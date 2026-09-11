@@ -109,9 +109,13 @@ If a property test fails, proptest writes the shrunken counterexample to
 4. `wgsl.rs`: emit it. Anything needing a loop or an array goes in a helper
    function via `Emitter::helpers`, not inline.
 5. `tests/properties.rs` in both `sc-geom` and `sc-mesh`: add it to the generator.
+6. `sc-doc`'s `FORMAT_VERSION`: a new variant is a new file format. An old build
+   opening the file has to say so rather than guess.
 
 The property panel and the agent interface both work off `params()`, so you get
-an editor for free.
+an editor for free. A parameter that is not a length in millimetres needs a row
+in `ui::unit_for`, and one that is a whole number needs one in `ui::field_style`
+too, or it is labelled as a distance and shown with a fraction.
 
 ## Traps that will cost you an hour
 

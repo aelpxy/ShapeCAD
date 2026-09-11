@@ -193,6 +193,17 @@ fn bounds_memo(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, Aabb>) -> A
             Aabb::from_half(Vec3::new(major + minor, major + minor, minor))
         }
         Node::Plane { .. } => Aabb::INFINITE,
+        // The union of every instance's box. Transforming the child's box once
+        // per instance over-reports for a rotated instance, which is the safe
+        // direction: a bound may be too large and must never be too small.
+        Node::Pattern { child, kind, count } => {
+            let base = bounds_memo(arena, child, memo);
+            let mut all = Aabb::EMPTY;
+            for i in 0..count {
+                all = all.union(base.transformed(&kind.placement(i, count)));
+            }
+            all
+        }
         // The voxel footprint, which is half a voxel wider than the outermost
         // sample centres and at least two voxels wider than the surface.
         Node::Mesh { ref grid, .. } => grid.bounds(),

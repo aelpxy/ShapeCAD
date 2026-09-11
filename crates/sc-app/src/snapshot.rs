@@ -36,6 +36,8 @@ const MENU_POINT: (f32, f32) = (620.0, 380.0);
 pub(crate) enum Scene {
     /// The engine example, framed.
     Engine,
+    /// A circular pattern, to show the count doing its job.
+    Pattern,
     /// The guided tour on its first card.
     Tutorial,
     /// A selected box with its dimension grips showing.
@@ -102,6 +104,33 @@ fn pose(scene: Scene) -> AppState {
         }
         Scene::Tutorial => {
             state.start_tutorial();
+        }
+        Scene::Pattern => {
+            state.new_document();
+            state.add_body(
+                sc_geom::Node::Cylinder {
+                    radius: 4.0,
+                    half_height: 3.0,
+                    round: 0.5,
+                },
+                "Boss",
+            );
+            // Off the axis, or every instance of a circular pattern lands in
+            // one place and the capture shows one boss.
+            state.move_selection(sc_geom::glam::Vec3::new(22.0, 0.0, 0.0));
+            state.repeat_selection(sc_geom::node::Repeat::Circular {
+                sweep: std::f32::consts::TAU,
+            });
+            if let Some(id) = state.selected {
+                state.apply(sc_doc::Command::SetParam {
+                    id,
+                    name: "count".into(),
+                    value: 6.0,
+                });
+            }
+            state.frame_model();
+            state.rig.snap_to(state.rig.goal);
+            state.status = "Ready".to_string();
         }
         Scene::Grips => {
             state.new_document();

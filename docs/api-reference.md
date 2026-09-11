@@ -260,6 +260,8 @@ Validation happens when the document or arena accepts that node.
 | Transform with `on` set | Reported but not settable | Position is regenerated from the attached face; `set_param` returns `false` |
 | Mesh | None | The grid is fixed at import; resolution is read-only via `Node::mesh_resolution` |
 | Prism | Profile keys only | No depth: an unbounded sweep has none. This is how "through all" is expressed |
+| Pattern, linear | `count`, `step_x`, `step_y`, `step_z` | Copies and the vector between neighbours |
+| Pattern, circular | `count`, `sweep` | Copies and the total swept angle, in degrees |
 | Offset | `distance` | Positive grows; negative shrinks |
 | Shell | `thickness` | Inward wall thickness |
 | Extrude | Profile keys plus `depth` | Extrusion depth |
@@ -268,6 +270,8 @@ Validation happens when the document or arena accepts that node.
 | RegularPolygon profile | `sides`, `radius` | Side count and circumradius, not across-flats size |
 | Path profile | None | Points require replacement of the containing node |
 
+`Pattern::count` edits round and clamp to 2..=`node::MAX_INSTANCES` (200); the
+ceiling exists because every instance costs a loop iteration in the shader.
 `RegularPolygon::sides` edits round and clamp to 3..64. Paths allow 3..256 finite
 points with nonzero signed area. Rotation, child links and profile point arrays
 are not scalar parameters; use `Command::Replace` while preserving the node ID.
@@ -743,8 +747,35 @@ pub enum Node {
     Prism {
         profile: Profile,    // swept without end along Z
     },
+    Pattern {
+        child: NodeId,
+        kind: Repeat,        // how one instance is placed relative to the last
+        count: u32,          // total instances, including the original
+    },
+}
+
+pub const MAX_INSTANCES: u32 = 200;
+
+pub enum Repeat {
+    Linear { step: Vec3 },   // the vector between neighbouring instances
+    Circular { sweep: f32 }, // total swept angle in radians, about Z
 }
 ```
+
+A pattern is a union of `count` placements of one child, evaluated as a minimum
+over instances rather than as `count` nodes in the arena. The count stays a
+single editable number, and the child stays a single node: editing the child
+edits every copy. Instance zero is always the identity, so adding a pattern
+never moves what was already there.
+
+`Repeat::Circular` divides a full turn by `count` and a partial sweep by
+`count - 1`, which is what makes a 360 degree pattern of 6 place bosses every 60
+degrees while a 90 degree pattern of 3 places them at 0, 45 and 90.
+
+| Item | Signature | Behavior / failure conditions |
+| --- | --- | --- |
+| `Repeat::spans` | `pub fn spans(self, count: u32) -> u32` | How many gaps a circular sweep is divided into: `count` for a full turn, `count - 1` otherwise. A linear step is already a per-instance offset, so it does not divide. |
+| `Repeat::placement` | `pub fn placement(self, i: u32, count: u32) -> Transform` | Where instance `i` sits. Identity at `i == 0`. |
 
 | Item | Signature | Behavior / failure conditions |
 | --- | --- | --- |
@@ -1242,6 +1273,7 @@ pub(crate) enum Icon {
     Intersect,
     Torus,
     Extrude,
+    Pattern,
     Trash,
 }
 ```
@@ -1398,6 +1430,9 @@ pub(crate) struct AppState {
 | `AppState::attach_to_selection` | `pub(crate) fn attach_to_selection(&mut self)` | Attaches the sketch plane to the selected feature's far face. Looks through single-child wrappers (offset, shell, transform) to the pad underneath, because a user selects the finished feature rather than the bare extrude. Refuses on a boolean: both sides have a face and nothing can say which was meant. |
 | `AppState::attachable_face` | `pub(crate) fn attachable_face(&self, id: NodeId) -> Option<NodeId>` | The pad a given selection would attach to, or `None`. |
 | `AppState::move_selection` | `pub(crate) fn move_selection(&mut self, delta: Vec3)` | Moves the selection. An attached feature keeps its attachment: the move goes into a placement **beneath** the derived one, in the feature's own frame, so it slides across the face in x and y and lifts off it in z, and still follows that face when the base changes. Repeated moves accumulate into one offset rather than stacking a node each. Anything unattached is wrapped in a placement of its own. |
+| `AppState::duplicate_selection` | `pub(crate) fn duplicate_selection(&mut self)` | Copies the selected subtree, places the copy four grid steps along X so it lands beside the original rather than inside it, unions it onto the model and selects it. The copy is independent: editing it does not touch the source. A node referenced twice inside the subtree is copied once, so shared structure stays shared. One undo step. |
+| `AppState::clone_subtree` | `fn clone_subtree(&mut self, id: NodeId) -> Option<NodeId>` | The copy itself, children first so a child id always exists before its parent references it. Memoized per source node, which is what keeps a shared child shared. |
+| `AppState::repeat_selection` | `pub(crate) fn repeat_selection(&mut self, kind: Repeat)` | Wraps the selection in a `Node::Pattern` with a count of 4, rewiring the parent so the pattern takes the selection's place, and selects the pattern so the count is immediately editable. A linear step is recomputed from the selection's bounds rather than taken from `kind`, so instances land beside each other at any scale; a circular sweep is used as given. |
 | `AppState::detach_selection` | `pub(crate) fn detach_selection(&mut self)` | Clears the derivation, keeping the resolved placement so nothing jumps. The only way to stop a feature following its face, and deliberately explicit. |
 | `AppState::selection_is_attached` | `pub(crate) fn selection_is_attached(&self) -> bool` | Whether the selection is a placement that follows a face. Gates the Detach action and the property panel. |
 | `AppState::detach_plane` | `pub(crate) fn detach_plane(&mut self)` | Returns the sketch plane to a datum. |

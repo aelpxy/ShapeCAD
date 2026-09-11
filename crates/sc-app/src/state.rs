@@ -1124,6 +1124,135 @@ impl AppState {
     }
 
     /// Unions a new body onto the model, or makes it the model if there is none.
+    /// Copies the selection and joins the copy to the model.
+    ///
+    /// The whole point of a CAD tool is making the same thing more than once,
+    /// and until now every repeat meant performing the entire gesture again and
+    /// then matching the numbers by hand. The copy lands offset by one grid step
+    /// so it is visible rather than hidden inside the original, and arrives
+    /// selected, so the gizmo is already on it and it can be dragged straight to
+    /// where it belongs.
+    pub(crate) fn duplicate_selection(&mut self) {
+        let Some(target) = self.selected else {
+            self.status = "Nothing selected".to_string();
+            return;
+        };
+        self.as_one_step(|s| {
+            let Some(copy) = s.clone_subtree(target) else {
+                s.status = "That cannot be copied".to_string();
+                return;
+            };
+            let step = s.grid.max(0.01) * 4.0;
+            let Some(placed) = s.place_plain(copy, Transform::from_translation(Vec3::X * step))
+            else {
+                return;
+            };
+            if let Some(name) = s.doc.name(target).map(ToString::to_string) {
+                s.apply(Command::SetName {
+                    id: copy,
+                    name: Some(name),
+                });
+            }
+            s.join_to_model(placed);
+            s.select(Some(placed));
+            s.status = "Copied, drag it where you want it".to_string();
+        });
+    }
+
+    /// Repeats the selection along a line, or about the Z axis of its own frame.
+    ///
+    /// Wraps rather than copies. The child is evaluated once per instance, so
+    /// twenty instances cost one subtree and twenty point transforms, and the
+    /// count stays a single number: raise it and there are more of them.
+    pub(crate) fn repeat_selection(&mut self, kind: sc_geom::node::Repeat) {
+        let Some(target) = self.selected else {
+            self.status = "Nothing selected".to_string();
+            return;
+        };
+        // Spaced off the selection's own size, so the instances land beside each
+        // other rather than inside each other. A fixed step would bury them in a
+        // large feature and scatter them across the room for a small one.
+        let span = sc_geom::bounds(self.doc.arena(), target).size();
+        let kind = match kind {
+            sc_geom::node::Repeat::Linear { .. } => sc_geom::node::Repeat::Linear {
+                step: Vec3::X * (span.x.max(1.0) * 1.5),
+            },
+            circular @ sc_geom::node::Repeat::Circular { .. } => circular,
+        };
+        self.wrap_selection(
+            |child| Node::Pattern {
+                child,
+                kind,
+                count: 4,
+            },
+            "Repeat",
+        );
+        self.status = "Repeated. Change the count on the right".to_string();
+    }
+
+    /// Deep-copies a subtree, returning the new root.
+    ///
+    /// Deep rather than shared, because an edit to the copy must not change the
+    /// original: that is what the word means to everyone who has used it. The
+    /// arena would happily let two parents name one node, and for a pattern that
+    /// is exactly right, but not for this.
+    ///
+    /// A derivation is remapped only when the face it names is inside the copy.
+    /// Copying a boss on its own leaves it attached to the face it was already
+    /// on; copying a boss together with the pad it sits on gives the copy its own
+    /// pad to follow.
+    fn clone_subtree(&mut self, id: NodeId) -> Option<NodeId> {
+        let order = self.post_order(id);
+        let mut copied: std::collections::HashMap<NodeId, NodeId> =
+            std::collections::HashMap::new();
+        for old in order {
+            let mut node = self.doc.arena().get(old)?.clone();
+            node.map_children(|c| copied.get(&c).copied().unwrap_or(c));
+            if let Node::Transform { on: Some(base), .. } = &mut node {
+                if let Some(inside) = copied.get(base) {
+                    *base = *inside;
+                }
+            }
+            let new = self.apply(Command::Add { node })?;
+            copied.insert(old, new);
+        }
+        copied.get(&id).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn post_order_for_test(&self, id: NodeId) -> Vec<NodeId> {
+        self.post_order(id)
+    }
+
+    /// Every node under `id`, children before parents, each once.
+    ///
+    /// A shared node is reached twice and copied once, so the copy keeps the
+    /// sharing the original had rather than quietly doubling in size.
+    fn post_order(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        self.walk_post(id, &mut seen, &mut out);
+        out
+    }
+
+    fn walk_post(
+        &self,
+        id: NodeId,
+        seen: &mut std::collections::HashSet<NodeId>,
+        out: &mut Vec<NodeId>,
+    ) {
+        if !seen.insert(id) {
+            return;
+        }
+        let Some(node) = self.doc.arena().get(id) else {
+            return;
+        };
+        for child in node.children() {
+            self.walk_post(child, seen, out);
+        }
+        out.push(id);
+    }
+
     fn join_to_model(&mut self, id: NodeId) {
         let Some(root) = self.doc.root() else {
             self.apply(Command::SetRoot { root: Some(id) });
@@ -3676,6 +3805,136 @@ mod tests {
         assert!(
             (near_points - far_points).abs() < 4.0,
             "on screen it went from {near_points} to {far_points} points"
+        );
+    }
+
+    /// A copy is independent. Sharing the nodes would be cheaper and is exactly
+    /// what a pattern wants, but here it would mean resizing one hole resizes
+    /// the other, which is not what the word means.
+    #[test]
+    fn a_copy_can_be_edited_without_touching_the_original() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        let original = state.selected.expect("selected");
+
+        state.duplicate_selection();
+        let copy = state
+            .attachable_face(state.selected.expect("the copy is selected"))
+            .or(state.selected)
+            .expect("a copy");
+        assert_ne!(copy, original, "the copy is the original");
+
+        // Reach the copied sphere, whatever placement sits above it.
+        let sphere = state.post_order_for_test(copy);
+        let sphere = sphere
+            .into_iter()
+            .find(|id| matches!(state.doc.arena().get(*id), Some(Node::Sphere { .. })))
+            .expect("the copy has a sphere");
+        assert_ne!(sphere, original, "the copy shares the original's node");
+
+        state.apply(Command::SetParam {
+            id: sphere,
+            name: "radius".into(),
+            value: 20.0,
+        });
+        let before = state
+            .doc
+            .arena()
+            .get(original)
+            .expect("the original survived")
+            .params()
+            .into_iter()
+            .find(|(n, _)| *n == "radius")
+            .expect("radius")
+            .1;
+        assert!(
+            (before - 6.0).abs() < 0.01,
+            "editing the copy changed the original to {before}"
+        );
+    }
+
+    /// And the copy is actually in the model, somewhere else.
+    #[test]
+    fn a_copy_lands_beside_the_original() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.grid = 1.0;
+        state.add_body(Node::Sphere { radius: 3.0 }, "Ball");
+        let before = state.doc.hash().expect("rooted");
+
+        state.duplicate_selection();
+
+        assert_ne!(
+            state.doc.hash().expect("rooted"),
+            before,
+            "the copy never reached the model"
+        );
+        assert!(
+            solid_at_point(&state, Vec3::ZERO),
+            "the original went missing"
+        );
+        assert!(
+            solid_at_point(&state, Vec3::new(4.0, 0.0, 0.0)),
+            "the copy is not beside it"
+        );
+    }
+
+    /// However many nodes a feature is made of, copying it is one thing done.
+    #[test]
+    fn a_copy_is_a_single_undo_step() {
+        let mut state = AppState::new();
+        state.load_sample();
+        let before = state.doc.hash().expect("rooted");
+        let nodes = state.doc.arena().len();
+
+        state.select(state.doc.root());
+        state.duplicate_selection();
+        assert!(
+            state.doc.arena().len() > nodes + 5,
+            "nothing much was copied"
+        );
+
+        state.undo();
+
+        assert_eq!(
+            state.doc.hash().expect("rooted"),
+            before,
+            "one undo left part of the copy behind"
+        );
+    }
+
+    /// A node reached down two branches is copied once, so the copy keeps the
+    /// sharing the original had rather than quietly doubling in size.
+    #[test]
+    fn a_shared_node_is_copied_once() {
+        let mut state = AppState::new();
+        state.new_document();
+        let ball = state
+            .apply(Command::Add {
+                node: Node::Sphere { radius: 4.0 },
+            })
+            .expect("valid");
+        let both = state
+            .apply(Command::Add {
+                node: Node::Union {
+                    a: ball,
+                    b: ball,
+                    smooth: 0.0,
+                },
+            })
+            .expect("valid");
+        state.apply(Command::SetRoot { root: Some(both) });
+        state.select(Some(both));
+
+        let before = state.doc.arena().len();
+        state.duplicate_selection();
+        let added = state.doc.arena().len() - before;
+
+        // The union, the one sphere, the placement and the joining union.
+        assert!(
+            added <= 4,
+            "copying a shared node made {added} nodes, so it was copied twice"
         );
     }
 

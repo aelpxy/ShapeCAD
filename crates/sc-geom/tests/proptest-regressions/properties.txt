@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc de8817755db42eafb8572864bd871afc9f34bc206e5bcbc3ed15ea69be48b30f # shrinks to s = Rotate(Difference(Sphere(0.5), On(Sphere(0.5), Mesh(1.0, 9, false), [0.0, 0.0, 0.0]), 0.0), [0.0, 0.0, 0.0])
+cc 20cd1c3a328fad1dcc7342ec14f28f7041db7507b53b43ef47ca792c1faff4e3 # shrinks to s = Repeated(Sphere(0.5), [3.0, 0.0, 0.0], 2)

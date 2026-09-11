@@ -45,6 +45,8 @@ fn main() {
             snapshot::Scene::Grips
         } else if args.iter().any(|a| a == "--engine") {
             snapshot::Scene::Engine
+        } else if args.iter().any(|a| a == "--pattern") {
+            snapshot::Scene::Pattern
         } else if args.iter().any(|a| a == "--showcase") {
             snapshot::Scene::Showcase
         } else {

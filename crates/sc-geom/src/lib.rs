@@ -817,6 +817,19 @@ mod tests {
                 },
             )
             .unwrap();
+        // A pattern is the first node whose shader is a loop calling a function,
+        // rather than an expression inlined into the main body, so the fixture
+        // has to contain one or that whole path goes unchecked.
+        let rot = b
+            .arena
+            .insert(Node::Pattern {
+                child: rot,
+                kind: crate::node::Repeat::Linear {
+                    step: Vec3::new(4.0, 0.0, 0.0),
+                },
+                count: 3,
+            })
+            .unwrap();
         let of = b.offset(rot, 0.05).unwrap();
         let sh = b.shell(of, 0.4).unwrap();
         let ex = b

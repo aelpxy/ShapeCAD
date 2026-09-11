@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 /// Version 4 added `Node::Prism`, the unbounded sweep a through cut is
 /// expressed with. An older build cannot evaluate one, and reading the file
 /// without it would turn a hole sized against the whole part into nothing.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Conventional file extension, without the dot.
 pub const EXTENSION: &str = "shapecad";

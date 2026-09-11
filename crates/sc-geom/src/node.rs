@@ -203,6 +203,24 @@ pub enum Node {
         /// The region swept.
         profile: Profile,
     },
+    /// The same subtree repeated, in a line or about an axis.
+    ///
+    /// A part with four bolt holes is four holes, and until this existed the
+    /// only way to say so was to make four and then keep four sets of numbers in
+    /// step by hand. Here the count is one parameter: change it and the part
+    /// changes.
+    ///
+    /// The child is evaluated once per instance rather than copied, which is
+    /// what makes it cheap. A hundred instances is one subtree and a hundred
+    /// point transforms, not a hundred subtrees.
+    Pattern {
+        /// The subtree being repeated. Instance zero is it, where it already is.
+        child: NodeId,
+        /// How the instances are laid out.
+        kind: Repeat,
+        /// How many there are in total, counting the original.
+        count: u32,
+    },
     /// Hollows the solid inward, preserving the outer surface.
     Shell {
         /// The subtree being hollowed.
@@ -285,6 +303,11 @@ impl PartialEq for Node {
                 other,
                 Node::Extrude { profile: p, depth: d } if profile == p && depth == d
             ),
+            Node::Pattern { child, kind, count } => matches!(
+                other,
+                Node::Pattern { child: c, kind: k, count: n }
+                    if child == c && kind == k && count == n
+            ),
             Node::Prism { profile } => {
                 matches!(other, Node::Prism { profile: p } if profile == p)
             }
@@ -292,6 +315,81 @@ impl PartialEq for Node {
                 other,
                 Node::Shell { child: c, thickness: t } if child == c && thickness == t
             ),
+        }
+    }
+}
+
+/// The most instances a pattern will hold.
+///
+/// The shader unrolls nothing: it loops, and the loop bound is baked into the
+/// source, so a count is structural and changing it rebuilds the pipeline. That
+/// is the right trade for a number somebody types occasionally, and the wrong
+/// one for a number somebody drags, which is why the cap exists at all. Two
+/// hundred is far past any bolt circle and still a loop a tracer can afford.
+pub const MAX_INSTANCES: u32 = 200;
+
+/// How a [`Node::Pattern`] lays its instances out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Repeat {
+    /// Evenly spaced along a direction. The length of `step` is the spacing and
+    /// its direction is the line.
+    Linear {
+        /// Offset from one instance to the next.
+        step: Vec3,
+    },
+    /// Evenly spaced about the Z axis of the pattern's own frame, spanning
+    /// `sweep` radians in total.
+    ///
+    /// About Z rather than an arbitrary axis, for the same reason an extrusion
+    /// sweeps along Z: the frame is what gets rotated, so a pattern about any
+    /// other axis is this one with a placement above it. One axis here means one
+    /// loop in the shader rather than a general rotation per instance.
+    Circular {
+        /// Total angle covered, in radians.
+        sweep: f32,
+    },
+}
+
+impl Repeat {
+    /// How many gaps the sweep is divided into.
+    ///
+    /// A full turn lands the last instance back on the first, so there the
+    /// spacing divides by the count. A partial sweep puts the last one at the
+    /// far end, which is what an arc of holes wants and what anybody typing
+    /// ninety degrees expects.
+    #[must_use]
+    pub fn spans(self, count: u32) -> u32 {
+        match self {
+            Self::Linear { .. } => count.max(1),
+            Self::Circular { sweep } => {
+                if (sweep.abs() - std::f32::consts::TAU).abs() < 1.0e-4 {
+                    count.max(1)
+                } else {
+                    count.max(2) - 1
+                }
+            }
+        }
+    }
+
+    /// Where instance `i` of `count` sits, relative to instance zero.
+    ///
+    /// Evaluation needs the inverse of this, since a field is sampled by moving
+    /// the point rather than the shape, but forwards is how anyone reading it
+    /// will think about it. Instance zero is always the identity, which is what
+    /// lets the shader seed its loop from the child itself.
+    #[must_use]
+    pub fn placement(self, i: u32, count: u32) -> crate::Transform {
+        match self {
+            Self::Linear { step } => crate::Transform::from_translation(step * i as f32),
+            Self::Circular { sweep } => {
+                let spans = Self::Circular { sweep }.spans(count);
+                crate::Transform {
+                    translation: Vec3::ZERO,
+                    rotation: glam::Quat::from_rotation_z(sweep * i as f32 / spans as f32),
+                    scale: 1.0,
+                }
+            }
         }
     }
 }
@@ -308,7 +406,8 @@ impl Node {
     pub fn mesh_grid(&self) -> Option<&Arc<Grid>> {
         match self {
             Node::Mesh { grid, .. } => Some(grid),
-            Node::Sphere { .. }
+            Node::Pattern { .. }
+            | Node::Sphere { .. }
             | Node::Box { .. }
             | Node::Cylinder { .. }
             | Node::Torus { .. }
@@ -353,6 +452,7 @@ impl Node {
             Node::Offset { .. } => "offset",
             Node::Extrude { .. } => "extrude",
             Node::Prism { .. } => "prism",
+            Node::Pattern { .. } => "pattern",
             Node::Shell { .. } => "shell",
         }
     }
@@ -365,7 +465,8 @@ impl Node {
     pub fn derived_from(&self) -> Option<NodeId> {
         match *self {
             Node::Transform { on, .. } => on,
-            Node::Sphere { .. }
+            Node::Pattern { .. }
+            | Node::Sphere { .. }
             | Node::Box { .. }
             | Node::Cylinder { .. }
             | Node::Torus { .. }
@@ -396,7 +497,8 @@ impl Node {
             Node::Union { a, b, .. }
             | Node::Difference { a, b, .. }
             | Node::Intersection { a, b, .. } => (Some(a), Some(b)),
-            Node::Transform { child, .. }
+            Node::Pattern { child, .. }
+            | Node::Transform { child, .. }
             | Node::Offset { child, .. }
             | Node::Shell { child, .. } => (Some(child), None),
             Node::Sphere { .. }
@@ -425,7 +527,8 @@ impl Node {
                 *a = f(*a);
                 *b = f(*b);
             }
-            Node::Transform { child, .. }
+            Node::Pattern { child, .. }
+            | Node::Transform { child, .. }
             | Node::Offset { child, .. }
             | Node::Shell { child, .. } => *child = f(*child),
             // Exhaustive for the same reason as [`Node::children`]: a kind that
@@ -503,6 +606,20 @@ impl Node {
                 ("z", xform.translation.z),
                 ("scale", xform.scale),
             ],
+            // The count is the number worth editing, and the one that makes a
+            // pattern worth having: four holes become six by changing it.
+            Node::Pattern { kind, count, .. } => {
+                let mut out = vec![("count", count as f32)];
+                match kind {
+                    Repeat::Linear { step } => {
+                        out.push(("step_x", step.x));
+                        out.push(("step_y", step.y));
+                        out.push(("step_z", step.z));
+                    }
+                    Repeat::Circular { sweep } => out.push(("sweep", sweep.to_degrees())),
+                }
+                out
+            }
             Node::Offset { distance, .. } => vec![("distance", distance)],
 
             Node::Shell { thickness, .. } => vec![("thickness", thickness)],
@@ -574,6 +691,20 @@ impl Node {
                 "scale" => xform.scale = v,
                 _ => return false,
             },
+            Node::Pattern { kind, count, .. } => match (name, &mut *kind) {
+                // Rounded and floored at two, because one instance is not a
+                // pattern and a fraction of one is not a number of things. The
+                // cap keeps a dragged count from asking the shader for a loop
+                // nobody meant.
+                ("count", _) => {
+                    *count = (v.round() as i64).clamp(2, i64::from(MAX_INSTANCES)) as u32;
+                }
+                ("step_x", Repeat::Linear { step }) => step.x = v,
+                ("step_y", Repeat::Linear { step }) => step.y = v,
+                ("step_z", Repeat::Linear { step }) => step.z = v,
+                ("sweep", Repeat::Circular { sweep }) => *sweep = v.to_radians(),
+                _ => return false,
+            },
             Node::Offset { distance, .. } if name == "distance" => *distance = v,
 
             Node::Shell { thickness, .. } if name == "thickness" => *thickness = v,
@@ -612,6 +743,16 @@ impl Node {
                     && round <= radius.min(half_height)
             }
             Node::Torus { major, minor } => major > 0.0 && minor > 0.0 && minor < major,
+            // A step of nothing stacks every instance in one place, which is a
+            // hundred copies of one shape and a hundred times the work for a
+            // part that looks unchanged.
+            Node::Pattern { kind, count, .. } => {
+                (2..=MAX_INSTANCES).contains(&count)
+                    && match kind {
+                        Repeat::Linear { step } => step.length_squared() > 1.0e-12,
+                        Repeat::Circular { sweep } => sweep.is_finite() && sweep.abs() > 1.0e-6,
+                    }
+            }
             // Both bounds matter. Too short and there is no direction to
             // normalise; long enough to overflow the square and `normalize`
             // hands back the zero vector, which turns the half-space into the
@@ -763,5 +904,147 @@ mod tests {
                 node.kind()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pattern_tests {
+    use super::{Node, Repeat, MAX_INSTANCES};
+    use crate::glam::Vec3;
+    use crate::{eval, Arena, NodeId};
+
+    fn four_in_a_row(step: Vec3, count: u32) -> (Arena, NodeId) {
+        let mut arena = Arena::new();
+        let ball = arena.insert(Node::Sphere { radius: 1.0 }).expect("valid");
+        let pattern = arena
+            .insert(Node::Pattern {
+                child: ball,
+                kind: Repeat::Linear { step },
+                count,
+            })
+            .expect("valid pattern");
+        (arena, pattern)
+    }
+
+    /// The whole promise: there is something at every instance and nothing in
+    /// between. Without it a pattern is a shape drawn once with extra nodes.
+    #[test]
+    fn every_instance_is_there_and_the_gaps_are_not() {
+        let (arena, id) = four_in_a_row(Vec3::X * 10.0, 4);
+        for i in 0..4 {
+            let at = Vec3::X * 10.0 * i as f32;
+            assert!(
+                eval(&arena, id, at) < 0.0,
+                "instance {i} is missing at {at:?}"
+            );
+        }
+        // Halfway between two, well outside a one millimetre ball.
+        assert!(eval(&arena, id, Vec3::X * 5.0) > 0.0, "the gap filled in");
+        // And it stops after the last one.
+        assert!(eval(&arena, id, Vec3::X * 40.0) > 0.0, "it went on forever");
+    }
+
+    /// Changing the count is one number, which is the entire reason this node
+    /// exists rather than four copies of a feature.
+    #[test]
+    fn the_count_is_one_parameter() {
+        let (mut arena, id) = four_in_a_row(Vec3::X * 10.0, 4);
+        assert!(eval(&arena, id, Vec3::X * 40.0) > 0.0);
+
+        let mut node = arena.get(id).expect("there").clone();
+        assert!(node.set_param("count", 6.0), "count is not settable");
+        arena.replace(id, node).expect("still valid");
+
+        assert!(
+            eval(&arena, id, Vec3::X * 40.0) < 0.0,
+            "raising the count did not add an instance"
+        );
+    }
+
+    /// A circular pattern closes on itself for a full turn and spans end to end
+    /// for anything less, which is what an arc of holes needs.
+    #[test]
+    fn a_full_turn_does_not_double_up_on_itself() {
+        let full = Repeat::Circular {
+            sweep: std::f32::consts::TAU,
+        };
+        assert_eq!(full.spans(4), 4, "a full turn should divide by the count");
+        let last = full.placement(3, 4).rotation;
+        let first = full.placement(0, 4).rotation;
+        assert!(
+            (last * Vec3::X - first * Vec3::X).length() > 0.5,
+            "the last instance landed on the first"
+        );
+
+        let quarter = Repeat::Circular {
+            sweep: std::f32::consts::FRAC_PI_2,
+        };
+        assert_eq!(quarter.spans(3), 2, "a partial sweep divides by the gaps");
+        let end = quarter.placement(2, 3).rotation * Vec3::X;
+        assert!(
+            (end - Vec3::Y).length() < 1.0e-4,
+            "a quarter sweep should end on Y, ended on {end:?}"
+        );
+    }
+
+    /// A pattern that goes nowhere stacks every instance in one place: a hundred
+    /// copies of one shape, a hundred times the work, and a part that looks
+    /// unchanged while the tracer crawls.
+    #[test]
+    fn a_pattern_that_goes_nowhere_is_refused() {
+        let mut arena = Arena::new();
+        let ball = arena.insert(Node::Sphere { radius: 1.0 }).expect("valid");
+        for kind in [
+            Repeat::Linear { step: Vec3::ZERO },
+            Repeat::Circular { sweep: 0.0 },
+        ] {
+            assert!(
+                arena
+                    .insert(Node::Pattern {
+                        child: ball,
+                        kind,
+                        count: 4,
+                    })
+                    .is_err(),
+                "{kind:?} was accepted"
+            );
+        }
+    }
+
+    /// One instance is not a pattern, and the cap is what stops a dragged count
+    /// asking the shader for a loop nobody meant.
+    #[test]
+    fn the_count_is_held_between_two_and_the_cap() {
+        let mut node = Node::Pattern {
+            child: NodeId(0),
+            kind: Repeat::Linear { step: Vec3::X },
+            count: 4,
+        };
+        for (asked, expected) in [(1.0, 2), (0.0, 2), (-5.0, 2), (1.0e9, MAX_INSTANCES)] {
+            assert!(node.set_param("count", asked));
+            let got = node
+                .params()
+                .into_iter()
+                .find(|(n, _)| *n == "count")
+                .expect("count")
+                .1;
+            assert_eq!(got as u32, expected, "asking for {asked} gave {got}");
+        }
+    }
+
+    /// The bounds have to hold every instance. A bound that is too small crops
+    /// the part out of the mesh and out of the camera framing.
+    #[test]
+    fn the_bounds_hold_every_instance() {
+        let (arena, id) = four_in_a_row(Vec3::X * 10.0, 4);
+        let b = crate::bounds(&arena, id);
+        assert!(
+            b.min.x <= -1.0 + 1.0e-3,
+            "the first instance is outside {b:?}"
+        );
+        assert!(
+            b.max.x >= 31.0 - 1.0e-3,
+            "the last instance is outside {b:?}"
+        );
     }
 }

@@ -61,10 +61,18 @@ enum Shape {
     /// doing exactly the job it exists for, and the bounds come from the solid
     /// being cut.
     ThroughCut(Box<Shape>, Profile),
+    /// The same shape repeated along a line.
+    ///
+    /// A pattern is the only node whose shader is a loop calling a function
+    /// rather than an expression inlined into the body, so leaving it out of
+    /// the generator would leave that whole path to the unit tests alone.
+    Repeated(Box<Shape>, [f32; 3], u32),
 }
 
-fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
-    match s {
+/// The arms with no children, split out only to keep `materialize` inside the
+/// line limit. `None` means the shape is not a leaf.
+fn materialize_leaf(s: &Shape, b: &mut Builder) -> Option<sc_geom::Result<NodeId>> {
+    Some(match s {
         Shape::Sphere(r) => b.sphere(*r),
         Shape::Cuboid(h, round) => {
             let half = Vec3::from_array(*h);
@@ -80,11 +88,6 @@ fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
         }
         Shape::Torus(major, minor) => b.torus(*major, minor.min(major * 0.9)),
         Shape::Extrude(profile, depth) => b.extrude(profile.clone(), *depth),
-        Shape::SliceOff(x, normal, offset) => {
-            let solid = materialize(x, b)?;
-            let tool = b.plane(Vec3::from_array(*normal), *offset)?;
-            b.smooth_difference(solid, tool, 0.0)
-        }
         Shape::Mesh(radius, dims, boxy) => {
             let (radius, dims) = (*radius, *dims);
             // Spacing is derived from the radius so that every generated grid
@@ -107,6 +110,20 @@ fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
             );
             b.arena
                 .insert(sc_geom::Node::mesh(AssetId(0), Arc::new(grid)))
+        }
+        _ => return None,
+    })
+}
+
+fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
+    if let Some(leaf) = materialize_leaf(s, b) {
+        return leaf;
+    }
+    match s {
+        Shape::SliceOff(x, normal, offset) => {
+            let solid = materialize(x, b)?;
+            let tool = b.plane(Vec3::from_array(*normal), *offset)?;
+            b.smooth_difference(solid, tool, 0.0)
         }
         Shape::Union(x, y, k) => {
             let (a, c) = (materialize(x, b)?, materialize(y, b)?);
@@ -147,6 +164,16 @@ fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
             let a = materialize(x, b)?;
             b.shell(a, *t)
         }
+        Shape::Repeated(x, step, count) => {
+            let a = materialize(x, b)?;
+            b.arena.insert(sc_geom::Node::Pattern {
+                child: a,
+                kind: sc_geom::node::Repeat::Linear {
+                    step: Vec3::from_array(*step),
+                },
+                count: *count,
+            })
+        }
         Shape::ThroughCut(x, profile) => {
             let solid = materialize(x, b)?;
             let tool = b.arena.insert(Node::Prism {
@@ -154,6 +181,13 @@ fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
             })?;
             b.smooth_difference(solid, tool, 0.0)
         }
+        // Handled by `materialize_leaf` above, which returns `Some` for each.
+        Shape::Sphere(..)
+        | Shape::Cuboid(..)
+        | Shape::Cylinder(..)
+        | Shape::Torus(..)
+        | Shape::Extrude(..)
+        | Shape::Mesh(..) => unreachable!("a leaf reached the composite match"),
         Shape::On(x, base, t) => {
             let under = materialize(base, b)?;
             let child = materialize(x, b)?;
@@ -182,7 +216,8 @@ fn contains_mesh(s: &Shape) -> bool {
         | Shape::Shell(a, _)
         | Shape::SliceOff(a, ..)
         // The cutting prism is generated here, never from a mesh.
-        | Shape::ThroughCut(a, _) => contains_mesh(a),
+        | Shape::ThroughCut(a, _)
+        | Shape::Repeated(a, _, _) => contains_mesh(a),
         // Matched out rather than caught by a wildcard. This function exists so
         // that a node cannot go missing from the shader quietly, and a wildcard
         // here is exactly how it would: a new shape holding a mesh would report
@@ -317,7 +352,12 @@ fn arb_shape(inexact: bool) -> impl Strategy<Value = Shape> {
                 )),
             (inner.clone(), arb_normal(), -10.0f32..10.0)
                 .prop_map(|(a, n, offset)| Shape::SliceOff(Box::new(a), n, offset)),
-            (inner, arb_profile()).prop_map(|(a, profile)| Shape::ThroughCut(Box::new(a), profile)),
+            (inner.clone(), arb_profile())
+                .prop_map(|(a, profile)| Shape::ThroughCut(Box::new(a), profile)),
+            // Steps kept clear of zero, which the kernel refuses, and counts
+            // small so a property building thousands of trees stays quick.
+            (inner, (3.0f32..9.0, -9.0f32..9.0, -9.0f32..9.0), 2u32..5)
+                .prop_map(|(a, s, n)| Shape::Repeated(Box::new(a), [s.0, s.1, s.2], n)),
         ]
     })
 }
@@ -328,7 +368,12 @@ fn arb_shape(inexact: bool) -> impl Strategy<Value = Shape> {
 /// a scale of exactly one is the multiply the emitter drops. Every other
 /// peephole has its threshold at zero, and scaling a zero leaves it a zero.
 fn is_structural(name: &str, before: f32, after: f32) -> bool {
+    // `sides` and `count` are both loop bounds, baked into the source because a
+    // shader cannot take a loop bound from a buffer. Changing either rebuilds
+    // the pipeline, which is correct and rare: they are numbers somebody types,
+    // not numbers somebody drags.
     name == "sides"
+        || name == "count"
         || (name == "scale" && ((before - 1.0).abs() < 1e-9 || (after - 1.0).abs() < 1e-9))
 }
 

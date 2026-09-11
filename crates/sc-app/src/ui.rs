@@ -415,6 +415,7 @@ fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
     const ZOOM_OUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
     const ZOOM_RESET: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Num0);
     const FIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F);
+    const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::D);
 
     // A modal owns the keyboard. These are taken out of the queue before any
     // widget is laid out, so without this the f in a filename framed the model
@@ -489,6 +490,8 @@ fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
             state.save();
         } else if i.consume_shortcut(&OPEN) {
             state.browse(Purpose::Open);
+        } else if i.consume_shortcut(&DUPLICATE) {
+            state.duplicate_selection();
         } else if i.consume_shortcut(&NEW) {
             state.new_document();
         } else if i.consume_shortcut(&REDO) {
@@ -1358,6 +1361,44 @@ fn modify_tools(ui: &mut egui::Ui, state: &mut AppState) {
             );
         }
 
+        let row = rows.row(Icon::Layers, "Duplicate", false, has_selection);
+        if theme::hint(
+            row,
+            "Duplicate",
+            "Makes an independent copy beside the selection, ready to drag where you want it. Editing the copy leaves the original alone.",
+            Some("Ctrl+D"),
+        )
+        .clicked()
+        {
+            state.duplicate_selection();
+        }
+
+        let row = rows.row(Icon::Pattern, "Repeat", false, has_selection);
+        if theme::hint(
+            row,
+            "Repeat in a line",
+            "Four of the selection, evenly spaced. The count is one number on the right, so four become six without making two more.",
+            None,
+        )
+        .clicked()
+        {
+            state.repeat_selection(sc_geom::node::Repeat::Linear { step: Vec3::X });
+        }
+
+        let row = rows.row(Icon::Circle, "Repeat around", false, has_selection);
+        if theme::hint(
+            row,
+            "Repeat around a circle",
+            "Four of the selection, evenly spaced about the Z axis. A bolt circle is this with the count set to however many bolts.",
+            None,
+        )
+        .clicked()
+        {
+            state.repeat_selection(sc_geom::node::Repeat::Circular {
+                sweep: std::f32::consts::TAU,
+            });
+        }
+
         let row = rows.row(Icon::Move, "Move", false, has_selection);
         let help = if !has_selection {
             NO_SELECTION
@@ -1521,10 +1562,10 @@ fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) 
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let mut v = value;
-                let speed = if name == "smooth" { 0.05 } else { 0.1 };
+                let (speed, decimals) = field_style(name);
                 let field = egui::DragValue::new(&mut v)
                     .speed(speed)
-                    .fixed_decimals(2)
+                    .fixed_decimals(decimals)
                     .suffix(unit_for(name));
                 // The panel is a share of the window, so the field cannot
                 // insist on a width the panel may not have.
@@ -2538,6 +2579,10 @@ fn describe_node(node: &Node) -> &'static str {
             "A ring. The major radius is the circle it follows, the minor radius its thickness."
         }
         Node::Plane { .. } => "A half space. Everything on one side of a plane is solid.",
+        Node::Pattern { .. } => {
+            "The same feature repeated. Change the count and the part changes: \
+             four holes become six without making two more."
+        }
         Node::Prism { .. } => {
             "A profile swept without end, used to cut all the way through. It has no depth to \
              go stale, so the hole stays open however the part around it changes."
@@ -2602,20 +2647,36 @@ fn pretty(name: &str) -> String {
     name.replace('_', " ")
 }
 
-/// Millimetres for lengths, nothing for ratios and directions. Labelling a
-/// scale factor "mm" is the kind of small lie that erodes trust in the numbers.
+/// Millimetres for lengths, degrees for angles, nothing for counts, ratios and
+/// directions. Labelling a scale factor "mm" is the kind of small lie that
+/// erodes trust in the numbers.
 fn unit_for(name: &str) -> &'static str {
     match name {
         // A count, a ratio and a direction are not lengths. Everything else in
         // the kernel is a distance in millimetres.
-        "sides" | "scale" | "normal_x" | "normal_y" | "normal_z" => "",
+        "count" | "sides" | "scale" | "normal_x" | "normal_y" | "normal_z" => "",
+        "sweep" => "\u{b0}",
         _ => " mm",
+    }
+}
+
+/// Drag speed and decimal places for a parameter field.
+///
+/// A count is a whole number, so rendering it as `6.00` invites someone to type
+/// `6.5` into it. An angle covers a far wider range than a millimetre dimension
+/// does, so it drags faster and does not need the fraction either.
+fn field_style(name: &str) -> (f64, usize) {
+    match name {
+        "count" | "sides" => (0.05, 0),
+        "sweep" => (1.0, 0),
+        "smooth" => (0.05, 2),
+        _ => (0.1, 2),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{describe_param, pretty, unit_for};
+    use super::{describe_param, field_style, pretty, unit_for};
     use sc_geom::glam::Vec3;
     use sc_geom::{Node, Profile, Transform};
 
@@ -2753,6 +2814,19 @@ mod tests {
         assert_eq!(unit_for("depth"), " mm");
         assert_eq!(unit_for("sides"), "");
         assert_eq!(unit_for("scale"), "");
+        assert_eq!(unit_for("count"), "");
+        assert_eq!(unit_for("sweep"), "\u{b0}");
+    }
+
+    /// Whole numbers are shown whole. A pattern of `6.00` copies reads as if
+    /// five and a half were allowed.
+    #[test]
+    fn counts_are_shown_without_a_fraction() {
+        assert_eq!(field_style("count").1, 0);
+        assert_eq!(field_style("sides").1, 0);
+        assert_eq!(field_style("sweep").1, 0);
+        assert_eq!(field_style("radius").1, 2);
+        assert_eq!(field_style("smooth").1, 2);
     }
     /// Hovering has to actually produce a tooltip.
     ///

@@ -162,6 +162,41 @@ stops at the limit. Refusing it would put an error on the status bar on every
 frame, which is noise, and the geometry would stop responding with no
 explanation.
 
+## Copies and patterns
+
+Two rows in MODIFY, answering two different questions.
+
+**Duplicate** (**Ctrl+D**) copies the selected feature and its whole subtree,
+lands the copy a few grid steps to the right and selects it, so the next gesture
+is dragging it where it belongs. The copy is independent. Nothing links it back
+to the original, because someone reaching for Duplicate usually wants a starting
+point rather than a clone that follows its source forever.
+
+**Repeat** and **Repeat around** wrap the selection in a pattern node. That node
+holds the count, so going from four to six is one number in the property panel,
+not two more gestures. The child stays a single node in the tree, which means
+editing the original edits every instance: change the boss radius and all six
+bosses change together.
+
+Three choices worth writing down:
+
+**The step is measured, not fixed.** A linear repeat spaces instances off the
+selection's own bounds. A fixed step buries the copies inside a large feature and
+scatters them across the room for a small one, and either way the first thing the
+user has to do is fix a number that should not have been wrong.
+
+**Instance zero is the identity.** Applying a pattern never moves what was
+already there, so the gesture reads as adding copies rather than as rearranging
+the model.
+
+**A full turn divides by the count, a partial sweep by the count minus one.** Six
+holes around a full circle sit every sixty degrees, with nothing doubled up at
+the seam. Three holes across ninety degrees sit at nought, forty five and ninety,
+because an arc of holes is meant to reach the far end.
+
+Counts are shown as whole numbers and sweeps in degrees. A field reading `6.00
+mm` for a copy count invites someone to try five and a half.
+
 ## Grouped lists
 
 The tool panel is a grouped list, which is the shape this kind of list takes on

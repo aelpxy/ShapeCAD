@@ -386,6 +386,40 @@ impl Emitter<'_> {
     /// the same rectangle stay two functions, so re-dimensioning one of them
     /// moves a value in the buffer instead of changing the shape of the source
     /// and rebuilding the pipeline.
+    /// Emits a subtree as a standalone function taking its point as an argument.
+    ///
+    /// A pattern evaluates its child once per instance, at a different point
+    /// each time. Inlining it the way every other parent does would write the
+    /// whole subtree out `count` times, which at two hundred instances is a
+    /// shader nobody wants to compile. A function is written once and called in
+    /// a loop.
+    ///
+    /// The child's statements belong inside the function, and the memo entries
+    /// it produces name variables that exist only there, so both are swapped out
+    /// for the duration and put back afterwards. Sharing `helper_names` with the
+    /// profile helpers is deliberate rather than accidental: they have the same
+    /// signature and mean the same thing, so a prism used as a pattern's child
+    /// is emitted once either way.
+    fn emit_as_function(&mut self, id: NodeId) -> String {
+        if let Some(name) = self.helper_names.get(&id) {
+            return name.clone();
+        }
+        let name = self.fresh("sc_node_");
+        let outer_body = std::mem::take(&mut self.body);
+        let outer_memo = std::mem::take(&mut self.memo);
+
+        let result = self.emit(id, "p");
+
+        let inner = std::mem::replace(&mut self.body, outer_body);
+        self.memo = outer_memo;
+        let _ = write!(
+            self.helpers,
+            "\nfn {name}(p: vec3<f32>) -> f32 {{\n{inner}    return {result};\n}}\n"
+        );
+        self.helper_names.insert(id, name.clone());
+        name
+    }
+
     fn helper_for(
         &mut self,
         id: NodeId,
@@ -441,6 +475,46 @@ impl Emitter<'_> {
                 });
                 let d = self.fresh("d");
                 self.line(&format!("let {d} = {name}({p});"));
+                d
+            }
+
+            Node::Pattern { child, kind, count } => {
+                let f = self.emit_as_function(child);
+                let d = self.fresh("d");
+                // The count is the loop bound, so it is baked into the source
+                // and changing it rebuilds the pipeline. Everything else about a
+                // pattern is a value in the buffer.
+                // Seeded from instance zero rather than from empty space,
+                // which it is: `Repeat::placement(0, _)` is the identity for
+                // both kinds. The empty sentinel would work and would also
+                // make this node indistinguishable from one the shader had
+                // to drop, which is what `SC_EMPTY` is counted to detect.
+                self.line(&format!("var {d} = {f}({p});"));
+                self.line(&format!("for (var i = 1u; i < {count}u; i = i + 1u) {{"));
+                let point = self.fresh("q");
+                match kind {
+                    crate::node::Repeat::Linear { step } => {
+                        let (sx, sy, sz) = (self.p(step.x), self.p(step.y), self.p(step.z));
+                        self.line(&format!(
+                            "    let {point} = {p} - vec3<f32>({sx}, {sy}, {sz}) * f32(i);"
+                        ));
+                    }
+                    crate::node::Repeat::Circular { sweep } => {
+                        // Sampling moves the point rather than the shape, so the
+                        // rotation is the inverse of the instance's own.
+                        let spans = crate::node::Repeat::Circular { sweep }.spans(count);
+                        let a = self.p(-sweep / spans as f32);
+                        self.line(&format!("    let a = {a} * f32(i);"));
+                        self.line("    let ca = cos(a);");
+                        self.line("    let sa = sin(a);");
+                        self.line(&format!(
+                            "    let {point} = vec3<f32>({p}.x * ca - {p}.y * sa, \
+                             {p}.x * sa + {p}.y * ca, {p}.z);"
+                        ));
+                    }
+                }
+                self.line(&format!("    {d} = min({d}, {f}({point}));"));
+                self.line("}");
                 d
             }
 

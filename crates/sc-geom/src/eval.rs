@@ -94,6 +94,18 @@ pub fn eval(arena: &Arena, id: NodeId, p: Vec3) -> f32 {
         // A profile swept along +Z. Combining the in-plane distance with the
         // slab distance this way keeps the result exact rather than merely
         // bounding, which matters for offsets and blends applied on top.
+        // The nearest instance wins, which is a union over the whole set. Each
+        // instance is the child sampled at a point moved into that instance's
+        // frame, so the subtree is evaluated `count` times and stored once.
+        Node::Pattern { child, kind, count } => {
+            let mut best = f32::INFINITY;
+            for i in 0..count {
+                let at = kind.placement(i, count).inverse_point(p);
+                best = best.min(eval(arena, child, at));
+            }
+            best
+        }
+
         // No z term at all: that is what "without end" means, and it makes the
         // prism the cheapest node in the kernel rather than the dearest.
         Node::Prism { ref profile } => profile.distance(Vec2::new(p.x, p.y)),

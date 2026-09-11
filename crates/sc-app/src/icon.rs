@@ -42,6 +42,7 @@ pub(crate) enum Icon {
     Torus,
     Extrude,
     Mesh,
+    Pattern,
     Trash,
 }
 
@@ -174,6 +175,12 @@ fn solid_glyph(pen: &Pen<'_>, icon: Icon) -> bool {
             pen.path(&[(4.0, 11.0), (8.0, 6.0), (21.0, 6.0), (17.0, 11.0)], true);
             pen.line((21.0, 6.0), (21.0, 15.0));
             pen.line((17.0, 20.0), (21.0, 15.0));
+        }
+        Icon::Pattern => {
+            // Four of one thing, which is what a pattern is for.
+            for (cx, cy) in [(8.0, 8.0), (16.0, 8.0), (8.0, 16.0), (16.0, 16.0)] {
+                pen.rounded_rect(cx - 4.0, cy - 4.0, 8.0, 8.0, 1.5);
+            }
         }
         Icon::Mesh => {
             // A triangle with its vertices marked, which is what an imported
@@ -369,6 +376,7 @@ pub(crate) fn for_kind(kind: &str) -> Icon {
         // subtitle tells them apart. A separate icon for "the same shape but
         // longer" would be a distinction without a difference at 15 pixels.
         "extrude" | "prism" => Icon::Extrude,
+        "pattern" => Icon::Pattern,
         "mesh" => Icon::Mesh,
         "shell" => Icon::Shell,
         // Not a silent fallback: a node kind with no icon should be added above.
