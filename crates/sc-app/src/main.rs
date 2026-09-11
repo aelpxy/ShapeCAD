@@ -52,13 +52,73 @@ fn main() {
         return;
     }
 
+    // `--display` pins the window to one screen and is remembered, so it only
+    // has to be passed once. `--display auto` gives the choice back to the
+    // window system.
+    let requested = args
+        .iter()
+        .position(|a| a == "--display")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
     let event_loop = EventLoop::new().expect("could not create an event loop");
+
     // A CAD viewport is static most of the time; redrawing only on input keeps
     // the GPU idle instead of spinning at the refresh rate.
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop
-        .run_app(&mut App::new())
-        .expect("event loop failed");
+    let mut app = App::new();
+    if args.iter().any(|a| a == "--displays") {
+        app.mode = Mode::ListDisplays;
+    }
+    if let Some(name) = requested {
+        app.state
+            .set_display(if name == "auto" { None } else { Some(name) });
+    }
+    event_loop.run_app(&mut app).expect("event loop failed");
+}
+
+/// What this run is for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Mode {
+    #[default]
+    Run,
+    /// Print the displays and quit. The monitor list is only reachable from
+    /// inside the event loop, so this is a mode rather than a plain function.
+    ListDisplays,
+}
+
+/// Prints the displays the window system is offering, one per line.
+///
+/// Exists because on Wayland the application cannot tell which of them it is
+/// on, so when a window opens somewhere unexpected this is the only way to see
+/// what the names are and pass one to `--display`.
+fn list_displays(event_loop: &ActiveEventLoop) {
+    let primary = event_loop.primary_monitor().and_then(|m| m.name());
+    for monitor in event_loop.available_monitors() {
+        let name = monitor.name().unwrap_or_else(|| "?".to_string());
+        let size = monitor.size();
+        let at = monitor.position();
+        let mark = if Some(&name) == primary.as_ref() {
+            " (primary)"
+        } else {
+            ""
+        };
+        println!(
+            "{name}{mark}: {}x{} at {},{} scale {}",
+            size.width,
+            size.height,
+            at.x,
+            at.y,
+            monitor.scale_factor()
+        );
+    }
+    if primary.is_none() {
+        println!();
+        println!("The window system did not say which display is primary.");
+        println!("On Wayland it never does, and it also decides where a window opens.");
+    }
+    println!();
+    println!("Pass one of these names to --display, or `auto` to let the window system choose.");
 }
 
 struct Gpu {
@@ -74,27 +134,89 @@ struct Gpu {
 
 /// Width of the display in physical pixels, or zero if it cannot be determined.
 ///
-/// Tries the window's own monitor first, then the primary, then the widest
-/// available. Wayland answers none of these reliably before the surface is
-/// mapped, which is why the caller retries.
+/// Tries the window's own monitor first, then the primary, then infers one from
+/// the window's width.
+///
+/// Wayland tells a client neither which output it is on nor where it is, so
+/// both of the direct answers come back empty there, every time and not just
+/// before the surface is mapped. The window's own width is the remaining clue:
+/// a maximised window is about as wide as the display holding it.
 fn monitor_width(event_loop: &ActiveEventLoop, window: &Window) -> u32 {
-    window
+    if let Some(width) = window
         .current_monitor()
         .or_else(|| event_loop.primary_monitor())
         .map(|m| m.size().width)
         .filter(|w| *w > 0)
-        .or_else(|| {
-            event_loop
-                .available_monitors()
-                .map(|m| m.size().width)
-                .max()
-        })
+    {
+        return width;
+    }
+
+    let widths: Vec<u32> = event_loop
+        .available_monitors()
+        .map(|m| m.size().width)
+        .filter(|w| *w > 0)
+        .collect();
+    nearest_monitor_width(&widths, window.inner_size().width)
+}
+
+/// Picks the monitor whose width best explains a window of `window_width`.
+///
+/// Split out from the lookup above so the inference can be tested without a
+/// compositor, which is the only place it is ever exercised.
+///
+/// Guessing the widest monitor instead puts a 4K zoom on a 1080 wide screen
+/// whenever the compositor opens the window on the smaller of two displays.
+fn nearest_monitor_width(widths: &[u32], window_width: u32) -> u32 {
+    if window_width == 0 {
+        return widths.iter().copied().max().unwrap_or(0);
+    }
+    widths
+        .iter()
+        .copied()
+        // A window is never wider than the display holding it, so a narrower
+        // monitor cannot be the one it is on. Of those left, the narrowest is
+        // the closest fit.
+        .filter(|w| *w >= window_width)
+        .min()
+        .or_else(|| widths.iter().copied().max())
         .unwrap_or(0)
 }
 
 /// How far the pointer may move between press and release and still count as a
 /// click, in physical pixels.
 const CLICK_SLOP: f64 = 5.0;
+
+/// When the next frame should be drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NextFrame {
+    /// Straight away: the camera is still easing, or egui asked for it.
+    Now,
+    /// At this instant. egui asked to be repainted after a delay.
+    At(std::time::Instant),
+    /// Not until something happens. Nothing is animating.
+    Wait,
+}
+
+/// Decides when to draw again from egui's repaint request.
+///
+/// A delayed request is not a hint that can be dropped. A tooltip appears by
+/// asking to be repainted once the pointer has rested long enough, and egui
+/// only judges the pointer to be still by running frames in which it did not
+/// move. Treating "repaint in 280ms" as "wait for input" means neither ever
+/// happens, and nothing appears on hover.
+fn next_frame(
+    still_moving: bool,
+    delay: std::time::Duration,
+    now: std::time::Instant,
+) -> NextFrame {
+    if still_moving || delay.is_zero() {
+        NextFrame::Now
+    } else if delay == std::time::Duration::MAX {
+        NextFrame::Wait
+    } else {
+        NextFrame::At(now + delay)
+    }
+}
 
 /// What has to happen to the swapchain before a frame can be drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,8 +382,10 @@ struct App {
     last_frame: std::time::Instant,
     /// When and where the last click landed, for double-click detection.
     last_click: Option<(std::time::Instant, PhysicalPosition<f64>)>,
-    /// The display could not be measured at startup; retry once it is mapped.
-    scale_undetermined: bool,
+    /// When egui next wants to be repainted, if it asked for a delayed frame.
+    repaint_at: Option<std::time::Instant>,
+    /// Whether this run draws anything at all.
+    mode: Mode,
 }
 
 impl App {
@@ -278,7 +402,8 @@ impl App {
             dismissing_press: false,
             last_frame: std::time::Instant::now(),
             last_click: None,
-            scale_undetermined: false,
+            repaint_at: None,
+            mode: Mode::Run,
         }
     }
 
@@ -421,30 +546,47 @@ impl App {
         gpu.queue.submit(Some(encoder.finish()));
         gpu.queue.present(frame);
 
-        if still_moving
-            || output
-                .viewport_output
-                .values()
-                .any(|v| v.repaint_delay.is_zero())
-        {
-            gpu.window.request_redraw();
+        let delay = output
+            .viewport_output
+            .values()
+            .map(|v| v.repaint_delay)
+            .min()
+            .unwrap_or(std::time::Duration::MAX);
+
+        match next_frame(still_moving, delay, std::time::Instant::now()) {
+            NextFrame::Now => {
+                self.repaint_at = None;
+                gpu.window.request_redraw();
+            }
+            NextFrame::At(at) => self.repaint_at = Some(at),
+            NextFrame::Wait => self.repaint_at = None,
         }
     }
 
-    /// Second attempt at sizing the interface for the display.
+    /// Sizes the interface for whichever display the window is on.
     ///
-    /// Wayland frequently reports no monitor until the surface has been mapped,
-    /// which is after the window is created but before the first resize.
-    fn retry_scale_detection(&mut self, event_loop: &ActiveEventLoop) {
-        if !self.scale_undetermined {
+    /// Run on every resize rather than once at startup, for two reasons. The
+    /// window's size is the only clue to which display holds it, and that size
+    /// is not real until the compositor has mapped the surface. And a window
+    /// can move between displays afterwards, either because the user dragged it
+    /// or because a requested display was honoured a beat late.
+    ///
+    /// Choosing a zoom by hand switches this off, since the setting then says
+    /// what the user wants rather than what the display suggests.
+    fn update_auto_scale(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.settings.ui_scale.is_some() {
             return;
         }
         let Some(gpu) = &self.gpu else { return };
+        // A window with no area is minimised, and says nothing about which
+        // display it is on.
+        if gpu.window.inner_size().width == 0 {
+            return;
+        }
         let width = monitor_width(event_loop, &gpu.window);
         if width == 0 {
             return;
         }
-        self.scale_undetermined = false;
         let native = gpu.window.scale_factor() as f32;
         let auto = settings::auto_scale(width, native);
         if (auto - self.state.ui_scale).abs() > f32::EPSILON {
@@ -647,11 +789,24 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.mode == Mode::ListDisplays {
+            list_displays(event_loop);
+            event_loop.exit();
+            return;
+        }
         if self.gpu.is_some() {
             return;
         }
 
-        let attrs = Window::default_attributes()
+        // A named display is only a request. Wayland ignores a position, which
+        // is why the fallback below exists.
+        let chosen = self.state.settings.display.as_ref().and_then(|want| {
+            event_loop
+                .available_monitors()
+                .find(|m| m.name().as_deref() == Some(want.as_str()))
+        });
+
+        let mut attrs = Window::default_attributes()
             .with_title("ShapeCAD")
             // Opens filling the display. A CAD viewport is worth the whole
             // screen, and on a 4K panel a 1500 point window is a postage stamp.
@@ -661,11 +816,25 @@ impl ApplicationHandler for App {
             // Below this the panels take the whole window and the 3D view has
             // nowhere left to go.
             .with_min_inner_size(winit::dpi::LogicalSize::new(900.0, 600.0));
+        if let Some(monitor) = &chosen {
+            attrs = attrs.with_position(monitor.position());
+        }
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("could not open a window"),
         );
+
+        // Where a window goes is the window system's decision, and Wayland
+        // gives a client no way to influence it: no position, no output. The
+        // one primitive it does offer that names an output is fullscreen, so
+        // that is how a chosen display is honoured there. Positioning worked if
+        // the window can say where it is.
+        if let Some(monitor) = chosen {
+            if window.outer_position().is_err() {
+                window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(monitor))));
+            }
+        }
 
         let instance = gpu::instance();
         let surface = instance
@@ -716,7 +885,6 @@ impl ApplicationHandler for App {
         // Wayland often cannot name a monitor until the window is mapped. If it
         // could not, try again on the first resize rather than leaving someone
         // on a 4K panel with half-size controls.
-        self.scale_undetermined = monitor_width == 0 && self.state.settings.ui_scale.is_none();
 
         let egui_state = egui_winit::State::new(
             ctx,
@@ -737,6 +905,25 @@ impl ApplicationHandler for App {
             egui_renderer,
             egui_state,
         });
+    }
+
+    /// Sleeps until the next event, or until egui's delayed frame is due.
+    ///
+    /// The event loop otherwise waits for input, which is right for a CAD
+    /// viewport that is static most of the time, but it means a frame egui
+    /// asked for in half a second never arrives unless the timer is set here.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(at) = self.repaint_at else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
+        if at <= std::time::Instant::now() {
+            self.repaint_at = None;
+            self.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Wait);
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -773,12 +960,13 @@ impl ApplicationHandler for App {
                 // The new size is read back from the window in `redraw`, so
                 // there is exactly one place that decides how big the surface
                 // is and it cannot disagree with the frame being drawn.
-                self.retry_scale_detection(event_loop);
+                self.update_auto_scale(event_loop);
                 self.request_redraw();
             }
 
             // Moving the window to a display with a different density.
             WindowEvent::ScaleFactorChanged { .. } => {
+                self.update_auto_scale(event_loop);
                 self.request_redraw();
             }
 
@@ -841,7 +1029,11 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{surface_state, viewport_owns_pointer, SurfaceState};
+    use super::{
+        nearest_monitor_width, next_frame, surface_state, viewport_owns_pointer, NextFrame,
+        SurfaceState,
+    };
+    use std::time::{Duration, Instant};
 
     const VIEWPORT: [f32; 4] = [300.0, 60.0, 1000.0, 800.0];
 
@@ -913,5 +1105,63 @@ mod tests {
     #[test]
     fn a_matching_swapchain_is_drawn_straight_away() {
         assert_eq!(surface_state((1500, 940), (1500, 940)), SurfaceState::Ready);
+    }
+    /// The regression behind tooltips never appearing. egui asks to be
+    /// repainted a fraction of a second after the pointer stops, and that
+    /// frame has to be scheduled: the event loop is otherwise waiting for
+    /// input that is not coming, because the pointer is deliberately still.
+    #[test]
+    fn a_delayed_repaint_is_scheduled_rather_than_dropped() {
+        let now = Instant::now();
+        let delay = Duration::from_millis(280);
+        assert_eq!(
+            next_frame(false, delay, now),
+            NextFrame::At(now + delay),
+            "a finite delay must become a deadline"
+        );
+    }
+
+    #[test]
+    fn nothing_animating_waits_for_input() {
+        let now = Instant::now();
+        assert_eq!(next_frame(false, Duration::MAX, now), NextFrame::Wait);
+    }
+
+    /// An easing camera outranks any delay: it needs the next frame now.
+    #[test]
+    fn an_immediate_request_draws_straight_away() {
+        let now = Instant::now();
+        assert_eq!(next_frame(false, Duration::ZERO, now), NextFrame::Now);
+        assert_eq!(next_frame(true, Duration::MAX, now), NextFrame::Now);
+        assert_eq!(
+            next_frame(true, Duration::from_millis(280), now),
+            NextFrame::Now
+        );
+    }
+    /// Wayland never says which display a window is on, so the interface scale
+    /// is picked from the window's own width. Taking the widest monitor
+    /// instead puts a 4K zoom on a 1080 wide screen.
+    #[test]
+    fn the_monitor_is_inferred_from_the_window_width() {
+        let displays = [3840, 1080];
+        assert_eq!(nearest_monitor_width(&displays, 1080), 1080);
+        assert_eq!(nearest_monitor_width(&displays, 3840), 3840);
+        // A window smaller than either still belongs to the smaller one more
+        // plausibly than to the larger.
+        assert_eq!(nearest_monitor_width(&displays, 900), 1080);
+    }
+
+    /// A window wider than every display means the guess has gone wrong, so
+    /// fall back to the widest rather than reporting nothing.
+    #[test]
+    fn an_impossible_window_falls_back_to_the_widest() {
+        assert_eq!(nearest_monitor_width(&[3840, 1080], 5000), 3840);
+        assert_eq!(nearest_monitor_width(&[], 1920), 0);
+    }
+
+    /// Before the surface is mapped the window has no size to go on.
+    #[test]
+    fn an_unmapped_window_falls_back_to_the_widest() {
+        assert_eq!(nearest_monitor_width(&[3840, 1080], 0), 3840);
     }
 }

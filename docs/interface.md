@@ -133,6 +133,24 @@ answers the question geometrically. Keyboard events still honour egui's flag.
 Getting this wrong is not subtle: every click on the model is swallowed and the
 application appears completely inert.
 
+## Why a tooltip needs the event loop to cooperate
+
+The viewport is static most of the time, so the event loop waits for input
+rather than spinning at the refresh rate. That interacts badly with tooltips,
+and it is worth understanding before touching `next_frame`.
+
+egui will not show a tooltip until the pointer has rested on a widget for
+`tooltip_delay`, and it only learns that the pointer is still by running frames
+in which it did not move. Those frames are the ones it asks for with
+`request_repaint_after`, so a delayed repaint request is not a hint that can be
+dropped. Treating "repaint in 280ms" as "wait for input" deadlocks the thing:
+the input never comes, because the pointer is deliberately not moving.
+
+`next_frame` turns egui's request into a deadline and `about_to_wait` arms the
+timer with `ControlFlow::WaitUntil`. `a_hinted_row_shows_its_tooltip` drives a
+real `egui::Context` through that same rule and fails if a tooltip never
+appears, which is what a regression here looks like.
+
 ## Resizing
 
 The swapchain is reconciled with the window inside `redraw`, not when

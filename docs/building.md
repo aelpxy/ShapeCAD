@@ -111,6 +111,42 @@ the last pointer movement, so the pointer is moved on the first pass and then
 left alone; repeating the move event every pass resets the timer and no tooltip
 ever appears.
 
+## Which display it opens on
+
+On Wayland, which is what WSLg gives you, a client is told neither which output
+it is on nor where it is. `primary_monitor` and `current_monitor` both return
+`None`, `outer_position` returns `NotSupported`, and the compositor decides
+where a new window goes. That is why ShapeCAD sometimes opens on the wrong
+screen, and why it cannot simply move itself back.
+
+List what is available:
+
+```sh
+cargo run --release -p sc-app -- --displays
+```
+
+```
+rdp-0: 3840x2160 at 1080,0 scale 1
+rdp-2: 1080x1920 at 0,78 scale 1
+```
+
+Then pin it. The choice is remembered, so it only has to be passed once:
+
+```sh
+cargo run --release -p sc-app -- --display rdp-0
+cargo run --release -p sc-app -- --display auto   # back to the compositor
+```
+
+Naming an output is honoured with a position where the window system supports
+one, and with fullscreen on that output where it does not. Fullscreen is the
+only primitive Wayland offers that names an output at all: `set_maximized`
+takes no argument, so a maximised window on a chosen screen cannot be asked for.
+
+Interface zoom follows the window. The display is identified by matching the
+window's width against the available monitors, remeasured on every resize,
+because the window's size is not real until the compositor has mapped it and
+the requested display is sometimes honoured a beat late.
+
 ## Troubleshooting
 
 | Symptom | Cause |

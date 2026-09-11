@@ -1,12 +1,13 @@
 //! Persisted user preferences.
 //!
-//! Only interface scale so far. Kept deliberately separate from the document:
-//! how big you like the text is a property of your machine, not of the part.
+//! Interface scale and which display to open on. Kept deliberately separate
+//! from the document: how big you like the text, and which screen you work on,
+//! are properties of your machine rather than of the part.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Settings {
     /// Interface zoom, multiplied onto the display's own scale factor.
     ///
@@ -14,6 +15,15 @@ pub(crate) struct Settings {
     /// from the display instead of guessing 1.0 and rendering unreadably small
     /// on a 4K panel.
     pub(crate) ui_scale: Option<f32>,
+
+    /// Name of the display to open on, as `--displays` prints it.
+    ///
+    /// `None` leaves the choice to the window system, which is the only option
+    /// on Wayland unless a display is named: there a client is told neither
+    /// which output it is on nor where it is, so the compositor decides and the
+    /// application has no say.
+    #[serde(default)]
+    pub(crate) display: Option<String>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -38,12 +48,12 @@ impl Settings {
     /// Writes preferences, ignoring failure.
     ///
     /// Losing a zoom preference is not worth interrupting the user over.
-    pub(crate) fn save(self) {
+    pub(crate) fn save(&self) {
         let Some(p) = path() else { return };
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Ok(text) = serde_json::to_string_pretty(&self) {
+        if let Ok(text) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(p, text);
         }
     }

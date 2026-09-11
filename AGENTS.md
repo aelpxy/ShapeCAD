@@ -64,6 +64,9 @@ Add `--sample` for a populated document, `--dialog` for the file browser,
 `--hover` to catch a tooltip, `--menu` for the context menu, or `--showcase`
 for the readme screenshot. See `docs/building.md`.
 
+`--displays` lists the monitors and `--display <name>` pins the window to one,
+which on Wayland is the only way to influence where it opens.
+
 ## Before you say you are done
 
 1. `cargo fmt --all`

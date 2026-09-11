@@ -200,6 +200,12 @@ impl AppState {
         self.status = format!("Framed {id}");
     }
 
+    /// Chooses the display to open on, and remembers it.
+    pub(crate) fn set_display(&mut self, name: Option<String>) {
+        self.settings.display = name;
+        self.settings.save();
+    }
+
     /// Changes interface zoom and remembers the choice.
     pub(crate) fn set_ui_scale(&mut self, scale: f32) {
         let scale = (scale * 4.0).round() / 4.0;

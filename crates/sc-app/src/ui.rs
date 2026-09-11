@@ -1700,4 +1700,82 @@ mod tests {
         assert_eq!(unit_for("sides"), "");
         assert_eq!(unit_for("scale"), "");
     }
+    /// Hovering has to actually produce a tooltip.
+    ///
+    /// egui gates a tooltip on the pointer having rested, and it only learns
+    /// that the pointer is still by running frames in which it did not move.
+    /// Those frames are the ones it asks for with a delay, so this drives the
+    /// loop the way the application does, through `next_frame`. With a rule
+    /// that drops delayed requests the loop reaches `Wait` and no tooltip is
+    /// ever drawn, which is exactly what happened in the running application.
+    #[test]
+    fn a_hinted_row_shows_its_tooltip() {
+        use crate::{icon::Icon, theme};
+        use std::time::{Duration, Instant};
+
+        const BODY: &str = "Click points on the active plane.";
+
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 260.0));
+
+        let mut time = 0.0_f64;
+        let mut moved = false;
+        let mut shown = false;
+
+        for _ in 0..40 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                ..Default::default()
+            };
+            // Moved once and then left alone. egui measures the delay from the
+            // last movement, so repeating it would reset the timer forever.
+            if !moved {
+                input
+                    .events
+                    .push(egui::Event::PointerMoved(egui::pos2(80.0, 14.0)));
+                moved = true;
+            }
+
+            let mut output = ctx.run_ui(input, |ui| {
+                let row = theme::row(ui, Icon::Pen, "Sketch a profile", false, true);
+                theme::hint(row, "Sketch a profile", BODY, Some("S"));
+            });
+            // Nothing here uploads textures, and epaint refuses to let a delta
+            // be dropped unhandled.
+            output.textures_delta.clear();
+
+            if output.shapes.iter().any(|s| draws_text(&s.shape, BODY)) {
+                shown = true;
+                break;
+            }
+
+            let delay = output
+                .viewport_output
+                .values()
+                .map(|v| v.repaint_delay)
+                .min()
+                .unwrap_or(Duration::MAX);
+            match crate::next_frame(false, delay, Instant::now()) {
+                crate::NextFrame::Now => time += 1.0 / 60.0,
+                crate::NextFrame::At(_) => time += delay.as_secs_f64(),
+                crate::NextFrame::Wait => break,
+            }
+        }
+
+        assert!(
+            shown,
+            "the pointer rested on the row and no tooltip appeared"
+        );
+    }
+
+    /// Whether a shape, or anything nested in it, draws exactly this string.
+    fn draws_text(shape: &egui::Shape, text: &str) -> bool {
+        match shape {
+            egui::Shape::Text(t) => t.galley.text() == text,
+            egui::Shape::Vec(shapes) => shapes.iter().any(|s| draws_text(s, text)),
+            _ => false,
+        }
+    }
 }
