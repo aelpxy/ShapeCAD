@@ -717,9 +717,7 @@ fn tree_node(
     };
     let selected = state.selected == Some(id);
 
-    let name = state.doc.name(id).map(ToString::to_string);
-    let title = name.clone().unwrap_or_else(|| capitalise(node.kind()));
-    let subtitle = name.is_some().then(|| node.kind().to_owned());
+    let (title, subtitle) = label_for(state, id, &node);
 
     let row = theme::tree_row(
         ui,
@@ -755,9 +753,104 @@ fn tree_node(
     }
     seen.push(id);
 
-    for child in node.children() {
-        tree_node(ui, state, child, depth + 1, seen);
+    // A stack of cuts is a list, not a staircase. A boolean whose first operand
+    // is another of the same kind is one more step in the same chain, so it is
+    // drawn at the same depth instead of one further in: the engine example's
+    // eleven holes produced eleven levels of indent, marching off the side of
+    // the panel.
+    //
+    // The operand comes first and the rest of the chain after, so reading down
+    // gives the newest cut, the thing it cut with, the one before it, and the
+    // body at the bottom.
+    match chained_boolean(state, &node) {
+        Some((rest, operand)) => {
+            tree_node(ui, state, operand, depth + 1, seen);
+            tree_node(ui, state, rest, depth, seen);
+        }
+        None => {
+            for child in node.children() {
+                tree_node(ui, state, child, depth + 1, seen);
+            }
+        }
     }
+}
+
+/// What to call a node, and what to say under it.
+///
+/// One place decides. The tree and the property panel were each working it out
+/// and could disagree about the same node.
+///
+/// An unnamed boolean is titled by what it did and subtitled by the feature it
+/// did it with: "Difference" eleven times over says nothing about a part with
+/// eleven holes in it, and the row below it is that feature, so the two read as
+/// the different things they are. A bare placement is called what it is for
+/// rather than what it is made of.
+fn label_for(state: &AppState, id: NodeId, node: &Node) -> (String, Option<String>) {
+    if let Some(name) = state.doc.name(id) {
+        return (name.to_owned(), Some(node.kind().to_owned()));
+    }
+    if let (Some(verb), Some(feature)) = (operation(node), applied_feature(state, node)) {
+        return (verb.to_owned(), Some(feature));
+    }
+    if matches!(node, Node::Transform { .. }) {
+        return ("Position".to_owned(), Some(node.kind().to_owned()));
+    }
+    (capitalise(node.kind()), None)
+}
+
+/// What a boolean does, in a word.
+///
+/// The kind names are the agent-facing vocabulary and stay as they are; these
+/// are for the one place a person reads them down a list.
+fn operation(node: &Node) -> Option<&'static str> {
+    match *node {
+        Node::Union { .. } => Some("Join"),
+        Node::Difference { .. } => Some("Cut"),
+        Node::Intersection { .. } => Some("Keep"),
+        _ => None,
+    }
+}
+
+/// The `(rest, operand)` of a boolean that continues a chain of its own kind.
+fn chained_boolean(state: &AppState, node: &Node) -> Option<(NodeId, NodeId)> {
+    let (Node::Union { a, b, .. }
+    | Node::Difference { a, b, .. }
+    | Node::Intersection { a, b, .. }) = *node
+    else {
+        return None;
+    };
+    let same = state
+        .doc
+        .arena()
+        .get(a)
+        .is_some_and(|inner| inner.kind() == node.kind());
+    same.then_some((a, b))
+}
+
+/// The name of the feature a boolean applied, if it has one.
+///
+/// Walks down the second operand through single-child wrappers, which is where
+/// the name ends up: a pocket names the profile it cut with, and the placement
+/// around it is unnamed plumbing.
+fn applied_feature(state: &AppState, node: &Node) -> Option<String> {
+    let (Node::Union { b, .. } | Node::Difference { b, .. } | Node::Intersection { b, .. }) = *node
+    else {
+        return None;
+    };
+    let mut at = b;
+    for _ in 0..8 {
+        if let Some(name) = state.doc.name(at) {
+            return Some(name.to_owned());
+        }
+        let inner = state.doc.arena().get(at)?;
+        let mut children = inner.children();
+        let only = children.next()?;
+        if children.next().is_some() {
+            return None;
+        }
+        at = only;
+    }
+    None
 }
 
 /// Where the next sketch goes: a datum plane, or the face of a selected pad.
@@ -1119,7 +1212,7 @@ fn modify_tools(ui: &mut egui::Ui, state: &mut AppState) {
         } else if attached {
             "Slides the selection across the face it is attached to. It keeps following that face; use Detach from face to stop it."
         } else {
-            "Wraps the selection in a transform so it can be translated. Edit the offset in the property panel."
+            "Gives the selection a placement of its own and nudges it 10 mm along X. Dragging it in the viewport does the same thing and is usually quicker; this is here for when you want to type the numbers."
         };
         if theme::hint(row, "Move", help, None).clicked() {
             state.move_selection(Vec3::new(10.0, 0.0, 0.0));
@@ -1154,7 +1247,7 @@ fn right_panel(ui: &mut egui::Ui, state: &mut AppState) {
                         ui,
                         Icon::Cursor,
                         "Nothing selected",
-                        "Click a body in the viewport or a row in the design tree to edit its dimensions.",
+                        "Click a body in the viewport or a row in the design tree. Its dimensions appear here, and blue grips appear on the surfaces they move.",
                     );
                     return;
                 };
@@ -1190,6 +1283,7 @@ fn derived_note(ui: &mut egui::Ui) {
 
 /// The selected node's icon, name and id, across the top of the panel.
 fn properties_header(ui: &mut egui::Ui, state: &AppState, id: NodeId, node: &Node) {
+    let (title, subtitle) = label_for(state, id, node);
     ui.horizontal(|ui| {
         let (glyph, _) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
         crate::icon::draw(
@@ -1199,11 +1293,15 @@ fn properties_header(ui: &mut egui::Ui, state: &AppState, id: NodeId, node: &Nod
             theme::palette().text,
         );
         ui.add_space(2.0);
-        let title = state
-            .doc
-            .name(id)
-            .map_or_else(|| capitalise(node.kind()), ToString::to_string);
         theme::large_title(ui, &title);
+        if let Some(subtitle) = subtitle {
+            ui.add_space(5.0);
+            ui.label(
+                RichText::new(subtitle)
+                    .size(11.0)
+                    .color(theme::palette().text_dim),
+            );
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
                 RichText::new(format!("{id}"))
@@ -2123,11 +2221,49 @@ mod tests {
                 profile: Profile::Circle { radius: 1.0 },
                 depth: 1.0,
             },
+            Node::Prism {
+                profile: Profile::Rect {
+                    width: 2.0,
+                    height: 1.0,
+                },
+            },
+            Node::mesh(
+                sc_geom::AssetId(0),
+                std::sync::Arc::new(sc_geom::Grid::default()),
+            ),
             Node::Shell {
                 child,
                 thickness: 1.0,
             },
         ]
+    }
+
+    /// The list above has to be every kind, or the tests built on it check a
+    /// shrinking subset while looking like they check all of it.
+    #[test]
+    fn every_kind_really_is_every_kind() {
+        let mut kinds: Vec<&'static str> = every_kind().iter().map(Node::kind).collect();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds,
+            [
+                "box",
+                "cylinder",
+                "difference",
+                "extrude",
+                "intersection",
+                "mesh",
+                "offset",
+                "plane",
+                "prism",
+                "shell",
+                "sphere",
+                "torus",
+                "transform",
+                "union",
+            ],
+            "a node kind was added to the kernel and not to this fixture"
+        );
     }
 
     /// Every field in the property panel carries a hover explanation. A new
@@ -2247,5 +2383,144 @@ mod tests {
             egui::Shape::Vec(shapes) => shapes.iter().any(|s| draws_text(s, text)),
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::{applied_feature, chained_boolean, operation};
+    use crate::state::AppState;
+    use sc_doc::samples;
+    use sc_geom::{Node, NodeId};
+
+    /// Walks the tree the way `tree_node` does, returning the depth each node
+    /// would be drawn at.
+    fn depths(state: &AppState) -> Vec<(NodeId, usize)> {
+        fn walk(state: &AppState, id: NodeId, depth: usize, out: &mut Vec<(NodeId, usize)>) {
+            let Some(node) = state.doc.arena().get(id).cloned() else {
+                return;
+            };
+            out.push((id, depth));
+            match chained_boolean(state, &node) {
+                Some((rest, operand)) => {
+                    walk(state, operand, depth + 1, out);
+                    walk(state, rest, depth, out);
+                }
+                None => {
+                    for child in node.children() {
+                        walk(state, child, depth + 1, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(root) = state.doc.root() {
+            walk(state, root, 0, &mut out);
+        }
+        out
+    }
+
+    /// A stack of cuts is a list, not a staircase. The engine has eleven of
+    /// them, and nesting each one a level deeper marched the tree off the side
+    /// of the panel.
+    #[test]
+    fn a_chain_of_cuts_does_not_indent_forever() {
+        let mut state = AppState::new();
+        state.doc = samples::engine();
+        state.selected = state.doc.root();
+
+        let deepest = depths(&state)
+            .into_iter()
+            .map(|(_, depth)| depth)
+            .max()
+            .expect("the engine has nodes");
+        assert!(
+            deepest <= 6,
+            "the tree reaches depth {deepest}, which will not fit in the panel"
+        );
+    }
+
+    /// Every node still gets exactly one row. Flattening must not drop any, or a
+    /// feature becomes unreachable from the tree.
+    #[test]
+    fn flattening_still_shows_every_node_once() {
+        let mut state = AppState::new();
+        state.doc = samples::engine();
+
+        let rows = depths(&state);
+        let mut ids: Vec<NodeId> = rows.iter().map(|(id, _)| *id).collect();
+        let before = ids.len();
+        ids.sort_by_key(|id| id.0);
+        ids.dedup();
+        assert_eq!(before, ids.len(), "a node was drawn twice");
+
+        let reachable = state
+            .doc
+            .arena()
+            .reachable(state.doc.root().expect("rooted"))
+            .len();
+        assert_eq!(ids.len(), reachable, "a node was dropped from the tree");
+    }
+
+    /// A cut is followed by the thing it cut with, so reading down the panel
+    /// gives the newest cut, its feature, then the one before it.
+    #[test]
+    fn a_cut_is_followed_by_what_it_cut_with() {
+        let mut state = AppState::new();
+        state.doc = samples::engine();
+        let rows = depths(&state);
+
+        let (first, depth) = rows[0];
+        assert_eq!(depth, 0);
+        let node = state.doc.arena().get(first).expect("there").clone();
+        let (_, operand) = chained_boolean(&state, &node).expect("the root is a chain");
+        assert_eq!(rows[1].0, operand, "the operand does not follow its cut");
+        assert_eq!(rows[1].1, 1, "the operand is not nested under it");
+    }
+
+    /// An unnamed boolean is labelled by what it did it with, or eleven rows all
+    /// read "Difference" and the panel says nothing.
+    #[test]
+    fn an_unnamed_cut_borrows_the_name_of_its_feature() {
+        let mut state = AppState::new();
+        state.doc = samples::engine();
+
+        let named: Vec<String> = depths(&state)
+            .into_iter()
+            .filter_map(|(id, _)| {
+                let node = state.doc.arena().get(id)?;
+                (state.doc.name(id).is_none()).then(|| applied_feature(&state, node))?
+            })
+            .collect();
+        assert!(
+            named.iter().any(|n| n == "Mounting bolt"),
+            "no cut found its feature name, got {named:?}"
+        );
+        assert!(
+            named.iter().any(|n| n == "Cylinder bore"),
+            "the through cut lost its name, got {named:?}"
+        );
+    }
+
+    /// A boolean reads as a verb. Nothing else does.
+    #[test]
+    fn only_booleans_have_an_operation() {
+        assert_eq!(
+            operation(&Node::Difference {
+                a: NodeId(0),
+                b: NodeId(1),
+                smooth: 0.0
+            }),
+            Some("Cut")
+        );
+        assert_eq!(
+            operation(&Node::Union {
+                a: NodeId(0),
+                b: NodeId(1),
+                smooth: 0.0
+            }),
+            Some("Join")
+        );
+        assert_eq!(operation(&Node::Sphere { radius: 1.0 }), None);
     }
 }

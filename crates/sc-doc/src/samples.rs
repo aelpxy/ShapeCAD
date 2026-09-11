@@ -71,6 +71,14 @@ pub fn bracket() -> Document {
             },
         )
         .unwrap();
+        // Named, like every feature. The design tree labels a boolean by the
+        // feature it applied, so an unnamed cut reads as "Difference" and says
+        // nothing about what it did.
+        d.apply(Command::SetName {
+            id: drill,
+            name: Some("Bolt hole".into()),
+        })
+        .unwrap();
         let drill = add(
             &mut d,
             Node::Transform {
@@ -161,7 +169,18 @@ fn carved(d: &mut Document, a: NodeId, b: NodeId) -> NodeId {
 }
 
 /// A finite bore: a circle swept a known distance, for a hole that stops.
-fn bore(d: &mut Document, radius: f32, depth: f32, position: Vec3, rotation: Quat) -> NodeId {
+///
+/// Named, like every other feature here. The design tree shows a boolean by the
+/// feature it applied, so an unnamed cut reads as "difference" and a part with
+/// eleven of them reads as nothing at all.
+fn bore(
+    d: &mut Document,
+    name: &str,
+    radius: f32,
+    depth: f32,
+    position: Vec3,
+    rotation: Quat,
+) -> NodeId {
     let cut = add(
         d,
         Node::Extrude {
@@ -170,7 +189,17 @@ fn bore(d: &mut Document, radius: f32, depth: f32, position: Vec3, rotation: Qua
         },
     )
     .unwrap();
+    named(d, cut, name);
     at_turned(d, cut, position, rotation)
+}
+
+/// Labels a node, so the tree has something to call it.
+fn named(d: &mut Document, id: NodeId, name: &str) {
+    d.apply(Command::SetName {
+        id,
+        name: Some(name.into()),
+    })
+    .unwrap();
 }
 
 /// The crankcase: a rounded box with its chamber taken out of the inside.
@@ -302,6 +331,7 @@ fn feet(d: &mut Document, body: NodeId) -> NodeId {
 /// Order matters: a bore taken out before the fins were unioned on would be
 /// filled straight back in by them.
 fn drillings(d: &mut Document, body: NodeId, chamber: NodeId) -> NodeId {
+    named(d, chamber, "Crank chamber");
     let mut body = carved(d, body, chamber);
 
     // The cylinder bore is a through cut, so it is a prism rather than a
@@ -314,30 +344,57 @@ fn drillings(d: &mut Document, body: NodeId, chamber: NodeId) -> NodeId {
         },
     )
     .unwrap();
+    named(d, cylinder, "Cylinder bore");
     body = carved(d, body, cylinder);
 
     let upright = Quat::IDENTITY;
     for x in [-33.0f32, 33.0] {
         for y in [-28.0f32, 28.0] {
-            let hole = bore(d, 4.0, 34.0, Vec3::new(x, y, 104.0), upright);
+            let hole = bore(d, "Head bolt", 4.0, 34.0, Vec3::new(x, y, 104.0), upright);
             body = carved(d, body, hole);
         }
     }
 
-    let plug = bore(d, 4.5, 30.0, Vec3::new(0.0, 28.0, 116.0), upright);
+    let plug = bore(
+        d,
+        "Plug thread",
+        4.5,
+        30.0,
+        Vec3::new(0.0, 28.0, 116.0),
+        upright,
+    );
     body = carved(d, body, plug);
 
     let lying = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
     for side in [-1.0f32, 1.0] {
         // Started outside the casting and swept inward, so the port opens on the
         // outer face rather than leaving a skin over it.
-        let port = bore(d, 7.0, 34.0, Vec3::new(60.0 * side, 0.0, 123.0), lying);
+        let name = if side < 0.0 {
+            "Intake port"
+        } else {
+            "Exhaust port"
+        };
+        let port = bore(
+            d,
+            name,
+            7.0,
+            34.0,
+            Vec3::new(60.0 * side, 0.0, 123.0),
+            lying,
+        );
         body = carved(d, body, port);
     }
 
     for x in [-54.0f32, 54.0] {
         for y in [-26.0f32, 26.0] {
-            let hole = bore(d, 4.5, 18.0, Vec3::new(x, y, -2.0), upright);
+            let hole = bore(
+                d,
+                "Mounting bolt",
+                4.5,
+                18.0,
+                Vec3::new(x, y, -2.0),
+                upright,
+            );
             body = carved(d, body, hole);
         }
     }

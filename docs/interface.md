@@ -59,6 +59,27 @@ It runs unasked on a first launch and sets `tutorial_seen`. Putting it behind a
 menu item means the people who need it most are the least likely to find it, and
 it costs one click to dismiss. The Guide button in the top bar brings it back.
 
+## The design tree
+
+Two rules, both learned from the engine example, which has eleven holes in it.
+
+**A boolean chain is a list, not a staircase.** A boolean whose first operand is
+another of the same kind is one more step in the same chain, so it is drawn at
+the same depth rather than one further in. Without that the engine reached depth
+26 and marched off the side of the panel. The operand is drawn first and the rest
+of the chain after, so reading down gives the newest cut, the feature it cut
+with, the one before it, and the body at the bottom.
+
+**A node is called what it is for.** `label_for` decides, in one place, because
+the tree and the property panel were each working it out and could disagree. An
+unnamed boolean is titled by what it did and subtitled by the feature it did it
+with, since "Difference" eleven times says nothing about a part with eleven
+holes, and the row below it is that feature. A bare placement is "Position"
+rather than "Transform".
+
+That makes naming features matter, so the samples name theirs. An unnamed cut
+falls back to the kind and the panel goes quiet again.
+
 ## Direct manipulation
 
 A selected feature shows a grip on each of its dimensions: a dot sitting on the

@@ -41,6 +41,7 @@ pub(crate) enum Icon {
     Intersect,
     Torus,
     Extrude,
+    Mesh,
     Trash,
 }
 
@@ -180,6 +181,16 @@ fn solid_glyph(pen: &Pen<'_>, icon: Icon) -> bool {
             pen.path(&[(4.0, 11.0), (8.0, 6.0), (21.0, 6.0), (17.0, 11.0)], true);
             pen.line((21.0, 6.0), (21.0, 15.0));
             pen.line((17.0, 20.0), (21.0, 15.0));
+        }
+        Icon::Mesh => {
+            // A wireframe: the outline plus the edges across it, which is what
+            // distinguishes an imported mesh from anything modelled here.
+            pen.path(
+                &[(12.0, 3.0), (21.0, 12.0), (12.0, 21.0), (3.0, 12.0)],
+                true,
+            );
+            pen.line((12.0, 3.0), (12.0, 21.0));
+            pen.line((3.0, 12.0), (21.0, 12.0));
         }
         Icon::Move => {
             pen.line((12.0, 3.0), (12.0, 21.0));
@@ -358,8 +369,16 @@ pub(crate) fn for_kind(kind: &str) -> Icon {
         "intersection" => Icon::Intersect,
         "transform" => Icon::Move,
         "offset" => Icon::Offset,
-        "extrude" => Icon::Extrude,
+        // A prism is an extrusion without ends, so it shares the glyph and the
+        // subtitle tells them apart. A separate icon for "the same shape but
+        // longer" would be a distinction without a difference at 15 pixels.
+        "extrude" | "prism" => Icon::Extrude,
+        "mesh" => Icon::Mesh,
         "shell" => Icon::Shell,
+        // Not a silent fallback: a node kind with no icon should be added above.
+        // Left as a wildcard only because `kind` is a string and the compiler
+        // cannot check it, which is why `every_node_kind_has_its_own_icon`
+        // exists.
         _ => Icon::Layers,
     }
 }
@@ -452,5 +471,120 @@ impl Pen<'_> {
             self.stroke,
             egui::StrokeKind::Middle,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{for_kind, Icon};
+
+    /// Every node kind the kernel has needs its own glyph.
+    ///
+    /// `for_kind` takes a string, so the compiler cannot check this the way it
+    /// checks a match on the enum. Without this test a new node kind gets the
+    /// generic fallback and reads as "Layers" in the tree forever, which is the
+    /// kind of thing nobody files a bug about and everybody notices.
+    #[test]
+    fn every_node_kind_has_its_own_icon() {
+        // Written out rather than derived, so adding a kind to the kernel fails
+        // here until someone decides what it should look like.
+        let kinds = [
+            "sphere",
+            "box",
+            "cylinder",
+            "torus",
+            "plane",
+            "mesh",
+            "union",
+            "difference",
+            "intersection",
+            "transform",
+            "offset",
+            "extrude",
+            "prism",
+            "shell",
+        ];
+        for kind in kinds {
+            assert_ne!(
+                for_kind(kind),
+                Icon::Layers,
+                "{kind} fell through to the generic icon"
+            );
+        }
+    }
+
+    /// And the list above has to stay in step with the kernel, or it checks a
+    /// vocabulary that no longer exists.
+    #[test]
+    fn the_icon_table_covers_the_kernel() {
+        use sc_geom::glam::Vec3;
+        use sc_geom::{Node, NodeId, Profile};
+        use std::sync::Arc;
+
+        let child = NodeId(0);
+        let every = [
+            Node::Sphere { radius: 1.0 },
+            Node::Box {
+                half: Vec3::ONE,
+                round: 0.0,
+            },
+            Node::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+                round: 0.0,
+            },
+            Node::Torus {
+                major: 2.0,
+                minor: 1.0,
+            },
+            Node::Plane {
+                normal: Vec3::Z,
+                offset: 0.0,
+            },
+            Node::mesh(sc_geom::AssetId(0), Arc::new(sc_geom::Grid::default())),
+            Node::Union {
+                a: child,
+                b: child,
+                smooth: 0.0,
+            },
+            Node::Difference {
+                a: child,
+                b: child,
+                smooth: 0.0,
+            },
+            Node::Intersection {
+                a: child,
+                b: child,
+                smooth: 0.0,
+            },
+            Node::Transform {
+                child,
+                xform: sc_geom::Transform::IDENTITY,
+                on: None,
+            },
+            Node::Offset {
+                child,
+                distance: 1.0,
+            },
+            Node::Extrude {
+                profile: Profile::Circle { radius: 1.0 },
+                depth: 1.0,
+            },
+            Node::Prism {
+                profile: Profile::Circle { radius: 1.0 },
+            },
+            Node::Shell {
+                child,
+                thickness: 1.0,
+            },
+        ];
+        for node in every {
+            assert_ne!(
+                for_kind(node.kind()),
+                Icon::Layers,
+                "{} has no icon of its own",
+                node.kind()
+            );
+        }
     }
 }
