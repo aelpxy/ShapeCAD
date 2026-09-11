@@ -36,6 +36,8 @@ fn main() {
             snapshot::Scene::Hover
         } else if args.iter().any(|a| a == "--menu") {
             snapshot::Scene::Menu
+        } else if args.iter().any(|a| a == "--showcase") {
+            snapshot::Scene::Showcase
         } else {
             snapshot::Scene::Empty
         };

@@ -9,6 +9,10 @@
   Written in Rust, with a GPU-rendered viewport and STL export.
 </p>
 
+<p align="center">
+  <img src="assets/screenshot.png" width="900" alt="The ShapeCAD window: a design tree and tool list on the left, a bracket in the 3D viewport with its upright wall selected, and its dimensions on the right.">
+</p>
+
 ---
 
 It's still early. Basic modeling works, but selection, sketching and meshing

@@ -61,8 +61,8 @@ cargo run --release -p sc-app -- --snapshot out.png --width 2400 --height 1500 -
 ```
 
 Add `--sample` for a populated document, `--dialog` for the file browser,
-`--hover` to catch a tooltip, or `--menu` for the context menu. See
-`docs/building.md`.
+`--hover` to catch a tooltip, `--menu` for the context menu, or `--showcase`
+for the readme screenshot. See `docs/building.md`.
 
 ## Before you say you are done
 

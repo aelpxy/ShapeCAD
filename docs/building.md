@@ -88,6 +88,7 @@ scene:
 | `--dialog` | The file browser open over an empty document. |
 | `--hover` | The pointer resting on a tool row, so its tooltip is in the frame. |
 | `--menu` | The context menu open on the sample model's root. |
+| `--showcase` | The sample part posed for the readme screenshot, with the wall selected. |
 
 Two details matter if you touch that path. `RawInput::screen_rect` is in *points*,
 not pixels, so it must be divided by the scale. And several frames must be run:
@@ -97,6 +98,13 @@ invisible and in two is half transparent. Texture deltas must be applied from
 *every* frame. The font atlas is created during the first, and dropping that
 delta leaves the renderer with no atlas, at which point it silently skips the
 entire interface.
+
+The readme screenshot is `assets/screenshot.png`, regenerated with:
+
+```sh
+cargo run --release -p sc-app -- --snapshot assets/screenshot.png \
+  --width 2000 --height 1250 --scale 1.1 --showcase
+```
 
 Capturing a tooltip needs one more thing. egui measures the tooltip delay from
 the last pointer movement, so the pointer is moved on the first pass and then

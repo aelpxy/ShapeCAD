@@ -13,6 +13,13 @@ use sc_render::{gpu, snapshot as capture, Renderer};
 /// points. Chosen by eye from a capture at the default size.
 const HOVER_POINT: egui::Pos2 = egui::pos2(100.0, 315.0);
 
+/// How [`Scene::Showcase`] poses the camera: a three quarter view from the open
+/// side, so the filleted joint, both drilled holes and the upright face are all
+/// in frame at once.
+const SHOWCASE_YAW: f32 = -1.05;
+const SHOWCASE_PITCH: f32 = 0.55;
+const SHOWCASE_ZOOM: f32 = 1.02;
+
 /// Where [`Scene::Menu`] opens the context menu, in points. Over the middle of
 /// the 3D view, which is where a right click on the model would land.
 const MENU_POINT: (f32, f32) = (620.0, 380.0);
@@ -31,13 +38,39 @@ pub(crate) enum Scene {
     Hover,
     /// The context menu open on the sample model's root.
     Menu,
+    /// The sample part, posed for the screenshot in the readme.
+    Showcase,
 }
 
-/// Renders one frame of the application to a PNG.
+/// The node [`Scene::Showcase`] selects: the transform that places the upright
+/// wall.
 ///
-/// # Panics
-/// If no GPU is available or the image cannot be written.
-pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scene, scale: f32) {
+/// The wall is found by being the tallest box, but selecting the box itself
+/// tints it at its canonical position on the origin, which paints a band lying
+/// across the plate rather than the wall standing up. The transform above it is
+/// the node that puts the wall where it is, so that is what gets highlighted,
+/// and its offsets are worth showing in the property panel.
+fn showcase_subject(state: &AppState) -> Option<sc_geom::NodeId> {
+    let arena = state.doc.arena();
+    let wall = arena
+        .live_ids()
+        .filter_map(|id| match arena.get(id) {
+            Some(sc_geom::Node::Box { half, .. }) => Some((id, half.z)),
+            _ => None,
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(id, _)| id)?;
+
+    arena.live_ids().find(|id| {
+        matches!(
+            arena.get(*id),
+            Some(sc_geom::Node::Transform { child, .. }) if *child == wall
+        )
+    })
+}
+
+/// Builds the document and camera a scene asks for.
+fn pose(scene: Scene) -> AppState {
     let mut state = AppState::new();
     match scene {
         // Hover changes where the pointer is, not what the document holds.
@@ -48,6 +81,20 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scen
             let root = state.doc.root();
             state.select(root);
         }
+        Scene::Showcase => {
+            state.load_sample();
+            // A real feature, so the property panel has dimensions in it rather
+            // than a transform's zeroes.
+            state.select(showcase_subject(&state));
+            state.frame_model();
+            state.rig.goal.yaw = SHOWCASE_YAW;
+            state.rig.goal.pitch = SHOWCASE_PITCH;
+            state.rig.goal.distance *= SHOWCASE_ZOOM;
+            state.rig.snap_to(state.rig.goal);
+            // The status bar reports the sample being loaded otherwise, which
+            // is noise in a picture of the application at rest.
+            state.status = "Ready".to_string();
+        }
         Scene::Menu => {
             state.load_sample();
             if let Some(root) = state.doc.root() {
@@ -55,6 +102,15 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scen
             }
         }
     }
+    state
+}
+
+/// Renders one frame of the application to a PNG.
+///
+/// # Panics
+/// If no GPU is available or the image cannot be written.
+pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scene, scale: f32) {
+    let mut state = pose(scene);
 
     let instance = gpu::instance();
     let adapter = gpu::adapter(&instance, None, gpu::Preference::Hardware);
