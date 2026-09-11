@@ -156,18 +156,16 @@ fn bounds_memo(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, Aabb>) -> A
         }
         Node::Plane { .. } => Aabb::INFINITE,
         Node::Extrude { .. } => {
-            let Some(Node::Extrude { profile, height }) = arena.get(id) else {
+            // Re-fetched by reference: a profile is not `Copy`, so it cannot be
+            // bound by the surrounding match on `*node`.
+            let Some(Node::Extrude { profile, depth }) = arena.get(id) else {
                 return Aabb::EMPTY;
             };
-            let mut b = Aabb::EMPTY;
-            for v in profile {
-                let lo = Vec3::new(v.x, v.y, 0.0);
-                let hi = Vec3::new(v.x, v.y, *height);
-                b = b
-                    .union(Aabb { min: lo, max: lo })
-                    .union(Aabb { min: hi, max: hi });
+            let (lo, hi) = profile.bounds();
+            Aabb {
+                min: Vec3::new(lo.x, lo.y, 0.0),
+                max: Vec3::new(hi.x, hi.y, *depth),
             }
-            b
         }
 
         // A smooth blend bulges outward near the seam. Expanding by the full

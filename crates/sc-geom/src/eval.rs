@@ -81,12 +81,9 @@ pub fn eval(arena: &Arena, id: NodeId, p: Vec3) -> f32 {
         // A profile swept along +Z. Combining the in-plane distance with the
         // slab distance this way keeps the result exact rather than merely
         // bounding, which matters for offsets and blends applied on top.
-        Node::Extrude {
-            ref profile,
-            height,
-        } => {
-            let plane = sd_polygon(Vec2::new(p.x, p.y), profile);
-            let slab = (-p.z).max(p.z - height);
+        Node::Extrude { ref profile, depth } => {
+            let plane = profile.distance(Vec2::new(p.x, p.y));
+            let slab = (-p.z).max(p.z - depth);
             plane.max(slab).min(0.0) + Vec2::new(plane.max(0.0), slab.max(0.0)).length()
         }
 

@@ -31,7 +31,13 @@ fn build(s: &Shape, b: &mut Builder) -> NodeId {
         Shape::Cuboid(h) => b.cuboid(Vec3::from_array(*h)).unwrap(),
         Shape::Cylinder(r, hh) => b.cylinder(*r, *hh).unwrap(),
         Shape::Extrude(sides, radius, height) => b
-            .extrude(Builder::regular_polygon(*sides, *radius), *height)
+            .extrude(
+                sc_geom::Profile::RegularPolygon {
+                    sides: *sides as u32,
+                    radius: *radius,
+                },
+                *height,
+            )
             .unwrap(),
         Shape::Union(x, y, k) => {
             let (a, c) = (build(x, b), build(y, b));
@@ -124,7 +130,7 @@ proptest! {
     /// Every vertex must sit within its own cell of the surface.
     ///
     /// The QEF clamps each vertex into the cell that produced it, so the worst
-    /// honest case is the cell diagonal — a surface that only clips one corner.
+    /// honest case is the cell diagonal: a surface that only clips one corner.
     /// Anything beyond that means the solver escaped its cell, which is how a
     /// mesher silently emits spikes and self-intersecting triangles.
     #[test]

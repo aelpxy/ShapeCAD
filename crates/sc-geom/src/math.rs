@@ -86,6 +86,19 @@ impl Transform {
         self.rotation * (p * self.scale) + self.translation
     }
 
+    /// Composes two transforms: this one applied first, then `outer`.
+    ///
+    /// Needed to answer "where in the world is this node", which is how a work
+    /// plane attached to a face stays attached when the feature under it moves.
+    #[must_use]
+    pub fn then(&self, outer: &Self) -> Self {
+        Self {
+            translation: outer.rotation * (self.translation * outer.scale) + outer.translation,
+            rotation: outer.rotation * self.rotation,
+            scale: outer.scale * self.scale,
+        }
+    }
+
     /// Converts a distance measured in the child's frame into parent units.
     ///
     /// Forgetting this is the classic way to turn a valid distance field into
@@ -94,5 +107,51 @@ impl Transform {
     #[must_use]
     pub fn apply_distance(&self, d: f32) -> f32 {
         d * self.scale
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Transform;
+    use glam::{Quat, Vec3};
+
+    #[test]
+    fn composition_matches_applying_them_in_turn() {
+        let inner = Transform {
+            translation: Vec3::new(3.0, -1.0, 2.0),
+            rotation: Quat::from_rotation_z(0.7),
+            scale: 2.0,
+        };
+        let outer = Transform {
+            translation: Vec3::new(-5.0, 4.0, 1.0),
+            rotation: Quat::from_rotation_x(-0.4),
+            scale: 0.5,
+        };
+        let combined = inner.then(&outer);
+
+        for p in [
+            Vec3::ZERO,
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(-7.0, 0.5, 9.0),
+        ] {
+            let stepwise = outer.apply_point(inner.apply_point(p));
+            let composed = combined.apply_point(p);
+            assert!(
+                (stepwise - composed).length() < 1.0e-4,
+                "{p:?}: {stepwise:?} vs {composed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composing_with_the_identity_changes_nothing() {
+        let t = Transform {
+            translation: Vec3::new(1.0, 2.0, 3.0),
+            rotation: Quat::from_rotation_y(1.1),
+            scale: 3.0,
+        };
+        let both = t.then(&Transform::IDENTITY);
+        assert!((both.translation - t.translation).length() < 1.0e-5);
+        assert!((both.scale - t.scale).abs() < 1.0e-5);
     }
 }

@@ -222,3 +222,73 @@ mod tests {
         );
     }
 }
+
+/// The transform carrying `target` from its own frame into the model.
+///
+/// Walks the tree accumulating placements. Returns `None` if the node is not
+/// reachable from `root`, which is how a feature that has been removed from the
+/// model reports that it no longer has a position.
+///
+/// This is what lets a work plane be attached to a feature rather than pinned to
+/// a coordinate: the plane is re-derived from the node each time, so changing
+/// the feature underneath moves everything built on it.
+#[must_use]
+pub fn placement_of(arena: &Arena, root: NodeId, target: NodeId) -> Option<crate::Transform> {
+    fn walk(
+        arena: &Arena,
+        id: NodeId,
+        target: NodeId,
+        acc: crate::Transform,
+    ) -> Option<crate::Transform> {
+        if id == target {
+            return Some(acc);
+        }
+        let node = arena.get(id)?;
+        if let Node::Transform { child, xform } = node {
+            return walk(arena, *child, target, xform.then(&acc));
+        }
+        node.children().find_map(|c| walk(arena, c, target, acc))
+    }
+    walk(arena, root, target, crate::Transform::IDENTITY)
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use crate::ops::Builder;
+
+    #[test]
+    fn a_nested_node_reports_its_world_placement() {
+        let mut b = Builder::new();
+        let s = b.sphere(1.0).unwrap();
+        let inner = b.translate(s, Vec3::new(10.0, 0.0, 0.0)).unwrap();
+        let outer = b.translate(inner, Vec3::new(0.0, 5.0, 0.0)).unwrap();
+
+        let placed = placement_of(&b.arena, outer, s).expect("reachable");
+        let world = placed.apply_point(Vec3::ZERO);
+        assert!(
+            (world - Vec3::new(10.0, 5.0, 0.0)).length() < 1.0e-4,
+            "sphere sits at {world:?}"
+        );
+    }
+
+    #[test]
+    fn a_node_under_a_boolean_is_still_found() {
+        let mut b = Builder::new();
+        let a = b.sphere(1.0).unwrap();
+        let c = b.cube(1.0).unwrap();
+        let moved = b.translate(c, Vec3::new(4.0, 0.0, 0.0)).unwrap();
+        let u = b.union(a, moved).unwrap();
+
+        let placed = placement_of(&b.arena, u, c).expect("reachable");
+        assert!((placed.apply_point(Vec3::ZERO) - Vec3::new(4.0, 0.0, 0.0)).length() < 1.0e-4);
+    }
+
+    #[test]
+    fn an_unreachable_node_has_no_placement() {
+        let mut b = Builder::new();
+        let a = b.sphere(1.0).unwrap();
+        let orphan = b.cube(1.0).unwrap();
+        assert!(placement_of(&b.arena, a, orphan).is_none());
+    }
+}

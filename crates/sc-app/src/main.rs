@@ -5,6 +5,7 @@
 //! top in a second pass. No intermediate texture, no copy.
 
 mod dialog;
+mod icon;
 mod plane;
 mod settings;
 mod snapshot;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 
 use sc_geom::glam::Vec2;
 use sc_render::{gpu, Renderer};
-use state::AppState;
+use state::{AppState, MenuTarget};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -27,7 +28,17 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--snapshot") {
         let path = args.get(i + 1).map_or("shapecad.png", String::as_str);
-        let dialog = args.iter().any(|a| a == "--dialog");
+        let scene = if args.iter().any(|a| a == "--dialog") {
+            snapshot::Scene::Dialog
+        } else if args.iter().any(|a| a == "--sample") {
+            snapshot::Scene::Sample
+        } else if args.iter().any(|a| a == "--hover") {
+            snapshot::Scene::Hover
+        } else if args.iter().any(|a| a == "--menu") {
+            snapshot::Scene::Menu
+        } else {
+            snapshot::Scene::Empty
+        };
         let value = |flag: &str| -> Option<f32> {
             let i = args.iter().position(|a| a == flag)?;
             args.get(i + 1)?.parse().ok()
@@ -35,7 +46,7 @@ fn main() {
         let width = value("--width").unwrap_or(1500.0) as u32;
         let height = value("--height").unwrap_or(940.0) as u32;
         let scale = value("--scale").unwrap_or(1.0);
-        snapshot::write(std::path::Path::new(path), width, height, dialog, scale);
+        snapshot::write(std::path::Path::new(path), width, height, scene, scale);
         return;
     }
 
@@ -87,7 +98,7 @@ const CLICK_SLOP: f64 = 5.0;
 ///
 /// This has to be decided here rather than taken from egui. `egui_wants_pointer_input`
 /// is true whenever the pointer is merely *over* an egui area, and the viewport
-/// is itself a `CentralPanel` — so honouring egui's `consumed` flag for pointer
+/// is itself a `CentralPanel`, so honouring egui's `consumed` flag for pointer
 /// events swallows every click and drag in the 3D view.
 fn viewport_owns_pointer(x: f32, y: f32, viewport: [f32; 4], overlays: &[[f32; 4]]) -> bool {
     let inside = |r: [f32; 4]| x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3];
@@ -179,6 +190,14 @@ struct App {
     /// In sketch mode the left button both places points and orbits; the
     /// difference is whether the pointer moved.
     press_at: Option<PhysicalPosition<f64>>,
+    /// Where the right button went down, so a click can be told from a pan.
+    ///
+    /// Right drag pans and right click opens the context menu, so the two are
+    /// separated the same way the left button separates click from orbit.
+    right_press_at: Option<PhysicalPosition<f64>>,
+    /// The press currently in flight only closed the context menu, so its
+    /// release must not be read as a click on the model.
+    dismissing_press: bool,
     /// When the last frame was drawn, for frame-rate independent smoothing.
     last_frame: std::time::Instant,
     /// When and where the last click landed, for double-click detection.
@@ -197,6 +216,8 @@ impl App {
             input: Pointer::default(),
             cursor: None,
             press_at: None,
+            right_press_at: None,
+            dismissing_press: false,
             last_frame: std::time::Instant::now(),
             last_click: None,
             scale_undetermined: false,
@@ -392,10 +413,47 @@ impl App {
     /// A press and release in the same place is a click; anything further was a
     /// drag, and the camera has already acted on it.
     fn drag_distance(&self) -> f64 {
-        match (self.press_at, self.cursor) {
+        Self::distance(self.press_at, self.cursor)
+    }
+
+    fn right_drag_distance(&self) -> f64 {
+        Self::distance(self.right_press_at, self.cursor)
+    }
+
+    fn distance(from: Option<PhysicalPosition<f64>>, to: Option<PhysicalPosition<f64>>) -> f64 {
+        match (from, to) {
             (Some(a), Some(b)) => ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt(),
             _ => f64::MAX,
         }
+    }
+
+    /// Opens the context menu for whatever the pointer is over.
+    ///
+    /// The menu position is in interface points, which is what egui lays out
+    /// in, so the physical cursor position is divided by the scale factor.
+    fn open_context_menu(&mut self) {
+        let Some(cursor) = self.cursor else {
+            return;
+        };
+        let scale = self
+            .gpu
+            .as_ref()
+            .map_or(1.0, |gpu| gpu.egui_state.egui_ctx().pixels_per_point());
+        let at = (cursor.x as f32 / scale, cursor.y as f32 / scale);
+
+        let target = if self.state.sketch.is_some() {
+            MenuTarget::Sketch
+        } else {
+            // The same pick the left button uses, so the menu is about the
+            // thing the user believes they clicked.
+            self.select_under_pointer();
+            match self.state.selected {
+                Some(id) => MenuTarget::Node(id),
+                None => MenuTarget::Empty,
+            }
+        };
+        self.state.open_menu(at, target);
+        self.request_redraw();
     }
 
     /// Selects whatever is under the pointer, or clears the selection.
@@ -419,17 +477,14 @@ impl App {
             1.0 - ((cursor.y as f32 - top) / height) * 2.0,
         );
         let aspect = width / height.max(1.0);
-        let plane = self.state.plane;
-        match self
-            .state
-            .camera()
-            .plane_hit(ndc, aspect, sc_geom::glam::Vec3::ZERO, plane.normal())
-        {
+        let origin = self.state.plane_origin();
+        let normal = self.state.plane_normal();
+        match self.state.camera().plane_hit(ndc, aspect, origin, normal) {
             Some(hit) => {
-                let snapped = self.state.snap(plane.to_plane(hit));
+                let snapped = self.state.snap(self.state.to_plane(hit));
                 self.state.add_sketch_point(snapped);
             }
-            None => self.state.status = format!("That is not on the {} plane", plane.name()),
+            None => self.state.status = "That is not on the sketch plane".to_string(),
         }
     }
 
@@ -437,6 +492,24 @@ impl App {
     /// point, or focuses on a double click.
     fn handle_mouse_button(&mut self, state: ElementState, button: MouseButton) {
         let down = state == ElementState::Pressed;
+
+        // A press in the 3D view dismisses an open menu and does nothing else:
+        // the click that closes a menu should not also select or orbit. A press
+        // over the menu itself is left alone, since that is an item being
+        // chosen, and one over a panel is dismissed by `ui::context_menu`.
+        if down && self.state.menu.is_some() && self.pointer_in_viewport() {
+            self.state.close_menu();
+            self.dismissing_press = true;
+            self.input.gesture = Gesture::None;
+            self.request_redraw();
+            return;
+        }
+        if !down && self.dismissing_press {
+            self.dismissing_press = false;
+            self.input.gesture = Gesture::None;
+            return;
+        }
+
         if down && (self.input.egui_owns || !self.pointer_in_viewport()) {
             return;
         }
@@ -479,7 +552,16 @@ impl App {
                 }
                 self.input.gesture = if down { Gesture::Orbit } else { Gesture::None };
             }
-            MouseButton::Right | MouseButton::Middle => {
+            MouseButton::Right => {
+                if down {
+                    self.right_press_at = self.cursor;
+                } else if self.right_drag_distance() < CLICK_SLOP && self.pointer_in_viewport() {
+                    // A right click rather than a pan.
+                    self.open_context_menu();
+                }
+                self.input.gesture = if down { Gesture::Pan } else { Gesture::None };
+            }
+            MouseButton::Middle => {
                 self.input.gesture = if down { Gesture::Pan } else { Gesture::None };
             }
             _ => {}
@@ -584,7 +666,7 @@ impl ApplicationHandler for App {
         // The chrome sees every event, but only gets to *claim* keyboard ones.
         //
         // For the pointer, egui reports "consumed" whenever the cursor is over
-        // any of its areas — and the viewport is a panel — so deferring to it
+        // any of its areas, and the viewport is a panel, so deferring to it
         // would mean the 3D view never receives a click. Pointer ownership is
         // decided by `viewport_owns_pointer` at each use instead.
         if let Some(gpu) = &mut self.gpu {

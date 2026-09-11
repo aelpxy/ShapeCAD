@@ -21,6 +21,7 @@ pub mod math;
 pub mod node;
 pub mod ops;
 pub mod pick;
+pub mod profile;
 pub mod wgsl;
 
 pub use arena::Arena;
@@ -32,6 +33,7 @@ pub use math::Transform;
 pub use node::{Node, NodeId};
 pub use ops::Builder;
 pub use pick::{pick, Hit};
+pub use profile::Profile;
 
 pub use glam;
 
@@ -150,7 +152,7 @@ mod tests {
             glam::Vec2::new(5.0, 5.0),
             glam::Vec2::new(-5.0, 5.0),
         ];
-        let e = b.extrude(square, 10.0).unwrap();
+        let e = b.extrude(Profile::Path { points: square }, 10.0).unwrap();
 
         // Sits on its own plane rather than straddling it.
         assert_near(eval(&b.arena, e, Vec3::new(0.0, 0.0, 0.0)), 0.0, "base");
@@ -188,9 +190,9 @@ mod tests {
         let cw: Vec<_> = ccw.iter().rev().copied().collect();
 
         let mut a = Builder::new();
-        let ea = a.extrude(ccw, 6.0).unwrap();
+        let ea = a.extrude(Profile::Path { points: ccw }, 6.0).unwrap();
         let mut c = Builder::new();
-        let ec = c.extrude(cw, 6.0).unwrap();
+        let ec = c.extrude(Profile::Path { points: cw }, 6.0).unwrap();
 
         for p in [
             Vec3::new(0.0, 0.0, 3.0),
@@ -209,8 +211,13 @@ mod tests {
     fn degenerate_profiles_are_rejected() {
         let mut b = Builder::new();
         assert!(
-            b.extrude(vec![glam::Vec2::ZERO, glam::Vec2::X], 5.0)
-                .is_err(),
+            b.extrude(
+                Profile::Path {
+                    points: vec![glam::Vec2::ZERO, glam::Vec2::X]
+                },
+                5.0
+            )
+            .is_err(),
             "two points"
         );
         let collinear = vec![
@@ -218,9 +225,15 @@ mod tests {
             glam::Vec2::new(1.0, 0.0),
             glam::Vec2::new(2.0, 0.0),
         ];
-        assert!(b.extrude(collinear, 5.0).is_err(), "zero area");
-        let square = Builder::regular_polygon(4, 5.0);
-        assert!(b.extrude(square, -1.0).is_err(), "negative height");
+        assert!(
+            b.extrude(Profile::Path { points: collinear }, 5.0).is_err(),
+            "zero area"
+        );
+        let square = Profile::RegularPolygon {
+            sides: 4,
+            radius: 5.0,
+        };
+        assert!(b.extrude(square, -1.0).is_err(), "negative depth");
     }
 
     #[test]
@@ -342,7 +355,15 @@ mod tests {
         let tr = b.translate(i, Vec3::X).unwrap();
         let of = b.offset(tr, 0.05).unwrap();
         let sh = b.shell(of, 0.4).unwrap();
-        let ex = b.extrude(Builder::regular_polygon(6, 1.5), 2.0).unwrap();
+        let ex = b
+            .extrude(
+                Profile::RegularPolygon {
+                    sides: 6,
+                    radius: 1.5,
+                },
+                2.0,
+            )
+            .unwrap();
         let joined = b.union(sh, ex).unwrap();
         let root = b.union(joined, pl).unwrap();
 
@@ -391,15 +412,24 @@ mod tests {
             ]
         };
         let mut b = Builder::new();
-        let e = b.extrude(square(5.0), 10.0).unwrap();
+        let e = b
+            .extrude(
+                Profile::Path {
+                    points: square(5.0),
+                },
+                10.0,
+            )
+            .unwrap();
         let before = wgsl::generate(&b.arena, Some(e));
 
         b.arena
             .replace(
                 e,
                 Node::Extrude {
-                    profile: square(8.0),
-                    height: 10.0,
+                    profile: Profile::Path {
+                        points: square(8.0),
+                    },
+                    depth: 10.0,
                 },
             )
             .unwrap();
@@ -501,7 +531,15 @@ mod tests {
             .unwrap();
         let of = b.offset(rot, 0.05).unwrap();
         let sh = b.shell(of, 0.4).unwrap();
-        let ex = b.extrude(Builder::regular_polygon(5, 1.2), 3.0).unwrap();
+        let ex = b
+            .extrude(
+                Profile::RegularPolygon {
+                    sides: 5,
+                    radius: 1.2,
+                },
+                3.0,
+            )
+            .unwrap();
         let joined = b.smooth_union(sh, ex, 0.2).unwrap();
         let root = b.smooth_union(joined, pl, 0.25).unwrap();
         (b, root)

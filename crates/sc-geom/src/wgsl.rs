@@ -320,13 +320,10 @@ impl Emitter<'_> {
                 }
             }
 
-            Node::Extrude {
-                ref profile,
-                height,
-            } => {
+            Node::Extrude { ref profile, depth } => {
                 self.counter += 1;
                 let name = format!("sc_extrude_{}", self.counter);
-                self.emit_extrude_fn(&name, profile, height);
+                self.emit_extrude_fn(&name, profile, depth);
                 let d = self.fresh("d");
                 self.line(&format!("let {d} = {name}({p});"));
                 d
@@ -346,19 +343,30 @@ impl Emitter<'_> {
 
     /// Emits a function computing the exact distance to an extruded profile.
     ///
-    /// The vertex count is structural and appears as a literal loop bound; the
-    /// vertices themselves are read from the parameter buffer, so dragging a
-    /// sketch point does not recompile anything, and the generated code no
-    /// longer grows with the profile.
-    fn emit_extrude_fn(&mut self, name: &str, profile: &[glam::Vec2], height: f32) {
-        let n = profile.len();
-        let base = self.p_run(profile.iter().flat_map(|v| [v.x, v.y]));
-        let h = self.p(height);
-
-        let _ = write!(
-            self.helpers,
-            "\nfn {name}(p: vec3<f32>) -> f32 {{
-    let q = p.xy;
+    /// A rectangle and a circle get closed forms; anything else walks its
+    /// polygon. The vertex count is structural and appears as a literal loop
+    /// bound, while the vertices come from the parameter buffer, so dragging a
+    /// dimension does not recompile anything.
+    fn emit_extrude_fn(&mut self, name: &str, profile: &crate::Profile, depth: f32) {
+        let plane = match profile {
+            crate::Profile::Rect { width, height } => {
+                let (hw, hh) = (self.p(width * 0.5), self.p(height * 0.5));
+                format!(
+                    "    let q = abs(p.xy) - vec2<f32>({hw}, {hh});
+    let plane = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
+"
+                )
+            }
+            crate::Profile::Circle { radius } => {
+                let r = self.p(*radius);
+                format!("    let plane = length(p.xy) - {r};\n")
+            }
+            other => {
+                let poly = other.polygon();
+                let n = poly.len();
+                let base = self.p_run(poly.iter().flat_map(|v| [v.x, v.y]));
+                format!(
+                    "    let q = p.xy;
     var d = 1e30;
     var s = 1.0;
     for (var i = 0u; i < {n}u; i = i + 1u) {{
@@ -369,7 +377,7 @@ impl Emitter<'_> {
         let w = q - vi;
         let b = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
         d = min(d, dot(b, b));
-        // Written as three scalars rather than a bool vector: naga rejects a
+        // Three scalars rather than a bool vector: naga rejects a
         // `vec3<bool>` constructor here.
         let c0 = q.y >= vi.y;
         let c1 = q.y < vj.y;
@@ -377,7 +385,16 @@ impl Emitter<'_> {
         if ((c0 && c1 && c2) || (!c0 && !c1 && !c2)) {{ s = -s; }}
     }}
     let plane = s * sqrt(d);
-    let slab = max(-p.z, p.z - {h});
+"
+                )
+            }
+        };
+
+        let h = self.p(depth);
+        let _ = write!(
+            self.helpers,
+            "\nfn {name}(p: vec3<f32>) -> f32 {{
+{plane}    let slab = max(-p.z, p.z - {h});
     return min(max(plane, slab), 0.0) + length(max(vec2<f32>(plane, slab), vec2<f32>(0.0)));
 }}\n"
         );

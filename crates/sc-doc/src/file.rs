@@ -2,7 +2,7 @@
 //!
 //! A `.shapecad` file is JSON: the node arena, the root, and the names. Plain
 //! text rather than a container because it diffs cleanly in version control and
-//! is directly legible to a language model — which matters for a tool whose
+//! is directly legible to a language model, which matters for a tool whose
 //! premise is that agents can read and edit designs.
 //!
 //! The edit log is deliberately *not* saved. It grows without bound, whereas the
@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Bumped whenever the on-disk shape changes incompatibly.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// Version 2 made an extrusion's profile parametric. A rectangle is now a width
+/// and a height rather than four points, which an older build cannot read.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Conventional file extension, without the dot.
 pub const EXTENSION: &str = "shapecad";

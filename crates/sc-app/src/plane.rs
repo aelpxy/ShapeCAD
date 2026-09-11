@@ -32,6 +32,16 @@ impl SketchPlane {
         }
     }
 
+    /// What sketching on this plane means, in the terms a printed part is
+    /// thought about: which way is up, and which way a pad grows.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Xy => "The build plate. Sketches lie flat and pads grow upwards, which is how most printed parts start.",
+            Self::Xz => "The front elevation. Sketches stand upright and pads grow towards you along Y.",
+            Self::Yz => "The side elevation. Sketches stand upright and pads grow to the right along X.",
+        }
+    }
+
     /// The in-plane axes and the normal, as a right-handed frame.
     ///
     /// Sketch coordinates are expressed against `u` and `v`; an extrusion runs
@@ -46,20 +56,10 @@ impl SketchPlane {
         }
     }
 
-    pub(crate) fn normal(self) -> Vec3 {
-        self.frame().2
-    }
-
     /// Lifts a sketch coordinate into the model.
     pub(crate) fn to_world(self, point: Vec2) -> Vec3 {
         let (u, v, _) = self.frame();
         u * point.x + v * point.y
-    }
-
-    /// Drops a model point onto the plane's coordinates.
-    pub(crate) fn to_plane(self, point: Vec3) -> Vec2 {
-        let (u, v, _) = self.frame();
-        Vec2::new(point.dot(u), point.dot(v))
     }
 
     /// The transform that carries geometry built in sketch coordinates into the
@@ -68,14 +68,32 @@ impl SketchPlane {
     /// An `Extrude` is defined in its own XY plane sweeping along +Z, so placing
     /// one is exactly a rotation from that frame onto this one.
     pub(crate) fn placement(self) -> Transform {
+        self.placement_at(0.0)
+    }
+
+    /// As [`SketchPlane::placement`], shifted along the normal.
+    ///
+    /// A pocket has to begin outside the material it cuts, so it is placed
+    /// behind the plane and swept far enough to emerge.
+    pub(crate) fn placement_at(self, offset: f32) -> Transform {
         let (u, v, n) = self.frame();
-        Transform::from_rotation(Quat::from_mat3(&Mat3::from_cols(u, v, n)))
+        Transform {
+            translation: n * offset,
+            rotation: Quat::from_mat3(&Mat3::from_cols(u, v, n)),
+            scale: 1.0,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything else derives from the frame, so it is what the tests pin down.
+    fn to_world(plane: SketchPlane, p: Vec2) -> Vec3 {
+        let (u, v, _) = plane.frame();
+        u * p.x + v * p.y
+    }
 
     #[test]
     fn every_frame_is_right_handed() {
@@ -91,23 +109,9 @@ mod tests {
     }
 
     #[test]
-    fn sketch_coordinates_survive_the_round_trip() {
-        for plane in SketchPlane::ALL {
-            for point in [Vec2::new(3.0, -7.0), Vec2::ZERO, Vec2::new(-12.5, 40.0)] {
-                let back = plane.to_plane(plane.to_world(point));
-                assert!(
-                    (back - point).length() < 1.0e-5,
-                    "{} mangled {point:?} into {back:?}",
-                    plane.name()
-                );
-            }
-        }
-    }
-
-    #[test]
     fn placement_matches_the_frame() {
-        // The placement must carry the extrusion's own axes onto the plane's,
-        // or a pad comes out facing the wrong way.
+        // The placement must carry the extrusion's own axes onto the plane's, or
+        // a pad comes out facing the wrong way.
         for plane in SketchPlane::ALL {
             let (u, v, n) = plane.frame();
             let placed = plane.placement();
@@ -123,10 +127,30 @@ mod tests {
     }
 
     #[test]
+    fn a_placement_carries_sketch_coordinates_into_the_model() {
+        for plane in SketchPlane::ALL {
+            for p in [Vec2::new(3.0, -7.0), Vec2::ZERO, Vec2::new(-12.5, 40.0)] {
+                let through_placement = plane.placement().apply_point(Vec3::new(p.x, p.y, 0.0));
+                assert!(
+                    (through_placement - to_world(plane, p)).length() < 1.0e-5,
+                    "{} placed {p:?} at {through_placement:?}",
+                    plane.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_offset_placement_moves_along_the_normal() {
+        let placed = SketchPlane::Xy.placement_at(-3.0);
+        assert!((placed.translation - Vec3::new(0.0, 0.0, -3.0)).length() < 1.0e-6);
+    }
+
+    #[test]
     fn the_build_plate_is_the_identity() {
-        assert_eq!(SketchPlane::Xy.normal(), Vec3::Z);
+        assert_eq!(SketchPlane::Xy.placement(), Transform::IDENTITY);
         assert_eq!(
-            SketchPlane::Xy.to_world(Vec2::new(5.0, 6.0)),
+            to_world(SketchPlane::Xy, Vec2::new(5.0, 6.0)),
             Vec3::new(5.0, 6.0, 0.0)
         );
     }

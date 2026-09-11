@@ -1,6 +1,6 @@
 //! Ergonomic construction of implicit DAGs.
 //!
-//! Thin sugar over [`Arena`] — no logic of its own, so it cannot drift from the
+//! Thin sugar over [`Arena`], with no logic of its own, so it cannot drift from the
 //! kernel. Used by tests, the CLI and (later) the agent layer's tool handlers.
 
 use crate::arena::Arena;
@@ -133,19 +133,8 @@ impl Builder {
     ///
     /// # Errors
     /// Propagates validation failures from [`Arena::insert`].
-    pub fn extrude(&mut self, profile: Vec<glam::Vec2>, height: f32) -> Result<NodeId> {
-        self.arena.insert(Node::Extrude { profile, height })
-    }
-
-    /// A regular polygon profile, convenient for tests and defaults.
-    #[must_use]
-    pub fn regular_polygon(sides: usize, radius: f32) -> Vec<glam::Vec2> {
-        (0..sides.max(3))
-            .map(|i| {
-                let a = i as f32 / sides.max(3) as f32 * std::f32::consts::TAU;
-                glam::Vec2::new(radius * a.cos(), radius * a.sin())
-            })
-            .collect()
+    pub fn extrude(&mut self, profile: crate::Profile, depth: f32) -> Result<NodeId> {
+        self.arena.insert(Node::Extrude { profile, depth })
     }
 
     /// # Errors

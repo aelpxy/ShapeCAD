@@ -1,18 +1,12 @@
 //! The implicit node tree: `ShapeCAD`'s document representation of geometry.
 //!
-//! This is a DAG, not a tree — subtrees may be shared. It is the authoritative
+//! This is a DAG, not a tree: subtrees may be shared. It is the authoritative
 //! description of a model; evaluation backends (CPU, WGSL, `fidget`) all consume
 //! it and none of them own it.
 
 use crate::math::Transform;
+use crate::profile::Profile;
 use glam::{Vec2, Vec3};
-
-/// Upper bound on profile complexity.
-///
-/// Profiles are currently emitted into the shader as literal arrays, so an
-/// unbounded one would produce an unusable amount of generated code. Lifting
-/// this means moving profile data into a storage buffer.
-pub const MAX_PROFILE_POINTS: usize = 256;
 
 /// Twice the signed area of a polygon, by the shoelace formula.
 ///
@@ -33,7 +27,7 @@ pub fn polygon_area(points: &[Vec2]) -> f32 {
 /// A stable handle to a node.
 ///
 /// Ids are never reused, even after deletion. That stability is what lets the UI
-/// hold a selection, and an AI agent hold a reference, across arbitrary edits —
+/// hold a selection, and an AI agent hold a reference, across arbitrary edits,
 /// and it is why the topological naming problem that plagues B-rep kernels does
 /// not arise here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -140,17 +134,17 @@ pub enum Node {
         /// Distance to grow by; negative shrinks.
         distance: f32,
     },
-    /// A closed 2D profile swept along +Z: the implicit equivalent of a pad.
+    /// A closed profile swept along +Z: the implicit equivalent of a pad.
     ///
-    /// The profile lives in the local XY plane and the solid runs from z = 0 to
-    /// z = `height`, so a sketch sits on its own plane rather than straddling
-    /// it. Place it in space with an enclosing [`Node::Transform`].
+    /// The profile is parametric, so a rectangle stays a width and a height and
+    /// can be re-dimensioned long after it was drawn. The solid runs from z = 0
+    /// to z = `depth`, so a sketch sits on its own plane rather than straddling
+    /// it; place it with an enclosing [`Node::Transform`].
     Extrude {
-        /// Closed polygon, in order. The winding may be either way; the field
-        /// determines inside-ness by crossing count, not by orientation.
-        profile: Vec<Vec2>,
+        /// The region being swept.
+        profile: Profile,
         /// Distance swept along +Z. Must be positive.
-        height: f32,
+        depth: f32,
     },
     /// Hollows the solid inward, preserving the outer surface.
     Shell {
@@ -219,7 +213,17 @@ impl Node {
     /// edits generically instead of matching on every variant.
     #[must_use]
     pub fn params(&self) -> Vec<(&'static str, f32)> {
+        // Matched by reference first: a profile is not `Copy`, and its own
+        // dimensions are part of the feature's.
+        if let Node::Extrude { profile, depth } = self {
+            let mut out = profile.params();
+            out.push(("depth", *depth));
+            return out;
+        }
         match *self {
+            // Handled above; it cannot be bound here because a profile is not
+            // `Copy`.
+            Node::Extrude { .. } => unreachable!("extrude is handled before the copy match"),
             Node::Sphere { radius } => vec![("radius", radius)],
             Node::Box { half, round } => vec![
                 ("half_x", half.x),
@@ -253,7 +257,7 @@ impl Node {
                 ("scale", xform.scale),
             ],
             Node::Offset { distance, .. } => vec![("distance", distance)],
-            Node::Extrude { height, .. } => vec![("height", height)],
+
             Node::Shell { thickness, .. } => vec![("thickness", thickness)],
         }
     }
@@ -261,6 +265,13 @@ impl Node {
     /// Set a named parameter. Returns false if the name is not valid for this
     /// node kind, leaving the node untouched.
     pub fn set_param(&mut self, name: &str, v: f32) -> bool {
+        if let Node::Extrude { profile, depth } = self {
+            if name == "depth" {
+                *depth = v;
+                return true;
+            }
+            return profile.set_param(name, v);
+        }
         match self {
             Node::Sphere { radius } if name == "radius" => *radius = v,
             Node::Box { half, round } => match name {
@@ -307,7 +318,7 @@ impl Node {
                 _ => return false,
             },
             Node::Offset { distance, .. } if name == "distance" => *distance = v,
-            Node::Extrude { height, .. } if name == "height" => *height = v,
+
             Node::Shell { thickness, .. } if name == "thickness" => *thickness = v,
             _ => return false,
         }
@@ -322,12 +333,8 @@ impl Node {
         if !finite {
             return false;
         }
-        if let Node::Extrude { profile, height } = self {
-            return *height > 0.0
-                && profile.len() >= 3
-                && profile.len() <= MAX_PROFILE_POINTS
-                && profile.iter().all(|p| p.is_finite())
-                && polygon_area(profile).abs() > 1.0e-6;
+        if let Node::Extrude { profile, depth } = self {
+            return *depth > 0.0 && depth.is_finite() && profile.is_valid();
         }
         match *self {
             Node::Sphere { radius } => radius > 0.0,

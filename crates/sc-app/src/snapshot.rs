@@ -2,21 +2,58 @@
 //!
 //! egui needs no window: given a synthetic screen rectangle it will lay out and
 //! tessellate exactly as it would on screen. That makes the full UI renderable
-//! without a display, which is what lets the interface be reviewed in CI — and,
+//! without a display, which is what lets the interface be reviewed in CI, and
 //! later, lets an agent see what the user is looking at.
 
 use crate::state::AppState;
 use crate::ui;
 use sc_render::{gpu, snapshot as capture, Renderer};
 
+/// Where the pointer sits for [`Scene::Hover`]: the Rectangle tool row, in
+/// points. Chosen by eye from a capture at the default size.
+const HOVER_POINT: egui::Pos2 = egui::pos2(100.0, 315.0);
+
+/// Where [`Scene::Menu`] opens the context menu, in points. Over the middle of
+/// the 3D view, which is where a right click on the model would land.
+const MENU_POINT: (f32, f32) = (620.0, 380.0);
+
+/// What the captured frame should show beyond an empty document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Scene {
+    /// A new, empty document.
+    #[default]
+    Empty,
+    /// The file browser open over an empty document.
+    Dialog,
+    /// The bundled sample model, with its root selected.
+    Sample,
+    /// The pointer resting on a tool row, so its tooltip is captured.
+    Hover,
+    /// The context menu open on the sample model's root.
+    Menu,
+}
+
 /// Renders one frame of the application to a PNG.
 ///
 /// # Panics
 /// If no GPU is available or the image cannot be written.
-pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, dialog: bool, scale: f32) {
+pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scene, scale: f32) {
     let mut state = AppState::new();
-    if dialog {
-        state.browse(crate::dialog::Purpose::Open);
+    match scene {
+        // Hover changes where the pointer is, not what the document holds.
+        Scene::Empty | Scene::Hover => {}
+        Scene::Dialog => state.browse(crate::dialog::Purpose::Open),
+        Scene::Sample => {
+            state.load_sample();
+            let root = state.doc.root();
+            state.select(root);
+        }
+        Scene::Menu => {
+            state.load_sample();
+            if let Some(root) = state.doc.root() {
+                state.open_menu(MENU_POINT, crate::state::MenuTarget::Node(root));
+            }
+        }
     }
 
     let instance = gpu::instance();
@@ -56,11 +93,22 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, dialog: boo
     // entire UI.
     let mut chrome = crate::ui::Chrome::default();
     let mut output = None;
-    for pass in 0..3 {
+    // A tooltip only appears after the pointer has rested on a widget, and its
+    // Area then needs its own sizing pass, so the hover capture runs longer.
+    let passes = if scene == Scene::Hover { 8 } else { 3 };
+    for pass in 0..passes {
         // Time has to advance between passes or egui's animations never run:
         // a modal would be captured mid fade-in, half transparent.
         let mut frame_input = input.clone();
-        frame_input.time = Some(f64::from(pass));
+        frame_input.time = Some(f64::from(pass) * 0.25);
+        // The pointer is moved once and then left alone: egui measures the
+        // tooltip delay from the last movement, so repeating the event on every
+        // pass would keep resetting it and no tooltip would ever appear.
+        if scene == Scene::Hover && pass == 0 {
+            frame_input
+                .events
+                .push(egui::Event::PointerMoved(HOVER_POINT));
+        }
         let frame = ctx.run_ui(frame_input, |ui| {
             chrome = ui::draw(ui, &mut state);
         });

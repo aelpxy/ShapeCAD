@@ -55,9 +55,13 @@ fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
             b.arena.insert(node)
         }
         Shape::Torus(major, minor) => b.torus(*major, minor.min(major * 0.9)),
-        Shape::Extrude(sides, radius, height) => {
-            b.extrude(Builder::regular_polygon(*sides, *radius), *height)
-        }
+        Shape::Extrude(sides, radius, height) => b.extrude(
+            sc_geom::Profile::RegularPolygon {
+                sides: *sides as u32,
+                radius: *radius,
+            },
+            *height,
+        ),
         Shape::Union(x, y, k) => {
             let (a, c) = (materialize(x, b)?, materialize(y, b)?);
             b.smooth_union(a, c, *k)
