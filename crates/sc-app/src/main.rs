@@ -94,6 +94,33 @@ fn monitor_width(event_loop: &ActiveEventLoop, window: &Window) -> u32 {
 /// click, in physical pixels.
 const CLICK_SLOP: f64 = 5.0;
 
+/// What has to happen to the swapchain before a frame can be drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceState {
+    /// The window has no area, which is what a minimised window reports.
+    /// Nothing can be drawn and nothing should be requested, or the loop spins.
+    Skip,
+    /// The swapchain no longer matches the window and has to be rebuilt.
+    Rebuild,
+    /// The two agree. Draw.
+    Ready,
+}
+
+/// Compares the swapchain's size with the window's.
+///
+/// Split out from the frame loop because it is the rule that decides whether a
+/// frame is drawn at the right size, and that is worth being able to test
+/// without a window.
+fn surface_state(config: (u32, u32), window: (u32, u32)) -> SurfaceState {
+    if window.0 == 0 || window.1 == 0 {
+        SurfaceState::Skip
+    } else if config == window {
+        SurfaceState::Ready
+    } else {
+        SurfaceState::Rebuild
+    }
+}
+
 /// Whether a pointer position belongs to the 3D view rather than to chrome.
 ///
 /// This has to be decided here rather than taken from egui. `egui_wants_pointer_input`
@@ -103,6 +130,35 @@ const CLICK_SLOP: f64 = 5.0;
 fn viewport_owns_pointer(x: f32, y: f32, viewport: [f32; 4], overlays: &[[f32; 4]]) -> bool {
     let inside = |r: [f32; 4]| x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3];
     inside(viewport) && !overlays.iter().copied().any(inside)
+}
+
+/// Takes the next surface texture, recovering from the ways that can fail.
+///
+/// When it fails, nothing is drawn and the window keeps showing the last image
+/// it was given. The event loop waits for input, so another frame has to be
+/// asked for here or that stale image stays on screen. Right after a resize
+/// that image is the previous frame at the previous size, which is exactly the
+/// smaller copy of the interface people see in the corner of the window.
+fn acquire(gpu: &Gpu) -> Option<wgpu::SurfaceTexture> {
+    match gpu.surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+            Some(t)
+        }
+        other => {
+            if matches!(
+                other,
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost
+            ) {
+                gpu.surface.configure(&gpu.device, &gpu.config);
+            }
+            // An occluded window is the one case where retrying is wrong:
+            // nothing can be presented and the request would spin.
+            if !matches!(other, wgpu::CurrentSurfaceTexture::Occluded) {
+                gpu.window.request_redraw();
+            }
+            None
+        }
+    }
 }
 
 /// Uploads egui's textures and buffers, then draws its output over the frame.
@@ -236,18 +292,38 @@ impl App {
         )
     }
 
-    fn resize(&mut self, width: u32, height: u32) {
-        if let Some(gpu) = &mut self.gpu {
-            if width == 0 || height == 0 {
-                return;
+    /// Reconciles the swapchain with the window. False if there is nothing to
+    /// draw into.
+    ///
+    /// This happens at draw time rather than when a resize is announced,
+    /// because Wayland does not guarantee that a resize arrives before the
+    /// frame that needs it. A frame drawn at the old size is still presented
+    /// at the new one, which is what leaves a smaller copy of the previous
+    /// frame sitting inside the window.
+    fn reconcile_surface(&mut self) -> bool {
+        let Some(gpu) = &mut self.gpu else {
+            return false;
+        };
+        let size = gpu.window.inner_size();
+        match surface_state(
+            (gpu.config.width, gpu.config.height),
+            (size.width, size.height),
+        ) {
+            SurfaceState::Skip => return false,
+            SurfaceState::Rebuild => {
+                gpu.config.width = size.width;
+                gpu.config.height = size.height;
+                gpu.surface.configure(&gpu.device, &gpu.config);
             }
-            gpu.config.width = width;
-            gpu.config.height = height;
-            gpu.surface.configure(&gpu.device, &gpu.config);
+            SurfaceState::Ready => {}
         }
+        true
     }
 
     fn redraw(&mut self) {
+        if !self.reconcile_surface() {
+            return;
+        }
         let Some(gpu) = &mut self.gpu else { return };
 
         // Ease the camera toward wherever input sent it, and keep requesting
@@ -298,15 +374,7 @@ impl App {
             self.state.field_dirty = false;
         }
 
-        let frame = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                gpu.surface.configure(&gpu.device, &gpu.config);
-                return;
-            }
-            _ => return,
-        };
+        let Some(frame) = acquire(gpu) else { return };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -583,7 +651,14 @@ impl ApplicationHandler for App {
 
         let attrs = Window::default_attributes()
             .with_title("ShapeCAD")
-            .with_inner_size(winit::dpi::LogicalSize::new(1500.0, 940.0));
+            // Opens filling the display. A CAD viewport is worth the whole
+            // screen, and on a 4K panel a 1500 point window is a postage stamp.
+            // The inner size is what un-maximising restores to.
+            .with_maximized(true)
+            .with_inner_size(winit::dpi::LogicalSize::new(1500.0, 940.0))
+            // Below this the panels take the whole window and the 3D view has
+            // nowhere left to go.
+            .with_min_inner_size(winit::dpi::LogicalSize::new(900.0, 600.0));
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
@@ -692,8 +767,10 @@ impl ApplicationHandler for App {
                 self.input.shift = mods.state().shift_key();
             }
 
-            WindowEvent::Resized(size) => {
-                self.resize(size.width, size.height);
+            WindowEvent::Resized(_) => {
+                // The new size is read back from the window in `redraw`, so
+                // there is exactly one place that decides how big the surface
+                // is and it cannot disagree with the frame being drawn.
                 self.retry_scale_detection(event_loop);
                 self.request_redraw();
             }
@@ -762,7 +839,7 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
-    use super::viewport_owns_pointer;
+    use super::{surface_state, viewport_owns_pointer, SurfaceState};
 
     const VIEWPORT: [f32; 4] = [300.0, 60.0, 1000.0, 800.0];
 
@@ -802,5 +879,37 @@ mod tests {
         assert!(viewport_owns_pointer(300.0, 60.0, VIEWPORT, &[]));
         assert!(viewport_owns_pointer(1300.0, 860.0, VIEWPORT, &[]));
         assert!(!viewport_owns_pointer(1300.1, 860.0, VIEWPORT, &[]));
+    }
+    /// A minimised window reports no area. Drawing is impossible, and asking
+    /// for another frame would spin the event loop at full speed.
+    #[test]
+    fn a_window_with_no_area_is_skipped() {
+        assert_eq!(surface_state((800, 600), (0, 600)), SurfaceState::Skip);
+        assert_eq!(surface_state((800, 600), (800, 0)), SurfaceState::Skip);
+        assert_eq!(surface_state((800, 600), (0, 0)), SurfaceState::Skip);
+    }
+
+    /// The case behind the stale frame: the window grew, the swapchain did not.
+    /// Drawing without rebuilding presents the old, smaller frame in the new,
+    /// larger window.
+    #[test]
+    fn a_resized_window_rebuilds_the_swapchain() {
+        assert_eq!(
+            surface_state((1500, 940), (3840, 2053)),
+            SurfaceState::Rebuild
+        );
+        assert_eq!(
+            surface_state((3840, 2053), (1500, 940)),
+            SurfaceState::Rebuild
+        );
+        assert_eq!(
+            surface_state((1500, 940), (1500, 941)),
+            SurfaceState::Rebuild
+        );
+    }
+
+    #[test]
+    fn a_matching_swapchain_is_drawn_straight_away() {
+        assert_eq!(surface_state((1500, 940), (1500, 940)), SurfaceState::Ready);
     }
 }
