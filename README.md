@@ -1,7 +1,15 @@
-# ShapeCAD
+<p align="center">
+  <img src="assets/logo.svg" width="104" height="104" alt="">
+</p>
 
-ShapeCAD is an experimental desktop CAD app for designing parts to 3D print.
-It's written in Rust, with a GPU-rendered viewport and STL export.
+<h1 align="center">ShapeCAD</h1>
+
+<p align="center">
+  An experimental desktop CAD app for designing parts to 3D print.<br>
+  Written in Rust, with a GPU-rendered viewport and STL export.
+</p>
+
+---
 
 It's still early. Basic modeling works, but selection, sketching and meshing
 need more work before I'd trust it for everyday use.
