@@ -1,0 +1,24 @@
+[package]
+name = "sc-geom"
+description = "ShapeCAD implicit geometry: node tree, evaluation, bounds, WGSL codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Off by default: the kernel builds and tests with zero proc-macro
+# dependencies, which keeps it buildable in minimal environments.
+default = []
+serde = ["dep:serde", "glam/serde"]
+
+[lints]
+workspace = true
+
+[dependencies]
+glam = "0.33.7"
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+
+[dev-dependencies]
+naga = { version = "30.0.1", features = ["wgsl-in"] }
+proptest = "1.11.0"

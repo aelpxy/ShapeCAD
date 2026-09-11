@@ -1,0 +1,17 @@
+[package]
+name = "sc-mesh"
+description = "ShapeCAD meshing: dual contouring of the implicit field to printable geometry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sc-geom.workspace = true
+rayon = "1"
+
+[dev-dependencies]
+proptest = "1.11.0"

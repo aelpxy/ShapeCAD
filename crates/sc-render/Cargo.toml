@@ -1,0 +1,22 @@
+[package]
+name = "sc-render"
+description = "ShapeCAD viewport: sphere-traced rendering of the implicit field"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sc-geom.workspace = true
+sc-doc.workspace = true
+wgpu = "30.0.1"
+winit = "0.30.13"
+pollster = "1.0.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+png = "0.18.1"
+
+[dev-dependencies]
+pollster = "1.0.1"

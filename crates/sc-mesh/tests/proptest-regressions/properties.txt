@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 94a4255514f9bd087079ce26e30f782719aaadec18dc2503cda24fe0539d23c0 # shrinks to s = Translate(Difference(Sphere(4.5967336), Cylinder(3.0651832, 6.3379583), 0.0), [0.0, 0.0, 0.0])
+cc fff94fcf142dcec7d2944b205e2a1a8fa92b26b72687d1b322188b3486c2d86d # shrinks to s = Union(Translate(Sphere(5.904276), [0.0, -3.216206, -2.9064112]), Difference(Cylinder(5.683753, 2.0), Cuboid([4.468588, 6.602638, 2.0]), 0.0), 0.646039)
+cc e44c08af852e966b43b78e740fede7873362cfadec6d5da14f7e6cba46b355df # shrinks to s = Shell(Shell(Translate(Sphere(2.0215945), [-2.8973744, -4.3568473, 5.0063667]), 1.0), 1.0)
+cc 5a280ea1766b0ee7122d06dd93ae73ab4f5180ce3b7edb69c4844f7cb6c001f3 # shrinks to s = Difference(Cylinder(5.7604814, 2.0), Union(Sphere(5.068574), Sphere(2.0), 0.0), 1.1795771)

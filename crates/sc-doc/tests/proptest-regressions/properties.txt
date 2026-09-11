@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7bbf03948b5af262c8aeabff6b835b125c5a3dd89432263cd3f6e2036da80f07 # shrinks to actions = [AddSphere(0.5), Undo, AddSphere(0.5), UnionOf(0, 0, 0.0)]
+cc ef369400b8ecd8946f2a9791d185068227443abcb7a75bf1b8994d8ca50ea701 # shrinks to actions = [AddSphere(0.5), AddSphere(0.5), AddSphere(0.5), AddSphere(0.5), AddSphere(0.5), AddSphere(0.5), AddSphere(0.5), AddSphere(0.5), SetName(0, "a"), AddSphere(0.5), AddSphere(0.5), AddSphere(0.5), SetRoot(0), Undo]

@@ -1,0 +1,19 @@
+[package]
+name = "sc-cli"
+description = "ShapeCAD headless runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "shapecad-cli"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+sc-geom.workspace = true
+sc-doc.workspace = true
+sc-mesh.workspace = true

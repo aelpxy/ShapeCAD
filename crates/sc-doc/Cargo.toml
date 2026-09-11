@@ -1,0 +1,24 @@
+[package]
+name = "sc-doc"
+description = "ShapeCAD document model: command log, undo/redo, the single mutation path"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# On by default: a document you cannot save is not a document.
+default = ["serde"]
+serde = ["dep:serde", "dep:serde_json", "sc-geom/serde"]
+
+[lints]
+workspace = true
+
+[dependencies]
+sc-geom.workspace = true
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+proptest = "1.11.0"

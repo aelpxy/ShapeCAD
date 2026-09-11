@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = ["crates/sc-geom", "crates/sc-doc", "crates/sc-cli", "crates/sc-render", "crates/sc-mesh", "crates/sc-app"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/aelpxy/shapecad"
+rust-version = "1.98"
+
+[workspace.dependencies]
+# serde is opt-in workspace-wide so the kernel can be built and tested with
+# no proc-macro dependencies at all.
+sc-geom = { path = "crates/sc-geom", default-features = false }
+sc-doc  = { path = "crates/sc-doc" }
+sc-mesh = { path = "crates/sc-mesh" }
+sc-render = { path = "crates/sc-render" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Lints are defined once here and inherited by every crate via `[lints] workspace = true`.
+# Keeping them central means a new crate cannot silently opt out of the standard.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Numeric conversions are pervasive and deliberate in geometry code; the casts
+# that matter are reviewed at the call site rather than lint-suppressed globally.
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+# Reads as noise in a crate whose types are named after the crate's domain.
+module_name_repetitions = "allow"
+# Enforced where it matters; not worth annotating every accessor.
+must_use_candidate = "allow"

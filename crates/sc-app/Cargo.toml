@@ -1,0 +1,28 @@
+[package]
+name = "sc-app"
+description = "ShapeCAD desktop application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "shapecad"
+path = "src/main.rs"
+
+[dependencies]
+sc-geom.workspace = true
+sc-doc.workspace = true
+sc-mesh.workspace = true
+sc-render.workspace = true
+wgpu = "30.0.1"
+winit = "0.30.13"
+pollster = "1.0.1"
+egui = "0.36.2"
+egui-wgpu = "0.36.2"
+egui-winit = { version = "0.36.2", default-features = false, features = ["wayland", "x11"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

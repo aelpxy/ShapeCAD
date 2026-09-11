@@ -1,0 +1,30 @@
+# Licence and advisory policy, enforced in CI.
+#
+# ShapeCAD is permanently open source and depends on no commercial components,
+# so the allow-list below is the whole story. Anything outside it needs a
+# deliberate decision rather than a silent `cargo add`.
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MPL-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
