@@ -432,6 +432,31 @@ fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
         return;
     }
 
+    // X, Y and Z lock a move to one axis while it is in flight, and the same
+    // key again lets it go. Pressed during a drag rather than before it, because
+    // that is when you discover the thing is drifting in a direction you did not
+    // want.
+    if state.moving.is_some() {
+        let pressed = ctx.input_mut(|i| {
+            [
+                (Key::X, crate::state::AXES[0].1),
+                (Key::Y, crate::state::AXES[1].1),
+                (Key::Z, crate::state::AXES[2].1),
+            ]
+            .into_iter()
+            .find(|(key, _)| i.consume_key(Modifiers::NONE, *key))
+            .map(|(_, axis)| axis)
+        });
+        if let Some(axis) = pressed {
+            let next = if state.move_axis() == Some(axis) {
+                None
+            } else {
+                Some(axis)
+            };
+            state.constrain_move(next);
+        }
+    }
+
     // Escape also puts an armed tool away, the same key that cancels everything.
     if state.armed.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
         state.disarm();
@@ -1339,7 +1364,7 @@ fn modify_tools(ui: &mut egui::Ui, state: &mut AppState) {
         } else if attached {
             "Slides the selection across the face it is attached to. It keeps following that face; use Detach from face to stop it."
         } else {
-            "Gives the selection a placement of its own and nudges it 10 mm along X. Dragging it in the viewport does the same thing and is usually quicker; this is here for when you want to type the numbers."
+            "Nudges the selection 10 mm along X, giving it a placement of its own if it has none. Usually quicker: drag the feature to slide it, or drag one of the coloured arms to move along that axis alone. X, Y and Z lock a drag to an axis while it is in flight."
         };
         if theme::hint(row, "Move", help, None).clicked() {
             state.move_selection(Vec3::new(10.0, 0.0, 0.0));
@@ -1748,6 +1773,7 @@ fn overlays(
     slots: &Slots,
     claimed: &mut Vec<egui::Rect>,
 ) {
+    move_gizmo(ui, state, viewport);
     grips(ui, state, viewport);
     armed_preview(ui, state, viewport);
     tutorial_card(ui, state, slots.tutorial, claimed);
@@ -2200,6 +2226,102 @@ fn armed_preview(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
         centre + Vec2::new(0.0, -20.0),
         &format!("{} at {:.0}, {:.0}", armed.label, at.x, at.y),
     );
+}
+
+/// Draws the move gizmo, and the constraint while a move is in flight.
+///
+/// Three arms rather than a free drag alone, because a plane drag has two
+/// degrees of freedom and a pointer has two, so every free move changes two
+/// coordinates whether that was wanted or not. Grabbing an arm moves along it
+/// and nothing else.
+fn move_gizmo(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
+    let rect = [
+        viewport.min.x,
+        viewport.min.y,
+        viewport.width(),
+        viewport.height(),
+    ];
+    let arms = state.move_arms(rect);
+    if arms.is_empty() {
+        return;
+    }
+    let painter = ui.painter_at(viewport);
+    let cursor = ui.ctx().pointer_latest_pos();
+    let locked = state.move_axis();
+    let dragging = state.moving.is_some();
+
+    for arm in &arms {
+        let (Some(tail), Some(head)) = (
+            state.world_to_screen(arm.tail, rect),
+            state.world_to_screen(arm.head, rect),
+        ) else {
+            continue;
+        };
+        let (tail, head) = (egui::pos2(tail.x, tail.y), egui::pos2(head.x, head.y));
+        let driving = locked == Some(arm.axis);
+        let near = !dragging
+            && cursor.is_some_and(|p| (p - head).length() < GRIP_REACH && viewport.contains(p));
+
+        // While one arm is locked the others are not available, so they say so
+        // by going quiet rather than by disappearing, which would leave the
+        // gizmo looking broken mid-drag.
+        let base = theme::axis_tint(arm.name);
+        let colour = if dragging && !driving {
+            base.gamma_multiply(0.25)
+        } else if driving || near {
+            base
+        } else {
+            base.gamma_multiply(0.85)
+        };
+        let width = if driving || near { 3.5 } else { 2.5 };
+
+        painter.line_segment([tail, head], egui::Stroke::new(width, colour));
+        // A ring rather than a dot, so an arm reads the same way a dimension
+        // grip does and the two are obviously the same kind of thing to grab.
+        let radius = if driving || near { 6.0 } else { 5.0 };
+        painter.circle_filled(head, radius + 1.0, egui::Color32::from_black_alpha(40));
+        painter.circle(
+            head,
+            radius,
+            theme::palette().on_ink,
+            egui::Stroke::new(2.5, colour),
+        );
+        if driving || near {
+            label(&painter, head + Vec2::new(10.0, -12.0), arm.name);
+        }
+    }
+
+    // The origin the arms measure from, so a feature dragged off somewhere still
+    // says where its own zero is.
+    if let Some(first) = arms.first() {
+        if let Some(centre) = state.world_to_screen(first.tail, rect) {
+            painter.circle_filled(
+                egui::pos2(centre.x, centre.y),
+                3.0,
+                theme::palette().text_dim,
+            );
+        }
+    }
+
+    // While locked, the axis is drawn right across the viewport, so the line the
+    // feature is travelling on is visible rather than inferred from an arm the
+    // part may well be covering.
+    if let (Some(axis), Some(arm)) = (locked, arms.first()) {
+        let reach = (arm.head - arm.tail).length() * 40.0;
+        let (Some(a), Some(b)) = (
+            state.world_to_screen(arm.tail - axis * reach, rect),
+            state.world_to_screen(arm.tail + axis * reach, rect),
+        ) else {
+            return;
+        };
+        painter.line_segment(
+            [egui::pos2(a.x, a.y), egui::pos2(b.x, b.y)],
+            egui::Stroke::new(
+                1.0,
+                theme::axis_tint(crate::state::axis_name(axis)).gamma_multiply(0.45),
+            ),
+        );
+    }
 }
 
 /// Radius of a grip, in points. Large enough to hit without aiming, small

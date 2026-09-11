@@ -166,6 +166,21 @@ pub(crate) fn scene() -> sc_render::ScenePalette {
     }
 }
 
+/// The tint for one named world axis.
+///
+/// The legend, the gizmo and the locked-axis line all name the axis rather than
+/// index it, so there is one place that decides X is red and nowhere for the
+/// three of them to disagree.
+#[must_use]
+pub(crate) fn axis_tint(name: &str) -> Color32 {
+    let p = palette();
+    match name {
+        "X" => p.axis[0],
+        "Y" => p.axis[1],
+        _ => p.axis[2],
+    }
+}
+
 /// The colours in force right now.
 #[must_use]
 pub(crate) fn palette() -> Palette {

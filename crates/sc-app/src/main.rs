@@ -858,8 +858,6 @@ impl App {
     /// screen still both reachable: the one whose centre is closer is the one
     /// being aimed at.
     fn grab_grip(&mut self) -> bool {
-        use sc_geom::glam::Vec2;
-
         // Not while something is armed. That click was promised to the feature
         // waiting to be placed, and a grip that happens to lie under the
         // pointer must not quietly spend it resizing something else instead.
@@ -875,17 +873,11 @@ impl App {
         if self.input.egui_owns || !self.pointer_in_viewport() {
             return false;
         }
-        let ppp = self
-            .gpu
-            .as_ref()
-            .map_or(1.0, |gpu| gpu.egui_state.egui_ctx().pixels_per_point());
-        let pointer = Vec2::new(cursor.x as f32 / ppp, cursor.y as f32 / ppp);
-        let viewport = [
-            self.viewport[0] / ppp,
-            self.viewport[1] / ppp,
-            self.viewport[2] / ppp,
-            self.viewport[3] / ppp,
-        ];
+        let _ = cursor;
+        let Some(pointer) = self.pointer_points() else {
+            return false;
+        };
+        let viewport = self.viewport_points();
 
         let mut best: Option<(f32, state::Drag)> = None;
         for grip in self.state.grips() {
@@ -976,16 +968,47 @@ impl App {
         }
     }
 
+    /// Interface points the frame is measured in, as opposed to physical pixels.
+    ///
+    /// Handles are drawn in points and compared against reaches in points, so
+    /// everything that hit-tests one has to be in points too, or a grip moves
+    /// out from under the pointer as soon as the interface is zoomed.
+    fn points_per_pixel(&self) -> f32 {
+        self.gpu
+            .as_ref()
+            .map_or(1.0, |gpu| gpu.egui_state.egui_ctx().pixels_per_point())
+    }
+
+    fn pointer_points(&self) -> Option<Vec2> {
+        let cursor = self.cursor?;
+        let ppp = self.points_per_pixel();
+        Some(Vec2::new(cursor.x as f32 / ppp, cursor.y as f32 / ppp))
+    }
+
+    fn viewport_points(&self) -> [f32; 4] {
+        let ppp = self.points_per_pixel();
+        [
+            self.viewport[0] / ppp,
+            self.viewport[1] / ppp,
+            self.viewport[2] / ppp,
+            self.viewport[3] / ppp,
+        ]
+    }
+
     /// Where the pointer meets the plane a free drag moves across.
     fn drag_plane_hit(&self) -> Option<Vec3> {
+        self.constrained_plane_hit(self.state.moving.and_then(|d| d.axis))
+    }
+
+    /// The same, for a drag locked to `axis` before the lock is recorded.
+    fn constrained_plane_hit(&self, axis: Option<Vec3>) -> Option<Vec3> {
+        let normal = match axis {
+            Some(a) => self.state.plane_for_axis(a),
+            None => self.state.drag_plane(),
+        };
         let (ndc, aspect) = self.pointer_ndc()?;
-        let id = self.state.selected?;
-        let root = self.state.doc.root()?;
-        let origin =
-            sc_geom::pick::placement_of(self.state.doc.arena(), root, id)?.apply_point(Vec3::ZERO);
-        self.state
-            .camera()
-            .plane_hit(ndc, aspect, origin, self.state.drag_plane())
+        let origin = self.state.selection_origin()?;
+        self.state.camera().plane_hit(ndc, aspect, origin, normal)
     }
 
     /// Starts dragging the selection if the press landed on it. True if it took

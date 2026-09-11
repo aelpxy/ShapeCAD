@@ -109,6 +109,49 @@ pub(crate) struct MoveDrag {
     /// the feature travels with the pointer rather than jumping its centre to
     /// it.
     pub from: Vec3,
+    /// The one direction motion is allowed in, if the drag has been constrained.
+    ///
+    /// Unconstrained dragging slides across a plane, which is two degrees of
+    /// freedom from a pointer that only has two, so every move changes two
+    /// coordinates at once whether that was wanted or not. Locking an axis is
+    /// how you move something ten millimetres to the right and nowhere else.
+    pub axis: Option<Vec3>,
+    /// Set when the constraint has just changed, so the next pointer sample
+    /// becomes the new anchor.
+    ///
+    /// Changing the constraint changes the plane the pointer is measured
+    /// against, so the old anchor is a point on a plane that no longer exists.
+    /// Re-anchoring on the next sample is what stops the feature jumping the
+    /// moment a key is pressed, and it needs no pointer position here, which is
+    /// what lets the key be handled where the keys are.
+    pub reanchor: bool,
+}
+
+/// The three world axes, as a person names them.
+pub(crate) const AXES: [(&str, Vec3); 3] = [("X", Vec3::X), ("Y", Vec3::Y), ("Z", Vec3::Z)];
+
+/// What to call a direction.
+#[must_use]
+pub(crate) fn axis_name(axis: Vec3) -> &'static str {
+    AXES.iter()
+        .find(|(_, a)| a.dot(axis).abs() > 0.5)
+        .map_or("an axis", |(name, _)| name)
+}
+
+/// One arm of the move gizmo, in world space.
+///
+/// Dragging an arm moves along that axis and nothing else, which is the whole
+/// reason it exists: a plane drag has two degrees of freedom and a pointer has
+/// two, so every free move changes two coordinates whether or not that was
+/// wanted.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MoveArm {
+    pub name: &'static str,
+    pub axis: Vec3,
+    /// The gizmo's centre, on the feature.
+    pub tail: Vec3,
+    /// Where the arm's grab target sits.
+    pub head: Vec3,
 }
 
 /// A push/pull drag in progress.
@@ -342,26 +385,6 @@ impl AppState {
         self.status = "Loaded sample bracket".to_string();
     }
 
-    /// The world plane a free drag moves the selection across.
-    ///
-    /// The world axis most nearly facing the camera, so looking down on a part
-    /// drags it across the build plate and looking at it from the side drags it
-    /// up and along. Screen-parallel dragging would track the pointer just as
-    /// closely but would bake the camera's angle into the coordinates, leaving
-    /// numbers nobody can read in the property panel.
-    #[must_use]
-    pub(crate) fn drag_plane(&self) -> Vec3 {
-        let (_, _, view) = self.camera().basis();
-        let a = view.abs();
-        if a.x >= a.y && a.x >= a.z {
-            Vec3::X
-        } else if a.y >= a.z {
-            Vec3::Y
-        } else {
-            Vec3::Z
-        }
-    }
-
     /// The placement that a free drag of the selection should write into,
     /// creating one if the selection does not already have one.
     ///
@@ -407,6 +430,83 @@ impl AppState {
     ///
     /// `grabbed` is where the pointer met the drag plane, which is what makes
     /// the feature travel with the pointer instead of jumping its centre there.
+    /// Where the selection sits in the world, if it is somewhere.
+    #[must_use]
+    pub(crate) fn selection_origin(&self) -> Option<Vec3> {
+        let id = self.selected?;
+        let root = self.doc.root()?;
+        Some(sc_geom::pick::placement_of(self.doc.arena(), root, id)?.apply_point(Vec3::ZERO))
+    }
+
+    /// The move gizmo for the selection, or empty if there is nothing to move.
+    ///
+    /// The arms are sized in world units from the camera so they stay the same
+    /// length on screen however far away the part is. A gizmo that shrinks with
+    /// the model is one you cannot grab on a large part and one that swallows a
+    /// small one.
+    #[must_use]
+    pub(crate) fn move_arms(&self, viewport: [f32; 4]) -> Vec<MoveArm> {
+        /// Arm length, in interface points. Long enough to aim at without
+        /// covering the feature it belongs to.
+        const ARM: f32 = 72.0;
+
+        if self.sketch.is_some() || self.armed.is_some() || self.tool != TOOL_SELECT {
+            return Vec::new();
+        }
+        let Some(tail) = self.selection_origin() else {
+            return Vec::new();
+        };
+        let height = viewport[3].max(1.0);
+        let reach = self.camera().world_per_pixel(height) * ARM;
+        AXES.iter()
+            .map(|(name, axis)| MoveArm {
+                name,
+                axis: *axis,
+                tail,
+                head: tail + *axis * reach,
+            })
+            .collect()
+    }
+
+    /// Locks a free drag to one world axis, or releases it back to the plane.
+    ///
+    /// Takes effect from where the feature is now rather than from where the
+    /// drag began, so pressing X part way through does not fling it back along
+    /// the path it has already travelled.
+    pub(crate) fn constrain_move(&mut self, axis: Option<Vec3>) {
+        let Some(mut drag) = self.moving else {
+            return;
+        };
+        if drag.axis == axis {
+            return;
+        }
+        // Measured from where the feature is now, not from where the drag
+        // began, so locking an axis part way through does not fling it back
+        // along the path it has already travelled.
+        drag.from = self.placement_of(drag.node).unwrap_or(drag.from);
+        drag.axis = axis;
+        drag.reanchor = true;
+        self.moving = Some(drag);
+        self.status = match axis {
+            Some(a) => format!("Locked to {}, press it again to let go", axis_name(a)),
+            None => "Free to slide".to_string(),
+        };
+    }
+
+    /// Whether the move in flight is locked, and to what.
+    #[must_use]
+    pub(crate) fn move_axis(&self) -> Option<Vec3> {
+        self.moving.and_then(|d| d.axis)
+    }
+
+    /// Where a placement currently sits, in its own parent's frame.
+    fn placement_of(&self, id: NodeId) -> Option<Vec3> {
+        match self.doc.arena().get(id) {
+            Some(Node::Transform { xform, .. }) => Some(xform.translation),
+            _ => None,
+        }
+    }
+
     pub(crate) fn begin_move(&mut self, grabbed: Vec3) -> Option<NodeId> {
         // One gesture at a time. A second begin would open a second step that
         // only one release could ever close.
@@ -429,13 +529,15 @@ impl AppState {
             node,
             grabbed,
             from,
+            axis: None,
+            reanchor: false,
         });
         Some(node)
     }
 
     /// Slides the feature to wherever the pointer has reached on the drag plane.
     pub(crate) fn move_to_plane(&mut self, now: Vec3) {
-        let Some(drag) = self.moving else {
+        let Some(mut drag) = self.moving else {
             return;
         };
         // The feature can go out from under the gesture: Delete acts on the
@@ -448,13 +550,67 @@ impl AppState {
             self.status = "That feature is gone".to_string();
             return;
         }
-        self.move_to(drag.node, drag.from + (now - drag.grabbed));
+        // The first sample after a constraint change is the new anchor: the old
+        // one was a point on a plane the drag is no longer measured against.
+        if drag.reanchor {
+            drag.grabbed = now;
+            drag.reanchor = false;
+            self.moving = Some(drag);
+        }
+        let mut delta = now - drag.grabbed;
+        // Constrained, only the component along the axis survives. The pointer
+        // still moves in two dimensions; the feature does not.
+        if let Some(axis) = drag.axis {
+            delta = axis * delta.dot(axis);
+        }
+        self.move_to(drag.node, drag.from + delta);
+    }
+
+    /// The plane a free drag slides across, as a normal.
+    ///
+    /// Unconstrained, the world axis most nearly facing the camera, so looking
+    /// down drags across the plate and looking from the side drags up and
+    /// along. Constrained, the plane that contains the locked axis and faces
+    /// the camera as squarely as it can: hitting a plane the axis lies in is
+    /// what keeps the projection onto that axis well conditioned, where using
+    /// the view-facing plane would make a pixel of pointer travel worth metres
+    /// whenever the axis pointed away.
+    #[must_use]
+    pub(crate) fn drag_plane(&self) -> Vec3 {
+        if let Some(axis) = self.moving.and_then(|d| d.axis) {
+            return self.plane_for_axis(axis);
+        }
+        let (_, _, view) = self.camera().basis();
+        let a = view.abs();
+        if a.x >= a.y && a.x >= a.z {
+            Vec3::X
+        } else if a.y >= a.z {
+            Vec3::Y
+        } else {
+            Vec3::Z
+        }
+    }
+
+    /// The plane containing `axis` that faces the camera most squarely.
+    ///
+    /// Hitting a plane the axis lies in is what keeps the projection onto that
+    /// axis well conditioned. Using the view-facing plane instead would make a
+    /// pixel of pointer travel worth metres whenever the axis pointed away.
+    #[must_use]
+    pub(crate) fn plane_for_axis(&self, axis: Vec3) -> Vec3 {
+        let (_, _, view) = self.camera().basis();
+        let across = view - axis * view.dot(axis);
+        across.try_normalize().unwrap_or_else(|| {
+            // The axis points straight at the camera, so no plane containing it
+            // faces the viewer at all. Any perpendicular will do: the drag is
+            // unusable at this angle whatever we pick, and orbiting fixes it.
+            axis.any_orthonormal_vector()
+        })
     }
 
     /// Moves a placement to `to`, snapped, in world coordinates.
     pub(crate) fn move_to(&mut self, id: NodeId, to: Vec3) {
-        let step = self.grid.max(0.01);
-        let snapped = (to / step).round() * step;
+        let snapped = self.snap_position(to);
         for (name, value) in [("x", snapped.x), ("y", snapped.y), ("z", snapped.z)] {
             self.apply(Command::SetParam {
                 id,
@@ -463,6 +619,28 @@ impl AppState {
             });
         }
         self.status = format!("{:.1}, {:.1}, {:.1} mm", snapped.x, snapped.y, snapped.z);
+    }
+
+    /// Rounds a position to the grid, with a stronger pull toward zero.
+    ///
+    /// Zero is not just another grid line. A feature on an axis, or centred on
+    /// the plate, is a thing people deliberately want and then check by reading
+    /// the number back, so it gets a wider catchment than the grid spacing
+    /// alone would give it. Everything else rounds normally.
+    #[must_use]
+    pub(crate) fn snap_position(&self, to: Vec3) -> Vec3 {
+        /// How many grid steps either side of zero snap to it.
+        const ZERO_PULL: f32 = 0.75;
+
+        let step = self.grid.max(0.01);
+        let axis = |v: f32| {
+            if v.abs() <= step * ZERO_PULL {
+                0.0
+            } else {
+                (v / step).round() * step
+            }
+        };
+        Vec3::new(axis(to.x), axis(to.y), axis(to.z))
     }
 
     /// Ends a free drag, keeping where it got to.
@@ -611,6 +789,21 @@ impl AppState {
             .collect()
     }
 
+    /// Where a point in the model lands on screen, in interface points.
+    ///
+    /// One definition, shared by everything that draws into the viewport and
+    /// everything that hit-tests against it. Two would drift, and the symptom
+    /// would be a handle that cannot be grabbed where it appears.
+    #[must_use]
+    pub(crate) fn world_to_screen(&self, world: Vec3, viewport: [f32; 4]) -> Option<Vec2> {
+        let [left, top, width, height] = viewport;
+        let ndc = self.camera().project(world, width / height.max(1.0))?;
+        Some(Vec2::new(
+            left + (ndc.x * 0.5 + 0.5) * width,
+            top + (0.5 - ndc.y * 0.5) * height,
+        ))
+    }
+
     /// Where a grip is on screen, and how fast its parameter moves there.
     ///
     /// `None` when the grip is behind the camera, or when its direction is so
@@ -627,18 +820,8 @@ impl AppState {
         /// is considered grabbable.
         const MIN_FORESHORTENING: f32 = 2.0;
 
-        let [left, top, width, height] = viewport;
-        let aspect = width / height.max(1.0);
-        let to_screen = |world: Vec3| -> Option<Vec2> {
-            let ndc = self.camera().project(world, aspect)?;
-            Some(Vec2::new(
-                left + (ndc.x * 0.5 + 0.5) * width,
-                top + (0.5 - ndc.y * 0.5) * height,
-            ))
-        };
-
-        let at = to_screen(grip.at)?;
-        let tip = to_screen(grip.tip)?;
+        let at = self.world_to_screen(grip.at, viewport)?;
+        let tip = self.world_to_screen(grip.tip, viewport)?;
         let span = tip - at;
         let points = span.length();
         if points < MIN_FORESHORTENING {
@@ -3318,6 +3501,181 @@ mod tests {
             state.drag_plane(),
             Vec3::X,
             "looking along X should drag in YZ"
+        );
+    }
+
+    fn placed_block(state: &mut AppState) {
+        state.new_document();
+        state.add_body(
+            Node::Box {
+                half: Vec3::splat(8.0),
+                round: 0.0,
+            },
+            "Block",
+        );
+    }
+
+    /// A locked drag moves along one axis and nowhere else. Without it a plane
+    /// drag spends two degrees of freedom on every move, so nudging something
+    /// sideways also shifts it forwards.
+    #[test]
+    fn a_locked_move_changes_only_its_own_axis() {
+        let mut state = AppState::new();
+        placed_block(&mut state);
+        let id = state.begin_move(Vec3::ZERO).expect("movable");
+        state.constrain_move(Some(Vec3::X));
+
+        // A pointer travelling diagonally across the plane.
+        state.move_to_plane(Vec3::new(0.0, 0.0, 0.0));
+        state.move_to_plane(Vec3::new(20.0, 17.0, 9.0));
+        state.finish_move();
+
+        let at = state
+            .doc
+            .arena()
+            .get(id)
+            .and_then(|n| match n {
+                Node::Transform { xform, .. } => Some(xform.translation),
+                _ => None,
+            })
+            .expect("a placement");
+        assert!((at.x - 20.0).abs() < 0.01, "x did not follow, got {at:?}");
+        assert!(
+            at.y.abs() < 0.01 && at.z.abs() < 0.01,
+            "it drifted to {at:?}"
+        );
+    }
+
+    /// Locking part way through must not fling the feature back along the path
+    /// it has already travelled. The lock is measured from where it is now.
+    #[test]
+    fn locking_part_way_through_keeps_the_ground_already_covered() {
+        let mut state = AppState::new();
+        placed_block(&mut state);
+        let id = state.begin_move(Vec3::ZERO).expect("movable");
+        state.move_to_plane(Vec3::new(0.0, 12.0, 0.0));
+
+        state.constrain_move(Some(Vec3::X));
+        state.move_to_plane(Vec3::new(5.0, 12.0, 0.0));
+        // Diagonal, so a drag that is not actually locked carries y and z with
+        // it and the assertions below catch that rather than agreeing with it.
+        state.move_to_plane(Vec3::new(9.0, 30.0, 6.0));
+        state.finish_move();
+
+        let at = state
+            .doc
+            .arena()
+            .get(id)
+            .and_then(|n| match n {
+                Node::Transform { xform, .. } => Some(xform.translation),
+                _ => None,
+            })
+            .expect("a placement");
+        assert!(
+            (at.y - 12.0).abs() < 0.01,
+            "locking threw away the travel already made: {at:?}"
+        );
+        assert!(
+            (at.x - 4.0).abs() < 0.01,
+            "x should have moved 4mm, got {at:?}"
+        );
+    }
+
+    /// Pressing the same axis again lets go.
+    #[test]
+    fn locking_the_same_axis_twice_releases_it() {
+        let mut state = AppState::new();
+        placed_block(&mut state);
+        state.begin_move(Vec3::ZERO).expect("movable");
+        state.constrain_move(Some(Vec3::Y));
+        assert_eq!(state.move_axis(), Some(Vec3::Y));
+        state.constrain_move(None);
+        assert_eq!(state.move_axis(), None);
+    }
+
+    /// Zero gets a wider catchment than the grid alone gives it. A feature on an
+    /// axis is something people deliberately want and then verify by reading the
+    /// number back, so landing on 0.4 when aiming at 0 is a worse answer than
+    /// the grid spacing suggests.
+    #[test]
+    fn a_position_near_zero_snaps_to_it() {
+        let mut state = AppState::new();
+        state.grid = 0.5;
+
+        // Chosen so plain rounding would not give zero: 0.3 rounds to 0.5, and
+        // only the wider catchment brings it home. A value that rounds to zero
+        // anyway would pass with the pull removed and prove nothing.
+        let pulled = state.snap_position(Vec3::new(0.3, -0.3, 0.3));
+        assert_eq!(pulled, Vec3::ZERO, "zero did not pull, got {pulled:?}");
+
+        // But not so wide that the grid line next to zero is unreachable.
+        let near = state.snap_position(Vec3::new(0.5, 0.0, 0.0));
+        assert!(
+            (near.x - 0.5).abs() < 0.01,
+            "the first grid line was swallowed, got {near:?}"
+        );
+        let far = state.snap_position(Vec3::new(7.1, 0.0, 0.0));
+        assert!(
+            (far.x - 7.0).abs() < 0.01,
+            "ordinary rounding broke, got {far:?}"
+        );
+    }
+
+    /// The plane a locked drag is measured against has to contain the axis, or
+    /// projecting onto it is ill conditioned exactly when the axis points away
+    /// from the camera.
+    #[test]
+    fn a_locked_drag_measures_against_a_plane_containing_its_axis() {
+        let mut state = AppState::new();
+        placed_block(&mut state);
+        for (_, axis) in crate::state::AXES {
+            let normal = state.plane_for_axis(axis);
+            assert!(
+                normal.dot(axis).abs() < 1.0e-4,
+                "the plane for {axis:?} does not contain it, normal {normal:?}"
+            );
+            assert!((normal.length() - 1.0).abs() < 1.0e-4);
+        }
+    }
+
+    /// The gizmo stays the same size on screen however far away the part is,
+    /// or it is unusable on a large one and swallows a small one.
+    #[test]
+    fn the_gizmo_keeps_its_size_on_screen() {
+        let mut state = AppState::new();
+        placed_block(&mut state);
+        let viewport = [0.0, 0.0, 1200.0, 800.0];
+
+        // Each measured against its own camera. Projecting both sets with the
+        // same one measures nothing, which is what the first version of this
+        // test did: it reported a fourfold change that was entirely its own.
+        let measure = |state: &AppState| {
+            let arms = state.move_arms(viewport);
+            assert_eq!(arms.len(), 3, "one arm per axis");
+            let tail = state
+                .world_to_screen(arms[0].tail, viewport)
+                .expect("on screen");
+            let head = state
+                .world_to_screen(arms[0].head, viewport)
+                .expect("on screen");
+            (
+                (arms[0].head - arms[0].tail).length(),
+                (head - tail).length(),
+            )
+        };
+
+        let (near_world, near_points) = measure(&state);
+        state.rig.goal.distance *= 4.0;
+        state.rig.snap_to(state.rig.goal);
+        let (far_world, far_points) = measure(&state);
+
+        assert!(
+            far_world > near_world * 3.5,
+            "the arm did not grow with the distance: {near_world} then {far_world}"
+        );
+        assert!(
+            (near_points - far_points).abs() < 4.0,
+            "on screen it went from {near_points} to {far_points} points"
         );
     }
 

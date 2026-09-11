@@ -80,6 +80,42 @@ rather than "Transform".
 That makes naming features matter, so the samples name theirs. An unnamed cut
 falls back to the kind and the panel goes quiet again.
 
+## Positioning
+
+A selected feature gets a move gizmo: three arms along the world axes, coloured
+to match the axis legend, with a grab ring on each. Dragging an arm moves along
+that axis and nothing else. Dragging the feature itself still slides it freely
+across a plane, and **X**, **Y** or **Z** locks that drag to an axis part way
+through, with the same key again letting it go.
+
+The arm is the point. A plane drag has two degrees of freedom and a pointer has
+two, so every free move changes two coordinates whether or not that was wanted.
+Locking is how you move something ten millimetres to the right and nowhere else.
+
+Four things that matter in the implementation, each a test:
+
+**The plane follows the constraint.** A locked drag is measured against a plane
+that *contains* the axis and faces the camera as squarely as it can, not against
+the view-facing plane. Projecting onto an axis that points away from the camera
+is ill conditioned, and a pixel of pointer travel would be worth metres.
+
+**Locking re-anchors.** Changing the constraint changes the plane the pointer is
+measured against, so the old anchor is a point on a plane that no longer exists.
+The drag marks itself for re-anchoring and takes the next sample as its new
+origin, measured from where the feature is *now*. Without that, pressing X part
+way through flings the feature back along the path it has already travelled.
+That also keeps the key handling where the keys are, since it needs no pointer
+position.
+
+**The gizmo is sized from the camera**, so it stays the same length on screen
+however far away the part is. One that scales with the model is unusable on a
+large part and swallows a small one.
+
+**Zero has a wider catchment than the grid.** A feature on an axis, or centred
+on the plate, is something people deliberately want and then verify by reading
+the number back, so landing on 0.4 when aiming at 0 is a worse answer than the
+grid spacing alone suggests. Everything else rounds normally.
+
 ## Direct manipulation
 
 A selected feature shows a grip on each of its dimensions: a dot sitting on the
