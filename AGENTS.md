@@ -28,16 +28,16 @@ These are load-bearing. Breaking one is a bug even if the tests pass.
 
 ## Repo map
 
-| Path | What lives there |
-|---|---|
-| `crates/sc-geom` | The kernel: node DAG, evaluation, bounds, hashing, WGSL generation |
-| `crates/sc-doc` | Documents: command log, undo, `.shapecad` format, sample parts |
-| `crates/sc-mesh` | Dual contouring to printable triangles, STL output |
-| `crates/sc-render` | Viewport, camera, GPU selection, offscreen capture |
-| `crates/sc-app` | The desktop application |
-| `crates/sc-cli` | Headless runner |
-| `docs/` | Reference documentation and decision records |
-| `tests/corpus/` | Golden geometry hashes |
+| Path               | What lives there                                                   |
+| ------------------ | ------------------------------------------------------------------ |
+| `crates/sc-geom`   | The kernel: node DAG, evaluation, bounds, hashing, WGSL generation |
+| `crates/sc-doc`    | Documents: command log, undo, `.shapecad` format, sample parts     |
+| `crates/sc-mesh`   | Dual contouring to printable triangles, STL output                 |
+| `crates/sc-render` | Viewport, camera, GPU selection, offscreen capture                 |
+| `crates/sc-app`    | The desktop application                                            |
+| `crates/sc-cli`    | Headless runner                                                    |
+| `docs/`            | Reference documentation and decision records                       |
+| `tests/corpus/`    | Golden geometry hashes                                             |
 
 Dependencies point one way only, from `sc-app` down to `sc-geom`. Do not add an
 edge that points back up.
@@ -59,6 +59,10 @@ Verify visually without a display by capturing the whole interface:
 ```sh
 cargo run --release -p sc-app -- --snapshot out.png --width 2400 --height 1500 --scale 1.5
 ```
+
+Add `--sample` for a populated document, `--dialog` for the file browser,
+`--hover` to catch a tooltip, or `--menu` for the context menu. See
+`docs/building.md`.
 
 ## Before you say you are done
 

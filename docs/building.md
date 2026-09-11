@@ -79,6 +79,16 @@ and how changes are checked on a machine with no display:
 cargo run --release -p sc-app -- --snapshot ui.png --width 2400 --height 1500 --scale 1.5
 ```
 
+By default the capture shows a new, empty document. Three flags pick a different
+scene:
+
+| Flag | What it captures |
+|---|---|
+| `--sample` | The bundled bracket, with its root selected, so the design tree and the property panel are populated. |
+| `--dialog` | The file browser open over an empty document. |
+| `--hover` | The pointer resting on a tool row, so its tooltip is in the frame. |
+| `--menu` | The context menu open on the sample model's root. |
+
 Two details matter if you touch that path. `RawInput::screen_rect` is in *points*,
 not pixels, so it must be divided by the scale. And several frames must be run:
 egui gives a newly created area a sizing pass before it can place itself, and
@@ -87,6 +97,11 @@ invisible and in two is half transparent. Texture deltas must be applied from
 *every* frame. The font atlas is created during the first, and dropping that
 delta leaves the renderer with no atlas, at which point it silently skips the
 entire interface.
+
+Capturing a tooltip needs one more thing. egui measures the tooltip delay from
+the last pointer movement, so the pointer is moved on the first pass and then
+left alone; repeating the move event every pass resets the timer and no tooltip
+ever appears.
 
 ## Troubleshooting
 
