@@ -30,6 +30,7 @@ pub(crate) enum Icon {
     Download,
     Frame,
     Cursor,
+    Help,
     Sun,
     Moon,
     Monitor,
@@ -283,6 +284,14 @@ fn action_glyph(pen: &Pen<'_>, icon: Icon) -> bool {
 /// Viewport furniture: the pointer, the framing control, the stack of bodies.
 fn view_glyph(pen: &Pen<'_>, icon: Icon) -> bool {
     match icon {
+        Icon::Help => {
+            pen.circle(12.0, 12.0, 9.0);
+            // The question mark as two strokes and a dot, so it keeps the same
+            // weight as every other glyph instead of depending on a font.
+            pen.arc(12.0, 9.5, 3.2, 3.2, 3.4, 6.6);
+            pen.line((12.0, 12.7), (12.0, 15.0));
+            pen.dot(12.0, 17.8, 1.0);
+        }
         Icon::Sun => {
             pen.circle(12.0, 12.0, 4.2);
             // Eight rays on the diagonals and axes, drawn as short segments so

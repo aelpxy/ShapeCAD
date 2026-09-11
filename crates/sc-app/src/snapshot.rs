@@ -20,6 +20,12 @@ const SHOWCASE_YAW: f32 = -1.05;
 const SHOWCASE_PITCH: f32 = 0.55;
 const SHOWCASE_ZOOM: f32 = 1.02;
 
+/// Where [`Scene::Grips`] rests the pointer: on the block's `half_x` grip, so
+/// the capture shows what a grip looks like when it is ready to be grabbed
+/// rather than only what it looks like at rest. Read off a capture, like
+/// [`HOVER_POINT`], because the position depends on the camera pose above.
+const GRIP_POINT: egui::Pos2 = egui::pos2(968.0, 574.0);
+
 /// Where [`Scene::Menu`] opens the context menu, in points. Over the middle of
 /// the 3D view, which is where a right click on the model would land.
 const MENU_POINT: (f32, f32) = (620.0, 380.0);
@@ -27,6 +33,12 @@ const MENU_POINT: (f32, f32) = (620.0, 380.0);
 /// What the captured frame should show beyond an empty document.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Scene {
+    /// The engine example, framed.
+    Engine,
+    /// The guided tour on its first card.
+    Tutorial,
+    /// A selected box with its dimension grips showing.
+    Grips,
     /// A new, empty document.
     #[default]
     Empty,
@@ -84,6 +96,29 @@ fn pose(scene: Scene) -> AppState {
         Scene::Dialog => state.browse(crate::dialog::Purpose::Open),
         Scene::Sample => {
             state.load_sample();
+            let root = state.doc.root();
+            state.select(root);
+        }
+        Scene::Tutorial => {
+            state.start_tutorial();
+        }
+        Scene::Grips => {
+            state.new_document();
+            state.add_body(
+                sc_geom::Node::Box {
+                    half: sc_geom::glam::Vec3::new(24.0, 16.0, 10.0),
+                    round: 2.0,
+                },
+                "Block",
+            );
+            state.frame_model();
+            state.rig.goal.yaw = -0.9;
+            state.rig.goal.pitch = 0.5;
+            state.rig.snap_to(state.rig.goal);
+            state.status = "Ready".to_string();
+        }
+        Scene::Engine => {
+            state.load_engine();
             let root = state.doc.root();
             state.select(root);
         }
@@ -172,6 +207,11 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scen
         // The pointer is moved once and then left alone: egui measures the
         // tooltip delay from the last movement, so repeating the event on every
         // pass would keep resetting it and no tooltip would ever appear.
+        if scene == Scene::Grips && pass == 0 {
+            frame_input
+                .events
+                .push(egui::Event::PointerMoved(GRIP_POINT));
+        }
         if scene == Scene::Hover && pass == 0 {
             frame_input
                 .events

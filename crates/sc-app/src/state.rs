@@ -55,6 +55,60 @@ pub(crate) struct ContextMenu {
     pub target: MenuTarget,
 }
 
+/// One of the selection's dimensions, ready to be drawn and grabbed.
+///
+/// In world space, unlike [`crate::handle::Handle`], which is in the node's own
+/// frame. `tip` is one local unit along the direction the parameter grows, and
+/// exists so that a caller can recover both the screen direction and the screen
+/// scale from two projections. That is what makes the drag track the pointer
+/// under perspective, and under a transform that scales.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Grip {
+    pub param: &'static str,
+    pub value: f32,
+    pub at: Vec3,
+    pub tip: Vec3,
+    pub gain: f32,
+}
+
+/// Whether an armed feature adds material or takes it away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Placing {
+    Pad,
+    Pocket,
+}
+
+/// A feature armed and waiting for a click to say where it goes.
+///
+/// Every add and cut tool used to drop its feature at the plane's origin, which
+/// meant every hole landed in the middle of the part and then had to be moved
+/// with numbers. Arming instead, and letting the next click on the plane place
+/// it, is the same operation with the position supplied by the hand that already
+/// knows where it wants it.
+#[derive(Clone, Debug)]
+pub(crate) struct Armed {
+    pub kind: Placing,
+    pub profile: sc_geom::Profile,
+    pub label: &'static str,
+}
+
+/// A push/pull drag in progress.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Drag {
+    pub node: NodeId,
+    pub param: &'static str,
+    /// The value when the drag began, so it can be put back.
+    pub from: f32,
+    /// Where it is now, for the readout.
+    pub value: f32,
+    /// Screen direction the parameter grows in. Unit length, in points.
+    pub axis: Vec2,
+    /// Parameter units per point of travel along `axis`.
+    pub gain: f32,
+    /// Pointer position when the drag began, in points.
+    pub origin: Vec2,
+}
+
 pub(crate) struct AppState {
     pub doc: Document,
     /// Camera, eased toward wherever input sends it.
@@ -110,6 +164,12 @@ pub(crate) struct AppState {
     pub menu: Option<ContextMenu>,
     /// What the window system says the desktop's colour scheme is, if it says.
     pub system_scheme: Option<crate::theme::Scheme>,
+    /// The dimension currently being pushed or pulled, if any.
+    pub drag: Option<Drag>,
+    /// A feature waiting to be placed by the next click, if any.
+    pub armed: Option<Armed>,
+    /// The tutorial, while it is running.
+    pub tutorial: Option<crate::tutorial::Tutorial>,
 }
 
 impl Default for AppState {
@@ -146,6 +206,9 @@ impl AppState {
             settings: Settings::load(),
             menu: None,
             system_scheme: None,
+            drag: None,
+            armed: None,
+            tutorial: None,
         }
     }
 
@@ -255,6 +318,322 @@ impl AppState {
         self.status = "Loaded sample bracket".to_string();
     }
 
+    /// The world plane a free drag moves the selection across.
+    ///
+    /// The world axis most nearly facing the camera, so looking down on a part
+    /// drags it across the build plate and looking at it from the side drags it
+    /// up and along. Screen-parallel dragging would track the pointer just as
+    /// closely but would bake the camera's angle into the coordinates, leaving
+    /// numbers nobody can read in the property panel.
+    #[must_use]
+    pub(crate) fn drag_plane(&self) -> Vec3 {
+        let (_, _, view) = self.camera().basis();
+        let a = view.abs();
+        if a.x >= a.y && a.x >= a.z {
+            Vec3::X
+        } else if a.y >= a.z {
+            Vec3::Y
+        } else {
+            Vec3::Z
+        }
+    }
+
+    /// The placement that a free drag of the selection should write into,
+    /// creating one if the selection does not already have one.
+    ///
+    /// A feature dragged twice must not leave two placements behind, so this
+    /// reuses the transform it made the first time. A derived placement is left
+    /// alone and its local offset used instead, which is what keeps a feature
+    /// attached to its face while being slid around on it.
+    fn movable(&mut self) -> Option<NodeId> {
+        let target = self.selected?;
+        match self.doc.arena().get(target) {
+            Some(Node::Transform { on: None, .. }) => return Some(target),
+            Some(Node::Transform {
+                child, on: Some(_), ..
+            }) => {
+                let child = *child;
+                if matches!(
+                    self.doc.arena().get(child),
+                    Some(Node::Transform { on: None, .. })
+                ) {
+                    return Some(child);
+                }
+                self.as_one_step(|s| s.slide_under(target, child, Vec3::ZERO));
+                return match self.doc.arena().get(target) {
+                    Some(Node::Transform { child, .. }) => Some(*child),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+        // Nothing to write into yet: give it a placement of its own, once.
+        self.wrap_selection(
+            |child| Node::Transform {
+                child,
+                xform: Transform::IDENTITY,
+                on: None,
+            },
+            "Move",
+        );
+        self.selected
+    }
+
+    /// Starts dragging the selection around, returning the node that will move.
+    pub(crate) fn begin_move(&mut self) -> Option<NodeId> {
+        // Opened before the placement is made, not after. Creating one is part
+        // of the same thing the user did, and leaving it outside the step means
+        // undo takes back the movement and leaves the placement behind.
+        self.doc.begin_step();
+        let Some(id) = self.movable() else {
+            self.doc.end_step();
+            return None;
+        };
+        Some(id)
+    }
+
+    /// Moves a placement to `to`, snapped, in world coordinates.
+    pub(crate) fn move_to(&mut self, id: NodeId, to: Vec3) {
+        let step = self.grid.max(0.01);
+        let snapped = (to / step).round() * step;
+        for (name, value) in [("x", snapped.x), ("y", snapped.y), ("z", snapped.z)] {
+            self.apply(Command::SetParam {
+                id,
+                name: name.to_string(),
+                value,
+            });
+        }
+        self.status = format!("{:.1}, {:.1}, {:.1} mm", snapped.x, snapped.y, snapped.z);
+    }
+
+    /// Ends a free drag.
+    pub(crate) fn finish_move(&mut self) {
+        self.doc.end_step();
+        self.status = "Ready".to_string();
+    }
+
+    /// Starts the tutorial from the beginning.
+    pub(crate) fn start_tutorial(&mut self) {
+        self.tutorial = Some(crate::tutorial::Tutorial::start(self));
+    }
+
+    /// Closes the tutorial and remembers not to open it again unasked.
+    pub(crate) fn end_tutorial(&mut self) {
+        self.tutorial = None;
+        if !self.settings.tutorial_seen {
+            self.settings.tutorial_seen = true;
+            self.settings.save();
+        }
+    }
+
+    /// Lets the tutorial look at what just happened. True if it moved on.
+    ///
+    /// Called once a frame rather than from each action, so that a step is
+    /// satisfied by the state the user put the application in and not by the
+    /// particular route they took to get there.
+    pub(crate) fn poll_tutorial(&mut self) -> bool {
+        let Some(mut tutorial) = self.tutorial else {
+            return false;
+        };
+        let moved = tutorial.advance(self);
+        self.tutorial = Some(tutorial);
+        moved
+    }
+
+    /// Arms a feature, to be placed by the next click on the plane.
+    ///
+    /// Clicking the same tool again disarms it, so the tool row is a toggle and
+    /// there is always a way out that does not involve knowing about Escape.
+    pub(crate) fn arm(&mut self, armed: Armed) {
+        if self
+            .armed
+            .as_ref()
+            .is_some_and(|a| a.label == armed.label && a.kind == armed.kind)
+        {
+            self.disarm();
+            return;
+        }
+        if self.sketch.is_some() {
+            self.cancel_sketch();
+        }
+        let what = armed.label;
+        self.armed = Some(armed);
+        self.tool = TOOL_SELECT;
+        self.status = format!("Click where the {} goes", what.to_lowercase());
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        if self.armed.take().is_some() {
+            self.status = "Ready".to_string();
+        }
+    }
+
+    /// Places the armed feature at a point on the active plane.
+    ///
+    /// `at` is in the plane's own coordinates and is snapped, so a feature
+    /// placed by eye still lands on a number somebody can reproduce.
+    pub(crate) fn place_armed(&mut self, at: Vec2) {
+        let Some(armed) = self.armed.take() else {
+            return;
+        };
+        let at = self.snap(at);
+        match armed.kind {
+            Placing::Pad => self.add_pad_at(armed.profile, armed.label, at),
+            Placing::Pocket => self.add_pocket_at(armed.profile, armed.label, at),
+        }
+    }
+
+    /// The selection's draggable dimensions, in world space.
+    ///
+    /// Empty when nothing is selected, when the selected node has no dimension
+    /// with a direction, or when it is not reachable from the root, since a node
+    /// that is not in the model has nowhere to put a grip.
+    #[must_use]
+    pub(crate) fn grips(&self) -> Vec<Grip> {
+        let Some(id) = self.selected else {
+            return Vec::new();
+        };
+        let Some(root) = self.doc.root() else {
+            return Vec::new();
+        };
+        let Some(placement) = sc_geom::pick::placement_of(self.doc.arena(), root, id) else {
+            return Vec::new();
+        };
+        let Some(node) = self.doc.arena().get(id) else {
+            return Vec::new();
+        };
+        let values = node.params();
+        crate::handle::handles(self.doc.arena(), id)
+            .into_iter()
+            .filter_map(|h| {
+                let value = values.iter().find(|(n, _)| *n == h.param)?.1;
+                Some(Grip {
+                    param: h.param,
+                    value,
+                    at: placement.apply_point(h.at),
+                    tip: placement.apply_point(h.at + h.along),
+                    gain: h.gain,
+                })
+            })
+            .collect()
+    }
+
+    /// Where a grip is on screen, and how fast its parameter moves there.
+    ///
+    /// `None` when the grip is behind the camera, or when its direction is so
+    /// close to head-on that a pixel of pointer travel would be worth metres.
+    /// Refusing a grip in that state is what stops a drag from flying off: the
+    /// user can orbit a little and grab it from a workable angle.
+    #[must_use]
+    pub(crate) fn grip_on_screen(
+        &self,
+        grip: &Grip,
+        viewport: [f32; 4],
+    ) -> Option<(Vec2, Vec2, f32)> {
+        /// Screen points a grip's direction must cover per local unit before it
+        /// is considered grabbable.
+        const MIN_FORESHORTENING: f32 = 2.0;
+
+        let [left, top, width, height] = viewport;
+        let aspect = width / height.max(1.0);
+        let to_screen = |world: Vec3| -> Option<Vec2> {
+            let ndc = self.camera().project(world, aspect)?;
+            Some(Vec2::new(
+                left + (ndc.x * 0.5 + 0.5) * width,
+                top + (0.5 - ndc.y * 0.5) * height,
+            ))
+        };
+
+        let at = to_screen(grip.at)?;
+        let tip = to_screen(grip.tip)?;
+        let span = tip - at;
+        let points = span.length();
+        if points < MIN_FORESHORTENING {
+            return None;
+        }
+        // Parameter units per point: the gain per local unit, divided by how
+        // many points a local unit currently covers. Perspective and any scale
+        // in the placement are both already in that number.
+        Some((at, span / points, grip.gain / points))
+    }
+
+    /// Starts pushing or pulling one dimension.
+    ///
+    /// Opens an undo step that stays open for the whole gesture, so the hundreds
+    /// of parameter changes a drag makes take one press of undo to take back.
+    /// Every path out of a drag closes it again.
+    pub(crate) fn begin_drag(&mut self, drag: Drag) {
+        if self.drag.is_some() {
+            return;
+        }
+        self.doc.begin_step();
+        self.drag = Some(drag);
+    }
+
+    /// Moves the dimension to wherever the pointer has got to.
+    pub(crate) fn drag_to(&mut self, pointer: Vec2) {
+        let Some(mut drag) = self.drag else {
+            return;
+        };
+        let travel = (pointer - drag.origin).dot(drag.axis);
+        let value = drag.from + travel * drag.gain;
+
+        // A drag that would make the node invalid stops at the limit instead of
+        // being refused. A radius cannot pass through zero, and reporting that
+        // as an error on every frame of a drag would be noise rather than
+        // information.
+        let Some(node) = self.doc.arena().get(drag.node) else {
+            return;
+        };
+        let mut probe = node.clone();
+        if !probe.set_param(drag.param, value) || !probe.is_valid() {
+            return;
+        }
+
+        self.apply(Command::SetParam {
+            id: drag.node,
+            name: drag.param.to_string(),
+            value,
+        });
+        drag.value = value;
+        self.drag = Some(drag);
+        self.status = format!("{} {value:.2} mm", drag.param);
+    }
+
+    /// Ends the drag, keeping where it got to.
+    pub(crate) fn finish_drag(&mut self) {
+        if self.drag.take().is_some() {
+            self.doc.end_step();
+            self.status = "Ready".to_string();
+        }
+    }
+
+    /// Ends the drag and puts the dimension back where it started.
+    pub(crate) fn cancel_drag(&mut self) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        self.apply(Command::SetParam {
+            id: drag.node,
+            name: drag.param.to_string(),
+            value: drag.from,
+        });
+        self.doc.end_step();
+        self.status = "Cancelled".to_string();
+    }
+
+    /// Loads the engine example: a deeper model than the bracket, for seeing how
+    /// the tree and the property panel behave on something with real depth.
+    pub(crate) fn load_engine(&mut self) {
+        self.doc = samples::engine();
+        self.selected = self.doc.root();
+        self.frame_camera();
+        self.path = None;
+        self.dirty = false;
+        self.field_dirty = true;
+        self.status = "Loaded the engine example".to_string();
+    }
+
     /// Points the camera down `normal` without moving what it is looking at.
     ///
     /// The rig smooths towards the new orientation rather than cutting to it,
@@ -330,6 +709,17 @@ impl AppState {
     /// Selects whatever lies under a viewport position, or clears the selection.
     ///
     /// `tolerance` should be a few pixels' worth of world units at that depth.
+    /// What is under the pointer, without selecting it.
+    ///
+    /// Shared with `select_at` so that "is the press on the selection" and "what
+    /// would this click select" can never give different answers.
+    #[must_use]
+    pub(crate) fn hit_at(&self, ndc: Vec2, aspect: f32, tolerance: f32) -> Option<NodeId> {
+        let root = self.doc.root()?;
+        let point = self.trace(ndc, aspect)?;
+        sc_geom::pick(self.doc.arena(), root, point, tolerance).map(sc_geom::Hit::node)
+    }
+
     pub(crate) fn select_at(&mut self, ndc: sc_geom::glam::Vec2, aspect: f32, tolerance: f32) {
         let Some(root) = self.doc.root() else { return };
         let Some(point) = self.trace(ndc, aspect) else {
@@ -499,6 +889,16 @@ impl AppState {
     /// the profile stays parametric: a rectangle is a width and a height for as
     /// long as it exists.
     pub(crate) fn add_pad(&mut self, profile: sc_geom::Profile, label: &str) {
+        self.add_pad_at(profile, label, Vec2::ZERO);
+    }
+
+    /// As [`AppState::add_pad`], at a chosen spot on the active plane.
+    ///
+    /// `at` is in the plane's own coordinates, which is what a click on the
+    /// plane gives. Kept as a placement of its own beneath the frame rather than
+    /// folded into it, so that an attached pad can still be regenerated when the
+    /// face it sits on moves.
+    pub(crate) fn add_pad_at(&mut self, profile: sc_geom::Profile, label: &str, at: Vec2) {
         self.as_one_step(|s| {
             // The sketch frame, not the datum plane: a pad dropped on an
             // attached face belongs on that face, exactly like one drawn there
@@ -512,7 +912,8 @@ impl AppState {
                 return;
             };
 
-            let Some(id) = s.place(extrude, frame) else {
+            let local = Transform::from_translation(Vec3::new(at.x, at.y, 0.0));
+            let Some(id) = s.place_offset(extrude, local, frame) else {
                 return;
             };
             s.apply(Command::SetName {
@@ -531,6 +932,11 @@ impl AppState {
     /// default is a hole all the way through rather than a blind recess. Its
     /// depth and position stay editable afterwards like any other feature.
     pub(crate) fn add_pocket(&mut self, profile: sc_geom::Profile, label: &str) {
+        self.add_pocket_at(profile, label, Vec2::ZERO);
+    }
+
+    /// As [`AppState::add_pocket`], at a chosen spot on the active plane.
+    pub(crate) fn add_pocket_at(&mut self, profile: sc_geom::Profile, label: &str, at: Vec2) {
         let Some(root) = self.doc.root() else {
             self.status = "Nothing to cut into yet".to_string();
             return;
@@ -546,7 +952,8 @@ impl AppState {
                 return;
             };
             let frame = s.sketch_frame();
-            let Some(placed) = s.place_offset(cut, Transform::IDENTITY, frame) else {
+            let local = Transform::from_translation(Vec3::new(at.x, at.y, 0.0));
+            let Some(placed) = s.place_offset(cut, local, frame) else {
                 return;
             };
 
@@ -2477,6 +2884,334 @@ mod tests {
         state.move_selection(Vec3::new(9.0, 0.0, 0.0));
 
         assert_ne!(state.doc.hash().expect("still rooted"), before);
+    }
+
+    /// A grip has to be where the pointer will look for it. The projection is
+    /// shared between the drawing and the hit testing precisely so the two
+    /// cannot disagree, and this checks the shared answer is sane.
+    #[test]
+    fn a_grip_projects_inside_the_viewport_it_belongs_to() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(
+            Node::Box {
+                half: Vec3::splat(10.0),
+                round: 0.0,
+            },
+            "Block",
+        );
+        let viewport = [0.0, 0.0, 1200.0, 800.0];
+
+        let grips = state.grips();
+        assert_eq!(grips.len(), 3, "a box has three half extents");
+        for grip in grips {
+            let (at, axis, gain) = state
+                .grip_on_screen(&grip, viewport)
+                .unwrap_or_else(|| panic!("{} did not project", grip.param));
+            assert!(
+                at.x > 0.0 && at.x < 1200.0 && at.y > 0.0 && at.y < 800.0,
+                "{} landed at {at:?}, outside the viewport",
+                grip.param
+            );
+            assert!((axis.length() - 1.0).abs() < 1.0e-4, "axis is not a unit");
+            assert!(gain > 0.0 && gain.is_finite(), "gain of {gain}");
+        }
+    }
+
+    /// Dragging a grip in the direction it points has to make the feature
+    /// bigger, and the geometry has to keep up with the pointer rather than
+    /// lagging it by the gain.
+    #[test]
+    fn dragging_a_grip_outward_resizes_the_feature() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(
+            Node::Box {
+                half: Vec3::splat(10.0),
+                round: 0.0,
+            },
+            "Block",
+        );
+        let viewport = [0.0, 0.0, 1200.0, 800.0];
+        let grip = state
+            .grips()
+            .into_iter()
+            .find(|g| g.param == "half_x")
+            .expect("a box has a half_x grip");
+        let (at, axis, gain) = state.grip_on_screen(&grip, viewport).expect("projects");
+
+        state.begin_drag(Drag {
+            node: state.selected.expect("selected"),
+            param: grip.param,
+            from: grip.value,
+            value: grip.value,
+            axis,
+            gain,
+            origin: at,
+        });
+        // Forty points along the grip's own direction.
+        state.drag_to(at + axis * 40.0);
+        state.finish_drag();
+
+        let after = state
+            .doc
+            .arena()
+            .get(state.selected.expect("selected"))
+            .expect("still there")
+            .params()
+            .into_iter()
+            .find(|(n, _)| *n == "half_x")
+            .expect("half_x")
+            .1;
+        let expected = grip.value + 40.0 * gain;
+        assert!(
+            (after - expected).abs() < 0.01,
+            "half_x went to {after}, expected {expected}"
+        );
+        assert!(after > grip.value, "dragging outward shrank it");
+    }
+
+    /// However many parameter changes a drag makes, it is one thing the user
+    /// did and takes one press of undo to take back.
+    #[test]
+    fn a_whole_drag_is_a_single_undo_step() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 10.0 }, "Ball");
+        let before = state.doc.hash().expect("rooted");
+        let viewport = [0.0, 0.0, 1200.0, 800.0];
+        let grip = state.grips().into_iter().next().expect("a sphere has one");
+        let (at, axis, gain) = state.grip_on_screen(&grip, viewport).expect("projects");
+
+        state.begin_drag(Drag {
+            node: state.selected.expect("selected"),
+            param: grip.param,
+            from: grip.value,
+            value: grip.value,
+            axis,
+            gain,
+            origin: at,
+        });
+        for step in 1..=30 {
+            state.drag_to(at + axis * step as f32);
+        }
+        state.finish_drag();
+        assert_ne!(
+            state.doc.hash().expect("rooted"),
+            before,
+            "the drag did nothing"
+        );
+
+        state.undo();
+
+        assert_eq!(
+            state.doc.hash().expect("rooted"),
+            before,
+            "one undo left part of the drag applied"
+        );
+    }
+
+    /// A drag that would take a dimension through zero stops at the limit
+    /// instead of being refused. Reporting an error on every frame of a drag
+    /// would be noise, and the geometry would stop responding with no
+    /// explanation of why.
+    #[test]
+    fn a_drag_stops_at_the_limit_rather_than_erroring() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 10.0 }, "Ball");
+        let viewport = [0.0, 0.0, 1200.0, 800.0];
+        let grip = state.grips().into_iter().next().expect("a sphere has one");
+        let (at, axis, gain) = state.grip_on_screen(&grip, viewport).expect("projects");
+
+        state.begin_drag(Drag {
+            node: state.selected.expect("selected"),
+            param: grip.param,
+            from: grip.value,
+            value: grip.value,
+            axis,
+            gain,
+            origin: at,
+        });
+        // Far enough inward to take the radius well past zero.
+        state.drag_to(at - axis * 10_000.0);
+        state.finish_drag();
+
+        let node = state
+            .doc
+            .arena()
+            .get(state.selected.expect("selected"))
+            .expect("the node survived");
+        assert!(node.is_valid(), "the drag left an invalid node behind");
+    }
+
+    /// Escape puts it back where it was, without needing undo.
+    #[test]
+    fn cancelling_a_drag_restores_the_dimension() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 10.0 }, "Ball");
+        let before = state.doc.hash().expect("rooted");
+        let viewport = [0.0, 0.0, 1200.0, 800.0];
+        let grip = state.grips().into_iter().next().expect("a sphere has one");
+        let (at, axis, gain) = state.grip_on_screen(&grip, viewport).expect("projects");
+
+        state.begin_drag(Drag {
+            node: state.selected.expect("selected"),
+            param: grip.param,
+            from: grip.value,
+            value: grip.value,
+            axis,
+            gain,
+            origin: at,
+        });
+        state.drag_to(at + axis * 60.0);
+        state.cancel_drag();
+
+        assert!(state.drag.is_none(), "the drag outlived the cancel");
+        assert_eq!(
+            state.doc.hash().expect("rooted"),
+            before,
+            "cancelling left the dimension moved"
+        );
+    }
+
+    /// Nothing is selected, so there is nothing to grab.
+    #[test]
+    fn an_empty_selection_has_no_grips() {
+        let mut state = AppState::new();
+        state.new_document();
+        assert!(state.grips().is_empty());
+        state.add_body(Node::Sphere { radius: 4.0 }, "Ball");
+        state.select(None);
+        assert!(state.grips().is_empty());
+    }
+
+    /// A hole goes where it was put. Every cut tool used to drop its feature at
+    /// the plane's origin, which meant every hole landed in the middle of the
+    /// part and then had to be moved with numbers.
+    #[test]
+    fn an_armed_cut_lands_where_it_is_placed() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 60.0,
+                height: 60.0,
+            },
+            "Plate",
+        );
+        assert!(solid_at_point(&state, Vec3::new(18.0, 0.0, 5.0)));
+
+        state.arm(Armed {
+            kind: Placing::Pocket,
+            profile: sc_geom::Profile::Circle { radius: 5.0 },
+            label: "Hole",
+        });
+        state.place_armed(Vec2::new(18.0, 0.0));
+
+        assert!(state.armed.is_none(), "the tool stayed armed after placing");
+        assert!(
+            !solid_at_point(&state, Vec3::new(18.0, 0.0, 5.0)),
+            "the hole did not land where it was placed"
+        );
+        assert!(
+            solid_at_point(&state, Vec3::new(0.0, 0.0, 5.0)),
+            "the hole landed at the origin instead"
+        );
+    }
+
+    /// Clicking the armed tool again puts it away, so there is a way out that
+    /// does not require knowing about Escape.
+    #[test]
+    fn arming_the_same_tool_twice_disarms_it() {
+        let mut state = AppState::new();
+        let armed = || Armed {
+            kind: Placing::Pocket,
+            profile: sc_geom::Profile::Circle { radius: 5.0 },
+            label: "Hole",
+        };
+        state.arm(armed());
+        assert!(state.armed.is_some());
+        state.arm(armed());
+        assert!(state.armed.is_none());
+    }
+
+    /// Dragging a feature around must not leave a placement behind every time.
+    /// Ten nudges should leave the tree exactly as one nudge does.
+    #[test]
+    fn dragging_a_feature_reuses_one_placement() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+
+        let id = state.begin_move().expect("something to move");
+        state.move_to(id, Vec3::new(10.0, 0.0, 0.0));
+        state.finish_move();
+        let after_one = state.doc.arena().live_ids().count();
+
+        let id = state.begin_move().expect("still movable");
+        state.move_to(id, Vec3::new(20.0, 5.0, 0.0));
+        state.finish_move();
+
+        assert_eq!(
+            state.doc.arena().live_ids().count(),
+            after_one,
+            "a second drag stacked another placement"
+        );
+        assert!(
+            solid_at_point(&state, Vec3::new(20.0, 5.0, 0.0)),
+            "the feature is not where it was dragged"
+        );
+    }
+
+    /// A drag writes three parameters many times over, and is still one thing
+    /// the user did.
+    #[test]
+    fn a_whole_free_drag_is_a_single_undo_step() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        let before = state.doc.hash().expect("rooted");
+
+        let id = state.begin_move().expect("movable");
+        for step in 1..=20 {
+            state.move_to(id, Vec3::new(step as f32, 0.0, 0.0));
+        }
+        state.finish_move();
+        assert_ne!(state.doc.hash().expect("rooted"), before);
+
+        state.undo();
+        assert_eq!(
+            state.doc.hash().expect("rooted"),
+            before,
+            "one undo left part of the drag applied"
+        );
+    }
+
+    /// The plane a free drag moves across follows the camera, so looking down
+    /// slides a part across the plate and looking from the side lifts it.
+    #[test]
+    fn the_drag_plane_faces_the_camera() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+
+        state.look_along(Vec3::Z);
+        state.rig.snap_to(state.rig.goal);
+        assert_eq!(
+            state.drag_plane(),
+            Vec3::Z,
+            "looking down should drag in XY"
+        );
+
+        state.look_along(Vec3::X);
+        state.rig.snap_to(state.rig.goal);
+        assert_eq!(
+            state.drag_plane(),
+            Vec3::X,
+            "looking along X should drag in YZ"
+        );
     }
 
     /// Framing something that was already deleted must not move the camera.

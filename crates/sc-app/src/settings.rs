@@ -59,6 +59,13 @@ pub(crate) struct Settings {
     /// Light, dark, or whatever the desktop is set to.
     #[serde(default)]
     pub(crate) appearance: Appearance,
+
+    /// Whether the tutorial has been finished or dismissed.
+    ///
+    /// It runs once, unasked, on a first launch. Offering it behind a menu item
+    /// means the people who most need it are the least likely to find it.
+    #[serde(default)]
+    pub(crate) tutorial_seen: bool,
 }
 
 fn path() -> Option<PathBuf> {
@@ -175,7 +182,7 @@ mod appearance_tests {
         assert_eq!(Appearance::System.resolve(None), Scheme::Light);
     }
 
-    /// A settings file written before this preference existed must load, and
+    /// A settings file written before these preferences existed must load, and
     /// must not silently pin the user to one scheme.
     #[test]
     fn an_older_settings_file_defaults_to_following_the_system() {
@@ -183,6 +190,23 @@ mod appearance_tests {
         let loaded: super::Settings = serde_json::from_str(older).expect("older settings load");
         assert_eq!(loaded.appearance, Appearance::System);
         assert_eq!(loaded.ui_scale, Some(1.5));
+        assert!(
+            !loaded.tutorial_seen,
+            "an existing user would never be shown the guide"
+        );
+    }
+
+    /// And once it has been seen, that has to survive a round trip, or the guide
+    /// reappears on every launch.
+    #[test]
+    fn having_seen_the_guide_round_trips() {
+        let mut settings = super::Settings::default();
+        assert!(!settings.tutorial_seen, "it has to run on a first launch");
+        settings.tutorial_seen = true;
+
+        let text = serde_json::to_string(&settings).expect("serialises");
+        let back: super::Settings = serde_json::from_str(&text).expect("deserialises");
+        assert!(back.tutorial_seen);
     }
 
     #[test]

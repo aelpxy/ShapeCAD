@@ -34,6 +34,77 @@ schemes is in force.
 Depth comes from the border, not from shadows. Only things that genuinely float
 over the 3D view get one, and even then it is faint.
 
+## The guided tour
+
+`tutorial.rs`. Five steps, shown on a card in the corner of the viewport, each
+advancing when the user actually does the thing rather than when they press Next.
+That difference is the whole point: a slideshow can be clicked through without
+anything being learned, and it cannot tell whether it worked.
+
+The cost is a condition per step, and conditions are what rots. A step that can
+never be satisfied traps a beginner in the one part of the application they
+cannot leave, and nothing else in the suite would notice, so every step is driven
+through a real `AppState` in `doing_what_each_step_asks_finishes_the_tutorial`.
+
+Steps measure **change**, not state. A `Mark` is taken when a step begins and the
+condition compares against it, so a document that already has something in it
+does not tick off "add a solid" before anything has been added.
+
+That test earned its keep immediately. There was a sixth step, "select it", and
+adding a solid selects it already, so the step was satisfied before the user had
+clicked anything: a card that ticks itself off, teaching nothing while looking
+like it taught something. Selection is explained on the cards either side instead.
+
+It runs unasked on a first launch and sets `tutorial_seen`. Putting it behind a
+menu item means the people who need it most are the least likely to find it, and
+it costs one click to dismiss. The Guide button in the top bar brings it back.
+
+## Direct manipulation
+
+A selected feature shows a grip on each of its dimensions: a dot sitting on the
+surface that dimension moves, with a stub pointing the way it grows once the
+pointer is near enough to grab it. Drag one and the geometry follows, with the
+value read out beside it.
+
+Three modules, split along the only line that matters, which is what has a right
+answer and what does not:
+
+- `handle.rs` says where a dimension lives, in the node's own frame. A grip in
+  the wrong place is a bug that can be written down as a failing test.
+- `AppState::grips` lifts those into the world through the node's placement, and
+  `grip_on_screen` projects one. **Drawing and hit testing share that one
+  function on purpose.** Two projections would drift, and the symptom would be
+  grips that cannot be grabbed where they appear.
+- `ui::grips` draws them; `App::grab_grip` starts the drag.
+
+Not every parameter gets one. A rounding radius, a blend radius, an offset
+distance and a shell thickness have no direction: the surface moves everywhere at
+once, so there is nowhere honest to put a grip. Those stay in the property panel,
+which is the right place for a scalar with no axis. A transform's translation is
+left out too, because moving a feature is a different gesture from resizing one
+and a mis-grab should not change the wrong thing.
+
+Four things the implementation has to get right, each of which is a test:
+
+**Gain.** A half-extent is measured from the centre and a width across, so
+dragging a rectangle's edge one millimetre makes it two millimetres wider. Get
+this wrong and the geometry moves at half the speed of the pointer.
+
+**Foreshortening.** A grip pointing nearly at the camera covers almost no screen
+distance, so a pixel of travel would be worth metres. `grip_on_screen` refuses
+one below a threshold; orbit slightly and it becomes grabbable. The screen scale
+comes from projecting the grip and a point one unit along it, which picks up
+perspective and any scale in the placement for free.
+
+**One drag, one undo.** A drag makes hundreds of parameter changes. It opens an
+undo step on the press and closes it on release, so all of them come back
+together. Every path out of a drag closes it, including Escape.
+
+**Stopping rather than erroring.** A drag that would take a radius through zero
+stops at the limit. Refusing it would put an error on the status bar on every
+frame, which is noise, and the geometry would stop responding with no
+explanation.
+
 ## Grouped lists
 
 The tool panel is a grouped list, which is the shape this kind of list takes on

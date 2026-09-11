@@ -21,6 +21,7 @@ fn main() {
         "demo" => demo(flag("--wgsl")),
         "selftest" => std::process::exit(selftest()),
         "export" => export(&args),
+        "write" => write(&args),
         "help" | "--help" | "-h" => usage(),
         other => {
             eprintln!("unknown command: {other}\n");
@@ -36,6 +37,9 @@ fn usage() {
            demo [--wgsl]   build the reference part and report it\n\
            export <file.stl> [--resolution N]\n\
            \x20               mesh the reference part and write it\n\
+           write <name> <file.shapecad>\n\
+           \x20               write a reference model as a document\n\
+           \x20               names: bracket, engine\n\
            selftest        compare the reference part against its golden hash\n\
            help            this message\n"
     );
@@ -161,4 +165,40 @@ fn selftest() -> i32 {
             }
         }
     }
+}
+
+/// Writes a reference model out as a document, so it can be opened and edited.
+///
+/// The samples are built in code rather than shipped as files, because a sample
+/// is a test fixture and a file on disk cannot be checked against the kernel it
+/// was built with. This turns one into a file on demand.
+fn write(args: &[String]) {
+    let name = args.get(1).map_or("engine", String::as_str);
+    let doc = match name {
+        "bracket" => sc_doc::samples::bracket(),
+        "engine" => sc_doc::samples::engine(),
+        other => {
+            eprintln!("unknown model: {other}\nnames: bracket, engine");
+            std::process::exit(2);
+        }
+    };
+    let Some(path) = args.get(2) else {
+        eprintln!("usage: shapecad write <name> <file.shapecad>");
+        std::process::exit(2);
+    };
+    let path = std::path::Path::new(path);
+    if let Err(e) = sc_doc::file::save(&doc, path) {
+        eprintln!("could not write {}: {e}", path.display());
+        std::process::exit(1);
+    }
+    let bounds = doc.bounds().expect("a sample is always rooted");
+    let size = bounds.size();
+    println!(
+        "wrote {} ({} nodes, {:.0} x {:.0} x {:.0} mm)",
+        path.display(),
+        doc.arena().len(),
+        size.x,
+        size.y,
+        size.z
+    );
 }

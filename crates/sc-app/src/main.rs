@@ -5,6 +5,7 @@
 //! top in a second pass. No intermediate texture, no copy.
 
 mod dialog;
+mod handle;
 mod icon;
 mod motion;
 mod plane;
@@ -12,11 +13,12 @@ mod settings;
 mod snapshot;
 mod state;
 mod theme;
+mod tutorial;
 mod ui;
 
 use std::sync::Arc;
 
-use sc_geom::glam::Vec2;
+use sc_geom::glam::{Vec2, Vec3};
 use sc_render::{gpu, Renderer};
 use state::{AppState, MenuTarget};
 use winit::application::ApplicationHandler;
@@ -37,6 +39,12 @@ fn main() {
             snapshot::Scene::Hover
         } else if args.iter().any(|a| a == "--menu") {
             snapshot::Scene::Menu
+        } else if args.iter().any(|a| a == "--tutorial") {
+            snapshot::Scene::Tutorial
+        } else if args.iter().any(|a| a == "--grips") {
+            snapshot::Scene::Grips
+        } else if args.iter().any(|a| a == "--engine") {
+            snapshot::Scene::Engine
         } else if args.iter().any(|a| a == "--showcase") {
             snapshot::Scene::Showcase
         } else {
@@ -398,6 +406,11 @@ struct App {
     /// Right drag pans and right click opens the context menu, so the two are
     /// separated the same way the left button separates click from orbit.
     right_press_at: Option<PhysicalPosition<f64>>,
+    /// A free drag of the selection: the placement being written into, where the
+    /// pointer first met the drag plane, and where the feature was then. A move
+    /// is the difference between the first two, so the feature travels with the
+    /// pointer rather than jumping its centre to it.
+    moving: Option<(sc_geom::NodeId, Vec3, Vec3)>,
     /// The press currently in flight only closed the context menu, so its
     /// release must not be read as a click on the model.
     dismissing_press: bool,
@@ -422,6 +435,7 @@ impl App {
             cursor: None,
             press_at: None,
             right_press_at: None,
+            moving: None,
             dismissing_press: false,
             last_frame: std::time::Instant::now(),
             last_click: None,
@@ -706,6 +720,208 @@ impl App {
         self.state.select_at(ndc, aspect, tolerance);
     }
 
+    /// Starts a push/pull drag if the pointer is on one of the selection's
+    /// grips. True if it took the press.
+    ///
+    /// The nearest grip wins rather than the first, so that two that overlap on
+    /// screen still both reachable: the one whose centre is closer is the one
+    /// being aimed at.
+    fn grab_grip(&mut self) -> bool {
+        use sc_geom::glam::Vec2;
+
+        if self.state.sketch.is_some() || self.state.tool != state::TOOL_SELECT {
+            return false;
+        }
+        let Some(cursor) = self.cursor else {
+            return false;
+        };
+        if self.input.egui_owns || !self.pointer_in_viewport() {
+            return false;
+        }
+        let ppp = self
+            .gpu
+            .as_ref()
+            .map_or(1.0, |gpu| gpu.egui_state.egui_ctx().pixels_per_point());
+        let pointer = Vec2::new(cursor.x as f32 / ppp, cursor.y as f32 / ppp);
+        let viewport = [
+            self.viewport[0] / ppp,
+            self.viewport[1] / ppp,
+            self.viewport[2] / ppp,
+            self.viewport[3] / ppp,
+        ];
+
+        let mut best: Option<(f32, state::Drag)> = None;
+        for grip in self.state.grips() {
+            let Some((at, axis, gain)) = self.state.grip_on_screen(&grip, viewport) else {
+                continue;
+            };
+            let reach = (pointer - at).length();
+            if reach > crate::ui::GRIP_REACH {
+                continue;
+            }
+            if best.as_ref().is_some_and(|(closest, _)| *closest <= reach) {
+                continue;
+            }
+            best = Some((
+                reach,
+                state::Drag {
+                    node: self.state.selected.expect("a grip implies a selection"),
+                    param: grip.param,
+                    from: grip.value,
+                    value: grip.value,
+                    axis,
+                    gain,
+                    origin: pointer,
+                },
+            ));
+        }
+        let Some((_, drag)) = best else {
+            return false;
+        };
+        self.state.begin_drag(drag);
+        self.input.gesture = Gesture::None;
+        true
+    }
+
+    /// Everything the pointer moving can mean: a free drag, a push/pull, a
+    /// hover that lights a grip, or a camera gesture.
+    fn pointer_moved(&mut self, position: PhysicalPosition<f64>) {
+        // A drag in progress owns the pointer outright: no orbit, no
+        // pan, and no selection change underneath it.
+        if self.moving.is_some() {
+            self.cursor = Some(position);
+            if let (Some((id, grabbed, from)), Some(now)) = (self.moving, self.drag_plane_hit()) {
+                self.state.move_to(id, from + (now - grabbed));
+            }
+            self.request_redraw();
+            return;
+        }
+        if self.state.drag.is_some() {
+            self.cursor = Some(position);
+            let ppp = self
+                .gpu
+                .as_ref()
+                .map_or(1.0, |gpu| gpu.egui_state.egui_ctx().pixels_per_point());
+            self.state
+                .drag_to(Vec2::new(position.x as f32 / ppp, position.y as f32 / ppp));
+            self.request_redraw();
+            return;
+        }
+        // The grips light up as the pointer passes over them, so the
+        // frame has to be redrawn while a feature is selected even when
+        // nothing else is happening.
+        if (self.state.selected.is_some() || self.state.armed.is_some())
+            && self.pointer_in_viewport()
+        {
+            self.request_redraw();
+        }
+        if let Some(prev) = self.cursor {
+            let dx = (position.x - prev.x) as f32;
+            let dy = (position.y - prev.y) as f32;
+            let [_, _, width, height] = self.viewport;
+            // Shift turns an orbit drag into a pan, as most tools do.
+            let pan = self.input.gesture == Gesture::Pan
+                || (self.input.gesture == Gesture::Orbit && self.input.shift);
+            if pan {
+                self.state.rig.goal.pan_pixels(dx, dy, height);
+                self.request_redraw();
+            } else if self.input.gesture == Gesture::Orbit {
+                self.state
+                    .rig
+                    .goal
+                    .orbit_pixels(dx, dy, Vec2::new(width, height));
+                self.request_redraw();
+            }
+        }
+        self.cursor = Some(position);
+        if self.state.sketch.is_some() {
+            self.request_redraw();
+        }
+    }
+
+    /// Where the pointer meets the plane a free drag moves across.
+    fn drag_plane_hit(&self) -> Option<Vec3> {
+        let cursor = self.cursor?;
+        let [left, top, width, height] = self.viewport;
+        let ndc = Vec2::new(
+            ((cursor.x as f32 - left) / width) * 2.0 - 1.0,
+            1.0 - ((cursor.y as f32 - top) / height) * 2.0,
+        );
+        let aspect = width / height.max(1.0);
+        let id = self.state.selected?;
+        let root = self.state.doc.root()?;
+        let origin =
+            sc_geom::pick::placement_of(self.state.doc.arena(), root, id)?.apply_point(Vec3::ZERO);
+        self.state
+            .camera()
+            .plane_hit(ndc, aspect, origin, self.state.drag_plane())
+    }
+
+    /// Starts dragging the selection if the press landed on it. True if it took
+    /// the press.
+    fn grab_selection(&mut self) -> bool {
+        if self.state.sketch.is_some()
+            || self.state.armed.is_some()
+            || self.state.tool != state::TOOL_SELECT
+            || self.input.egui_owns
+            || !self.pointer_in_viewport()
+        {
+            return false;
+        }
+        let Some(selected) = self.state.selected else {
+            return false;
+        };
+        // Only when the press is actually on the selected feature, which is the
+        // same test the click-to-select path uses.
+        let Some((ndc, aspect)) = self.pointer_ndc() else {
+            return false;
+        };
+        let [_, _, _, height] = self.viewport;
+        let tolerance = (self.state.camera().world_per_pixel(height) * 4.0).max(0.01);
+        if self.state.hit_at(ndc, aspect, tolerance) != Some(selected) {
+            return false;
+        }
+        let Some(grabbed) = self.drag_plane_hit() else {
+            return false;
+        };
+        let Some(id) = self.state.begin_move() else {
+            return false;
+        };
+        let from = self
+            .state
+            .doc
+            .arena()
+            .get(id)
+            .and_then(|n| match n {
+                sc_geom::Node::Transform { xform, .. } => Some(xform.translation),
+                _ => None,
+            })
+            .unwrap_or(Vec3::ZERO);
+        self.moving = Some((id, grabbed, from));
+        self.input.gesture = Gesture::None;
+        true
+    }
+
+    /// Drops the armed feature where the pointer meets the active plane.
+    fn place_armed(&mut self) {
+        let Some(cursor) = self.cursor else { return };
+        let [left, top, width, height] = self.viewport;
+        let ndc = Vec2::new(
+            ((cursor.x as f32 - left) / width) * 2.0 - 1.0,
+            1.0 - ((cursor.y as f32 - top) / height) * 2.0,
+        );
+        let aspect = width / height.max(1.0);
+        let origin = self.state.plane_origin();
+        let normal = self.state.plane_normal();
+        match self.state.camera().plane_hit(ndc, aspect, origin, normal) {
+            Some(hit) => {
+                let at = self.state.to_plane(hit);
+                self.state.place_armed(at);
+            }
+            None => self.state.status = "That is not on the active plane".to_string(),
+        }
+    }
+
     /// Places a sketch point where the pointer meets the build plate.
     fn place_sketch_point(&mut self) {
         let Some(cursor) = self.cursor else { return };
@@ -753,6 +969,45 @@ impl App {
         }
         match button {
             MouseButton::Left => {
+                // A grip under the pointer takes the press. Checked before
+                // anything else, because the alternative is orbiting the camera
+                // the instant someone tries to resize a feature.
+                if down && self.grab_grip() {
+                    self.press_at = self.cursor;
+                    self.request_redraw();
+                    return;
+                }
+                if !down && self.state.drag.is_some() {
+                    self.state.finish_drag();
+                    self.input.gesture = Gesture::None;
+                    self.request_redraw();
+                    return;
+                }
+                // A press on the thing that is already selected drags it. Not on
+                // anything else: a press on unselected geometry has to stay a
+                // way to select it, or nothing could ever be picked without
+                // being moved by accident.
+                if down && self.grab_selection() {
+                    self.press_at = self.cursor;
+                    self.request_redraw();
+                    return;
+                }
+                if !down && self.moving.take().is_some() {
+                    self.state.finish_move();
+                    self.input.gesture = Gesture::None;
+                    self.request_redraw();
+                    return;
+                }
+                // An armed feature takes the click: it was armed precisely so
+                // that the next one would say where it goes.
+                if !down && self.state.armed.is_some() {
+                    if self.drag_distance() < CLICK_SLOP {
+                        self.place_armed();
+                    }
+                    self.input.gesture = Gesture::None;
+                    self.request_redraw();
+                    return;
+                }
                 if down {
                     self.press_at = self.cursor;
                 } else if self.state.sketch.is_some() {
@@ -903,6 +1158,12 @@ impl ApplicationHandler for App {
         self.state.set_system_scheme(window_scheme(&window));
         self.state.apply_appearance();
         crate::theme::apply(&ctx);
+        // Unasked, on a first launch only. Putting it behind a menu item means
+        // the people who most need it are the least likely to find it, and it
+        // costs nothing to dismiss.
+        if !self.state.settings.tutorial_seen {
+            self.state.start_tutorial();
+        }
         // Many Linux compositors report 1.0 on a 4K panel. Measure the display
         // and pick a sensible zoom rather than rendering everything half-size.
         let native = window.scale_factor() as f32;
@@ -1015,30 +1276,7 @@ impl ApplicationHandler for App {
                 self.request_redraw();
             }
 
-            WindowEvent::CursorMoved { position, .. } => {
-                if let Some(prev) = self.cursor {
-                    let dx = (position.x - prev.x) as f32;
-                    let dy = (position.y - prev.y) as f32;
-                    let [_, _, width, height] = self.viewport;
-                    // Shift turns an orbit drag into a pan, as most tools do.
-                    let pan = self.input.gesture == Gesture::Pan
-                        || (self.input.gesture == Gesture::Orbit && self.input.shift);
-                    if pan {
-                        self.state.rig.goal.pan_pixels(dx, dy, height);
-                        self.request_redraw();
-                    } else if self.input.gesture == Gesture::Orbit {
-                        self.state
-                            .rig
-                            .goal
-                            .orbit_pixels(dx, dy, Vec2::new(width, height));
-                        self.request_redraw();
-                    }
-                }
-                self.cursor = Some(position);
-                if self.state.sketch.is_some() {
-                    self.request_redraw();
-                }
-            }
+            WindowEvent::CursorMoved { position, .. } => self.pointer_moved(position),
 
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.input.egui_owns || !self.pointer_in_viewport() {

@@ -9,7 +9,7 @@ use crate::dialog::{Outcome, Purpose};
 use crate::icon::Icon;
 use crate::plane::SketchPlane;
 use crate::settings::Appearance;
-use crate::state::{AppState, MenuTarget, TOOL_SELECT, TOOL_SKETCH};
+use crate::state::{AppState, Armed, MenuTarget, Placing, TOOL_SELECT, TOOL_SKETCH};
 use crate::theme;
 use egui::{Align, Layout, Margin, RichText, Vec2};
 use sc_doc::Command;
@@ -67,6 +67,11 @@ impl Default for Chrome {
 /// Panels shrink the parent `Ui`, so whatever space remains afterwards is
 /// exactly the region the 3D view should fill.
 pub(crate) fn draw(ui: &mut egui::Ui, state: &mut AppState) -> Chrome {
+    // Once a frame, before anything is laid out, so a step satisfied by the last
+    // frame's input shows its next card in this one.
+    if state.poll_tutorial() {
+        ui.ctx().request_repaint();
+    }
     shortcuts(ui.ctx(), state);
     top_bar(ui, state);
     status_bar(ui, state);
@@ -405,6 +410,20 @@ fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
     const ZOOM_RESET: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Num0);
     const FIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F);
 
+    // Escape abandons a drag and puts the dimension back. Checked before
+    // anything else that consumes Escape, so that a drag started by mistake can
+    // always be taken back without looking for undo.
+    if state.drag.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        state.cancel_drag();
+        return;
+    }
+
+    // Escape also puts an armed tool away, the same key that cancels everything.
+    if state.armed.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        state.disarm();
+        return;
+    }
+
     if state.sketch.is_some() {
         let (finish, cancel, back) = ctx.input_mut(|i| {
             (
@@ -532,30 +551,7 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let export = theme::primary_button_with_icon(ui, Icon::Download, "Export STL");
-                    if theme::hint(
-                        export,
-                        "Export STL",
-                        "Meshes the model with dual contouring and writes a binary STL ready to slice.",
-                        None,
-                    )
-                    .clicked()
-                    {
-                        state.browse(Purpose::ExportStl);
-                    }
-                    ui.add_space(6.0);
-
-                    appearance_switch(ui, state);
-                    ui.add_space(10.0);
-
-                    let redo = theme::icon_button(ui, Icon::Redo, state.doc.can_redo());
-                    if theme::hint(redo, "Redo", "Replays the last undone operation.", Some("Ctrl+Shift+Z")).clicked() {
-                        state.redo();
-                    }
-                    let undo = theme::icon_button(ui, Icon::Undo, state.doc.can_undo());
-                    if theme::hint(undo, "Undo", "Steps back through the command log.", Some("Ctrl+Z")).clicked() {
-                        state.undo();
-                    }
+                    top_bar_actions(ui, state);
                 });
             });
 
@@ -812,6 +808,69 @@ fn plane_row(ui: &mut egui::Ui, state: &mut AppState) {
     });
 }
 
+/// The top bar's right-hand group: export, history, appearance and the guide.
+///
+/// Laid out right to left, which anything nested inside inherits. Split out
+/// because the bar was doing two unrelated jobs in one function.
+fn top_bar_actions(ui: &mut egui::Ui, state: &mut AppState) {
+    let export = theme::primary_button_with_icon(ui, Icon::Download, "Export STL");
+    if theme::hint(
+        export,
+        "Export STL",
+        "Meshes the model with dual contouring and writes a binary STL ready to slice.",
+        None,
+    )
+    .clicked()
+    {
+        state.browse(Purpose::ExportStl);
+    }
+    ui.add_space(6.0);
+
+    appearance_switch(ui, state);
+    ui.add_space(6.0);
+
+    let running = state.tutorial.is_some();
+    let help = theme::tool_button(ui, Icon::Help, "Guide", running, true);
+    if theme::hint(
+                    help,
+                    "Guided tour",
+                    "Five steps covering everything you need to make a part. It watches what you do rather than asking you to click through it.",
+                    None,
+                )
+                .clicked()
+                {
+                    if running {
+                        state.end_tutorial();
+                    } else {
+                        state.start_tutorial();
+                    }
+                }
+    ui.add_space(10.0);
+
+    let redo = theme::icon_button(ui, Icon::Redo, state.doc.can_redo());
+    if theme::hint(
+        redo,
+        "Redo",
+        "Replays the last undone operation.",
+        Some("Ctrl+Shift+Z"),
+    )
+    .clicked()
+    {
+        state.redo();
+    }
+    let undo = theme::icon_button(ui, Icon::Undo, state.doc.can_undo());
+    if theme::hint(
+        undo,
+        "Undo",
+        "Steps back through the command log.",
+        Some("Ctrl+Z"),
+    )
+    .clicked()
+    {
+        state.undo();
+    }
+}
+
 /// Light, dark, or follow the desktop.
 fn appearance_switch(ui: &mut egui::Ui, state: &mut AppState) {
     const OPTIONS: [(Icon, &str, &str); 3] = [
@@ -912,9 +971,14 @@ fn add_tools(ui: &mut egui::Ui, state: &mut AppState) {
     ];
     theme::grouped(ui, |rows| {
         for (glyph, label, help, profile) in pads {
-            let row = rows.row(glyph, label, false, true);
+            let armed = state.armed.as_ref().is_some_and(|a| a.label == label);
+            let row = rows.row(glyph, label, armed, true);
             if theme::hint(row, label, help, None).clicked() {
-                state.add_pad(profile, label);
+                state.arm(Armed {
+                    kind: Placing::Pad,
+                    profile,
+                    label,
+                });
             }
         }
     });
@@ -989,14 +1053,19 @@ fn cut_tools(ui: &mut egui::Ui, state: &mut AppState) {
     ];
     theme::grouped(ui, |rows| {
         for (glyph, label, help, profile) in cuts {
-            let row = rows.row(glyph, label, false, can_cut);
+            let armed = state.armed.as_ref().is_some_and(|a| a.label == label);
+            let row = rows.row(glyph, label, armed, can_cut);
             let help = if can_cut {
                 help
             } else {
                 "There is nothing to cut into yet. Add a body first."
             };
             if theme::hint(row, label, help, None).clicked() {
-                state.add_pocket(profile, label);
+                state.arm(Armed {
+                    kind: Placing::Pocket,
+                    profile,
+                    label,
+                });
             }
         }
     });
@@ -1257,6 +1326,10 @@ fn overlays(
     viewport: egui::Rect,
     claimed: &mut Vec<egui::Rect>,
 ) {
+    grips(ui, state, viewport);
+    armed_preview(ui, state, viewport);
+    tutorial_card(ui, state, viewport, claimed);
+
     // Axis legend and Fit, top right.
     let legend = egui::Rect::from_min_size(
         egui::pos2(viewport.max.x - 124.0, viewport.min.y + 14.0),
@@ -1512,6 +1585,261 @@ pub(crate) fn ndc_of(pos: egui::Pos2, viewport: egui::Rect) -> GVec2 {
         ((pos.x - viewport.min.x) / viewport.width()) * 2.0 - 1.0,
         1.0 - ((pos.y - viewport.min.y) / viewport.height()) * 2.0,
     )
+}
+
+/// One step's card: where you are, what to do, and how far along.
+fn tutorial_step_card(ui: &mut egui::Ui, step: &crate::tutorial::Step, at: usize) -> bool {
+    let total = crate::tutorial::STEPS.len();
+    ui.label(
+        RichText::new(format!("STEP {} OF {total}", at + 1))
+            .size(10.0)
+            .family(theme::semibold())
+            .color(theme::palette().accent),
+    );
+    ui.add_space(2.0);
+    ui.label(RichText::new(step.title).size(15.0).strong());
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(step.body)
+            .size(12.0)
+            .color(theme::palette().text_dim),
+    );
+    ui.add_space(8.0);
+
+    let mut skip = false;
+    ui.horizontal(|ui| {
+        // A progress track rather than a Next button. There is nothing to press:
+        // the step advances when the thing it asked for happens.
+        for i in 0..total {
+            let (dot, _) = ui.allocate_exact_size(Vec2::new(14.0, 4.0), egui::Sense::hover());
+            ui.painter().rect_filled(
+                dot.shrink2(Vec2::new(2.0, 0.0)),
+                egui::CornerRadius::same(2),
+                if i <= at {
+                    theme::palette().accent
+                } else {
+                    theme::palette().border
+                },
+            );
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.small_button(RichText::new("Skip").size(11.0)).clicked() {
+                skip = true;
+            }
+        });
+    });
+    skip
+}
+
+/// The card after the last step. True if it was dismissed.
+fn tutorial_closing_card(ui: &mut egui::Ui) -> bool {
+    ui.label(RichText::new("That is the whole of it").size(15.0).strong());
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Everything else explains itself: rest the pointer on any control and it will tell you what it does. Export STL when the part is ready to print.",
+        )
+        .size(12.0)
+        .color(theme::palette().text_dim),
+    );
+    ui.add_space(8.0);
+    theme::primary_button(ui, "Done").clicked()
+}
+
+/// The tutorial card, bottom left of the viewport.
+///
+/// Deliberately not modal and not anchored to the control it is talking about.
+/// A card that blocks the interface teaches people to dismiss it, and one that
+/// points at a button teaches the button rather than the tool. This sits out of
+/// the way and advances when the thing it asked for actually happens.
+fn tutorial_card(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    viewport: egui::Rect,
+    claimed: &mut Vec<egui::Rect>,
+) {
+    /// Wide enough for three lines of body text at this size, and tall enough
+    /// for the longest of them plus the progress track.
+    const WIDTH: f32 = 310.0;
+    const HEIGHT: f32 = 196.0;
+    /// Clear of the floating tool bar along the bottom of the viewport.
+    const ABOVE_TOOLBAR: f32 = 74.0;
+
+    let Some(tutorial) = state.tutorial else {
+        return;
+    };
+    let card = egui::Rect::from_min_size(
+        egui::pos2(
+            viewport.min.x + 16.0,
+            viewport.max.y - HEIGHT - ABOVE_TOOLBAR,
+        ),
+        Vec2::new(WIDTH, HEIGHT),
+    );
+    claimed.push(card);
+
+    let mut close = false;
+    let mut skip = false;
+    ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
+        theme::floating().show(ui, |ui| {
+            ui.set_width(WIDTH - 28.0);
+            if let Some(step) = tutorial.step() {
+                skip |= tutorial_step_card(ui, step, tutorial.at);
+            } else {
+                close = tutorial_closing_card(ui);
+            }
+        });
+    });
+
+    if skip {
+        let mut t = tutorial;
+        t.skip_step(state);
+        state.tutorial = Some(t);
+    }
+    if close {
+        state.end_tutorial();
+    }
+}
+
+/// Draws the outline of an armed feature where it would land.
+///
+/// The preview is the whole point of arming rather than dropping: a hole placed
+/// by eye is only better than one placed at the origin if you can see where the
+/// eye is aiming before committing to it.
+fn armed_preview(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
+    let Some(armed) = state.armed.as_ref() else {
+        return;
+    };
+    let Some(cursor) = ui.ctx().pointer_latest_pos() else {
+        return;
+    };
+    if !viewport.contains(cursor) {
+        return;
+    }
+    let aspect = viewport.width() / viewport.height().max(1.0);
+    let Some(hit) = state.camera().plane_hit(
+        ndc_of(cursor, viewport),
+        aspect,
+        state.plane_origin(),
+        state.plane_normal(),
+    ) else {
+        return;
+    };
+    let at = state.snap(state.to_plane(hit));
+
+    let to_screen = |world: Vec3| -> Option<egui::Pos2> {
+        let ndc = state.camera().project(world, aspect)?;
+        Some(egui::pos2(
+            viewport.min.x + (ndc.x * 0.5 + 0.5) * viewport.width(),
+            viewport.min.y + (0.5 - ndc.y * 0.5) * viewport.height(),
+        ))
+    };
+    let outline: Vec<egui::Pos2> = armed
+        .profile
+        .polygon()
+        .into_iter()
+        .filter_map(|p| to_screen(state.to_world(at + p)))
+        .collect();
+    if outline.len() < 3 {
+        return;
+    }
+
+    // A cut is drawn in red and an addition in the accent colour, so which of
+    // the two is about to happen is visible without reading the status bar.
+    let colour = if armed.kind == Placing::Pocket {
+        theme::palette().danger
+    } else {
+        theme::palette().accent
+    };
+    let painter = ui.painter_at(viewport);
+    painter.add(egui::Shape::convex_polygon(
+        outline.clone(),
+        colour.gamma_multiply(0.18),
+        egui::Stroke::new(2.0, colour),
+    ));
+
+    let Some(centre) = to_screen(state.to_world(at)) else {
+        return;
+    };
+    label(
+        &painter,
+        centre + Vec2::new(0.0, -20.0),
+        &format!("{} at {:.0}, {:.0}", armed.label, at.x, at.y),
+    );
+}
+
+/// Radius of a grip, in points. Large enough to hit without aiming, small
+/// enough that a feature with three of them still looks like a feature.
+const GRIP_RADIUS: f32 = 6.0;
+/// How close the pointer has to be to grab one.
+pub(crate) const GRIP_REACH: f32 = 11.0;
+
+/// Draws the selection's draggable dimensions.
+///
+/// One dot per dimension, sitting on the surface it moves, with a stub pointing
+/// the way it grows. The dot is the whole affordance: a full arrow gizmo at every
+/// dimension of every feature would bury the model it is meant to be editing.
+fn grips(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
+    // Nothing while sketching. The pointer means "place a point" then, and a
+    // grip under it would be two meanings for one click.
+    if state.sketch.is_some() || state.tool != TOOL_SELECT {
+        return;
+    }
+    let rect = [
+        viewport.min.x,
+        viewport.min.y,
+        viewport.width(),
+        viewport.height(),
+    ];
+    let painter = ui.painter_at(viewport);
+    let cursor = ui.ctx().pointer_latest_pos();
+    let dragging = state.drag.map(|d| d.param);
+
+    for grip in state.grips() {
+        let Some((at, axis, _)) = state.grip_on_screen(&grip, rect) else {
+            continue;
+        };
+        let at = egui::pos2(at.x, at.y);
+        let held = dragging == Some(grip.param);
+        let near = dragging.is_none()
+            && cursor.is_some_and(|p| (p - at).length() < GRIP_REACH && viewport.contains(p));
+
+        // Full strength even at rest. A grip drawn faintly over shaded geometry
+        // is one nobody finds, and these are the only thing telling a user that
+        // the model can be edited by touching it.
+        let colour = theme::palette().accent;
+        // The stub only appears once the grip is worth grabbing, so a selected
+        // feature reads as a few dots rather than as a diagram.
+        if held || near {
+            let along = egui::vec2(axis.x, axis.y);
+            painter.line_segment(
+                [at + along * 8.0, at + along * 20.0],
+                egui::Stroke::new(2.0, colour),
+            );
+        }
+        let radius = if held || near {
+            GRIP_RADIUS + 1.5
+        } else {
+            GRIP_RADIUS
+        };
+        // A dark halo under the ring, so the grip reads against a light face and
+        // a shadowed one alike. The viewport is not a surface whose colour this
+        // code gets to choose.
+        painter.circle_filled(at, radius + 1.0, egui::Color32::from_black_alpha(40));
+        painter.circle(
+            at,
+            radius,
+            theme::palette().surface,
+            egui::Stroke::new(2.5, colour),
+        );
+
+        if held || near {
+            label(
+                &painter,
+                at + Vec2::new(14.0, -16.0),
+                &format!("{} {:.2} mm", pretty(grip.param), grip.value),
+            );
+        }
+    }
 }
 
 /// Draws the profile being sketched, and the hint telling you how to finish.

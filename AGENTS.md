@@ -131,6 +131,9 @@ an editor for free.
   every frame.
 - **Under WSL the only hardware GPU path reports itself as non-conformant** and
   crashes if driven off the main thread. See [docs/building.md](docs/building.md).
+- **Draw and hit-test a viewport handle through the same projection.** Grips go
+  through `AppState::grip_on_screen`, once. A second copy of the maths drifts,
+  and the symptom is a grip that cannot be grabbed where it is drawn.
 - **Animate with `motion::animate`, and integrate in fixed slices.** One spring
   step per frame makes the motion run at different speeds on different displays:
   measured 0.68 at 60Hz against 0.63 at 144Hz for the same tuning. The

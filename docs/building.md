@@ -89,6 +89,9 @@ scene:
 | `--hover` | The pointer resting on a tool row, so its tooltip is in the frame. |
 | `--menu` | The context menu open on the sample model's root. |
 | `--showcase` | The sample part posed for the readme screenshot, with the wall selected. |
+| `--engine` | The engine example, framed and selected. |
+| `--grips` | A selected block with its dimension grips, one of them hovered. |
+| `--tutorial` | The guided tour on its first card. |
 
 `--dark` captures any of these in the dark palette. Both schemes are worth
 looking at after a change to the interface: they are two sets of colours over one
@@ -102,6 +105,21 @@ invisible and in two is half transparent. Texture deltas must be applied from
 *every* frame. The font atlas is created during the first, and dropping that
 delta leaves the renderer with no atlas, at which point it silently skips the
 entire interface.
+
+## Example documents
+
+The reference models live in `sc-doc::samples`, in code rather than as files: a
+sample is a test fixture, and a file on disk cannot be checked against the kernel
+that built it. Write one out when you want something to open:
+
+```sh
+cargo run --release -p sc-cli -- write engine examples/engine.shapecad
+```
+
+`examples/engine.shapecad` is a checked-in copy of the engine: eighty-five nodes,
+a hollowed crankcase, a finned barrel, a head with a plug boss and two ports, and
+eleven holes of three kinds. Regenerate it after any change to the sample, or the
+file and the fixture will disagree.
 
 The readme screenshot is `assets/screenshot.png`, regenerated with:
 
