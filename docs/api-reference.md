@@ -1328,6 +1328,11 @@ Source: [crates/sc-app/src/snapshot.rs](../crates/sc-app/src/snapshot.rs).
 
 ```rust,ignore
 pub(crate) enum Scene {
+    Engine,
+    Pattern,
+    Snap,
+    Tutorial,
+    Grips,
     Empty,
     Dialog,
     Sample,
@@ -1339,7 +1344,59 @@ pub(crate) enum Scene {
 
 | Item | Signature | Behavior / failure conditions |
 | --- | --- | --- |
+| `Scene::from_args` | `pub(crate) fn from_args(args: &[String]) -> Scene` | Which scene a command line asks for, from one table of flags. `Empty` if it names none, the first listed if it names several. The table is checked against the enum by a test, because a scene with no flag is a capture nobody can take and looks exactly like one that renders nothing. |
 | `write` | `pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scene, scale: f32)` | Renders one frame of the application to a PNG. Panics: If no GPU is available or the image cannot be written. |
+
+#### sc_app::snap
+
+Source: [crates/sc-app/src/snap.rs](../crates/sc-app/src/snap.rs).
+
+Where a drag lands. Pure arithmetic on one axis at a time, so it is testable
+without a document, a camera or a pointer, and so it composes with axis locking.
+
+```rust,ignore
+pub(crate) enum Edge { Min, Centre, Max }
+
+pub(crate) struct Line {
+    pub at: f32,      // the coordinate, in the frame the drag is measured in
+    pub edge: Edge,   // which part of the offering feature it is
+    pub from: Vec3,   // that feature's centre, so the guide has two ends
+}
+
+pub(crate) struct Extent {
+    pub offsets: [Vec3; 3],  // min, centre and max, relative to the origin
+}
+
+pub(crate) enum Latch {
+    Grid,
+    Zero,
+    Feature { at: f32, from: Vec3, mine: Edge, theirs: Edge },
+}
+```
+
+| Item | Signature | Behavior / failure conditions |
+| --- | --- | --- |
+| `axis` | `pub(crate) fn axis(want: f32, extent: [f32; 3], lines: &[Line], reach: f32, grid: f32) -> (f32, Latch)` | Snaps one coordinate. Any of the moving feature's three edges may land on any offered line, which is what makes alignment and flushing the same gesture. Nearest within `reach` wins; exact ties prefer zero, then centre to centre, because a symmetric model offers the same coordinate from both sides of itself. Nothing within reach rounds to the grid. |
+| `position` | `pub(crate) fn position(want: Vec3, extent: Extent, lines: &[Vec<Line>; 3], reach: f32, grid: f32) -> (Vec3, [Latch; 3])` | `axis` on each of the three, independently. |
+| `reach` | `pub(crate) fn reach(per_pixel: f32, grid: f32) -> f32` | How far a line pulls from, in world units. A screen distance so the pull feels the same at any zoom, clamped to between half and four grid steps so it neither vanishes when zoomed in nor reaches across the plate when zoomed out. |
+| `Latch::guide` | `pub(crate) fn guide(self) -> Option<Vec3>` | Where to draw a guide to. `None` for the grid and for zero: a line on screen through the whole of every drag says nothing. |
+| `Latch::label` | `pub(crate) fn label(self) -> Option<String>` | How the readout names it, such as `centre to centre`. `None` for the grid. |
+
+#### sc_app::entry
+
+Source: [crates/sc-app/src/entry.rs](../crates/sc-app/src/entry.rs).
+
+A number being typed during a drag. Held as a string rather than a running
+float, because `1`, `1.`, `1.0` and `1.00` are the same number and four
+different things to type through, and a float cannot hold the difference, so
+backspace would jump rather than undo a keystroke.
+
+| Item | Signature | Behavior / failure conditions |
+| --- | --- | --- |
+| `Entry::push` | `pub(crate) fn push(&mut self, c: char) -> bool` | Takes a digit, a leading `-` or a first `.`. Returns whether it was taken, so a key that means something else is left for whatever else is listening. |
+| `Entry::backspace` | `pub(crate) fn backspace(&mut self) -> bool` | Removes the last character. Returns whether anything is left. |
+| `Entry::text` | `pub(crate) fn text(&self) -> &str` | What has been typed, for the readout. |
+| `Entry::value` | `pub(crate) fn value(&self) -> Option<f32>` | The number, if what has been typed is one yet. `-`, `.` and `-.` are all reachable part way through typing a good number, so they are not errors. |
 
 #### sc_app::state
 
@@ -1373,7 +1430,6 @@ pub(crate) struct AppState {
     pub status: String,
     pub last_edit_ms: f32,
     pub last_edit_rebuilt: bool,
-    pub tab: usize,
     pub tool: usize,
     pub sketch: Option<Vec<Vec2>>,
     pub extrude_height: f32,
@@ -1386,6 +1442,13 @@ pub(crate) struct AppState {
     pub ui_scale: f32,
     pub settings: Settings,
     pub menu: Option<ContextMenu>,
+    pub drag: Option<Drag>,             // a dimension being pushed or pulled
+    pub moving: Option<MoveDrag>,       // a feature being dragged around
+    pub snap_lines: [Vec<snap::Line>; 3], // what the move in flight can latch onto
+    pub guides: [Option<Vec3>; 3],      // where to draw a guide, per axis
+    pub entry: Option<entry::Entry>,    // a number being typed
+    pub armed: Option<Armed>,
+    pub tutorial: Option<Tutorial>,
 }
 ```
 
@@ -1430,6 +1493,14 @@ pub(crate) struct AppState {
 | `AppState::attach_to_selection` | `pub(crate) fn attach_to_selection(&mut self)` | Attaches the sketch plane to the selected feature's far face. Looks through single-child wrappers (offset, shell, transform) to the pad underneath, because a user selects the finished feature rather than the bare extrude. Refuses on a boolean: both sides have a face and nothing can say which was meant. |
 | `AppState::attachable_face` | `pub(crate) fn attachable_face(&self, id: NodeId) -> Option<NodeId>` | The pad a given selection would attach to, or `None`. |
 | `AppState::move_selection` | `pub(crate) fn move_selection(&mut self, delta: Vec3)` | Moves the selection. An attached feature keeps its attachment: the move goes into a placement **beneath** the derived one, in the feature's own frame, so it slides across the face in x and y and lifts off it in z, and still follows that face when the base changes. Repeated moves accumulate into one offset rather than stacking a node each. Anything unattached is wrapped in a placement of its own. |
+| `AppState::begin_move` | `pub(crate) fn begin_move(&mut self, grabbed: Vec3, viewport_height: f32) -> Option<NodeId>` | Starts a free drag and gathers what it can snap to. `grabbed` is where the pointer met the drag plane, so the feature travels with the pointer rather than jumping its centre to it. `viewport_height` sizes the snap pull, which is a screen distance. Refuses a second gesture, since only one release could ever close the step. |
+| `AppState::move_to` | `pub(crate) fn move_to(&mut self, id: NodeId, to: Vec3)` | Moves a placement, snapped. Against other features as well as the grid while a drag is in flight, against the grid alone otherwise: an edit made from a menu was not aimed at anything. Sets `guides` and the readout as a side effect. |
+| `AppState::place_at` | `pub(crate) fn place_at(&mut self, id: NodeId, to: Vec3)` | Writes a translation exactly as given. The one path that does not snap, for numbers that were typed rather than aimed. |
+| `AppState::selection_origin` | `pub(crate) fn selection_origin(&self) -> Option<Vec3>` | Where the selection sits in the world. Includes a `Transform`'s own translation, which `pick::placement_of` deliberately stops short of: the first drag makes the placement the selection, so leaving it out parks the move gizmo at the parent's origin while the feature it moves walks away. |
+| `AppState::type_number` | `pub(crate) fn type_number(&mut self, c: char) -> bool` | Feeds one character to the number being typed, starting one if a gesture is in flight. Returns whether it was used. |
+| `AppState::entry_backspace` | `pub(crate) fn entry_backspace(&mut self)` | Removes the last character, ending the entry when it empties. |
+| `AppState::cancel_entry` | `pub(crate) fn cancel_entry(&mut self)` | Drops the number, leaving the gesture in flight. Escape means "not that", not "not any of this". |
+| `AppState::commit_entry` | `pub(crate) fn commit_entry(&mut self)` | Applies the typed number and ends its gesture. A dimension takes it as the dimension; a move takes it as a distance along the locked axis, or along the axis it has mostly travelled if none is locked, and refuses if it has not travelled. A value the node cannot hold is refused rather than clamped. |
 | `AppState::duplicate_selection` | `pub(crate) fn duplicate_selection(&mut self)` | Copies the selected subtree, places the copy four grid steps along X so it lands beside the original rather than inside it, unions it onto the model and selects it. The copy is independent: editing it does not touch the source. A node referenced twice inside the subtree is copied once, so shared structure stays shared. One undo step. |
 | `AppState::clone_subtree` | `fn clone_subtree(&mut self, id: NodeId) -> Option<NodeId>` | The copy itself, children first so a child id always exists before its parent references it. Memoized per source node, which is what keeps a shared child shared. |
 | `AppState::repeat_selection` | `pub(crate) fn repeat_selection(&mut self, kind: Repeat)` | Wraps the selection in a `Node::Pattern` with a count of 4, rewiring the parent so the pattern takes the selection's place, and selects the pattern so the count is immediately editable. A linear step is recomputed from the selection's bounds rather than taken from `kind`, so instances land beside each other at any scale; a circular sweep is used as given. |
@@ -1496,7 +1567,6 @@ Source: [crates/sc-app/src/theme.rs](../crates/sc-app/src/theme.rs).
 | `empty_state` | `pub(crate) fn empty_state(ui: &mut egui::Ui, icon: crate::icon::Icon, title: &str, hint: &str)` | A centred placeholder for a panel with nothing in it. |
 | `primary_button` | `pub(crate) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response` | The single dark call-to-action. |
 | `primary_button_with_icon` | `pub(crate) fn primary_button_with_icon( ui: &mut egui::Ui, icon: crate::icon::Icon, text: &str, ) -> egui::Response` | The same, with a leading glyph. |
-| `segmented` | `pub(crate) fn segmented(ui: &mut egui::Ui, current: &mut usize, labels: &[(&str, &str)]) -> bool` | A segmented control. Returns true if the choice changed. |
 | `logo` | `pub(crate) fn logo(ui: &mut egui::Ui, size: f32)` | The application mark: an isometric solid with its corners filleted. |
 
 #### sc_app::ui

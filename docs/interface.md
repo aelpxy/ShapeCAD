@@ -116,6 +116,72 @@ on the plate, is something people deliberately want and then verify by reading
 the number back, so landing on 0.4 when aiming at 0 is a worse answer than the
 grid spacing alone suggests. Everything else rounds normally.
 
+## Precision
+
+A grid is the floor of precision, not the whole of it. Most of the numbers
+somebody wants are not round ones: they are the number that puts this boss on
+the same centreline as that one, or this wall flush with that face. Those are
+relationships between features, and a grid cannot express any of them.
+
+**Snapping to features.** A drag is offered coordinates by every other feature
+in the model, three per axis: the two faces of its bounding box and its centre.
+Any of the moving feature's own three can land on any of theirs, which is what
+makes both "line these up" and "make these flush" the same gesture. The nearest
+candidate within reach wins, and the grid is what happens when none is.
+
+`snap.rs` is pure arithmetic on one axis at a time, which is what lets it be
+tested without a document, a camera or a pointer, and what makes it compose with
+axis locking: a locked drag simply has nothing to contribute on the two axes it
+cannot move along.
+
+Four things the implementation has to get right:
+
+**The pull is a screen distance.** A snap you have to fight at one zoom and
+cannot escape at another is worse than no snap. Eight points, converted through
+the camera, and clamped against the grid at both ends so that zooming right out
+does not have parts snapping to things on the far side of the plate.
+
+**Only leaf features offer coordinates.** A boolean's bounding box is the box
+around both of its operands, a number nobody drew, and the root's is the whole
+model. Lining up with a hole, a pad or a boss is what people mean.
+
+**A feature is never offered its own coordinates.** It moves with the drag, so it
+would offer wherever it already is, and the part would refuse to leave the spot
+it started from.
+
+**A snap that cannot be seen reads as the part sticking.** Each latched axis
+draws a line, tinted like that axis, from the feature the coordinate came from to
+the feature being dragged, and the readout names what matched: `X centre to
+centre`, not `snapped`. Knowing which is what lets you tell a wanted alignment
+from an accident.
+
+**Typing an exact number.** Dragging is how you find a size; typing is how you
+state one. Chasing 12.00 with a pointer is a game, and losing it means dragging
+until the readout happens to agree, which usually ends at 11.98. So a gesture
+already in flight takes digits: Enter applies, Backspace edits, Escape drops the
+number and leaves the drag alone.
+
+What the number means depends on what is being dragged, because that is what the
+word means in each case. A dimension takes it as the dimension: twelve means a
+radius of twelve. A move takes it as a distance along the locked axis: twelve
+means twelve millimetres that way. The readout says which reading is in force
+while it is still being typed, so there is nothing to guess.
+
+Three more decisions:
+
+**A typed number is not snapped.** It is already the number that was meant, and
+rounding 12.5 to a 1mm grid afterwards would produce 13 and say nothing.
+
+**A typed number needs a direction, and a long drag has already given one.**
+Locking an axis is the explicit way to say which way; having dragged a hand's
+width to the right says it too, and demanding X as well would be pedantry.
+Having not moved at all says nothing, and that is refused rather than guessed.
+
+**A bad typed value is refused, not clamped.** A drag stops at the limit because
+it is a continuous gesture passing through, and an error on every frame would be
+noise. Typing is a statement, and quietly applying a different number is worse
+than saying no.
+
 ## Direct manipulation
 
 A selected feature shows a grip on each of its dimensions: a dot sitting on the
@@ -293,7 +359,6 @@ widget inline:
 - `icon_button(ui, icon, enabled)` is square and wordless.
 - `primary_button(..)` and `primary_button_with_icon(..)` are the dark
   call-to-action. There is at most one visible at a time.
-- `segmented(..)` is the workspace switch.
 - `empty_state(ui, icon, title, hint)` fills a panel that has nothing in it.
 
 ## Icons

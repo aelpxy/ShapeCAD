@@ -38,6 +38,8 @@ pub(crate) enum Scene {
     Engine,
     /// A circular pattern, to show the count doing its job.
     Pattern,
+    /// A move mid-drag, latched onto another feature, with its guide showing.
+    Snap,
     /// The guided tour on its first card.
     Tutorial,
     /// A selected box with its dimension grips showing.
@@ -55,6 +57,36 @@ pub(crate) enum Scene {
     Menu,
     /// The sample part, posed for the screenshot in the readme.
     Showcase,
+}
+
+impl Scene {
+    /// The flag that asks for each scene.
+    ///
+    /// One table, read by the argument parsing and checked against the enum by
+    /// `every_scene_can_be_asked_for`. Keeping the flags in a chain of `if`s
+    /// somewhere else is how [`Scene::Pattern`] came to exist with no way to ask
+    /// for it, which looks exactly like a scene that renders nothing.
+    const FLAGS: [(&'static str, Self); 10] = [
+        ("--dialog", Self::Dialog),
+        ("--sample", Self::Sample),
+        ("--hover", Self::Hover),
+        ("--menu", Self::Menu),
+        ("--tutorial", Self::Tutorial),
+        ("--grips", Self::Grips),
+        ("--engine", Self::Engine),
+        ("--pattern", Self::Pattern),
+        ("--snap", Self::Snap),
+        ("--showcase", Self::Showcase),
+    ];
+
+    /// Which scene a command line asks for. [`Scene::Empty`] if it asks for
+    /// none, and the first named if it asks for several.
+    pub(crate) fn from_args(args: &[String]) -> Self {
+        Self::FLAGS
+            .into_iter()
+            .find(|(flag, _)| args.iter().any(|a| a == flag))
+            .map_or(Self::Empty, |(_, scene)| scene)
+    }
 }
 
 /// The node [`Scene::Showcase`] selects: the transform that places the upright
@@ -82,6 +114,61 @@ fn showcase_subject(state: &AppState) -> Option<sc_geom::NodeId> {
             Some(sc_geom::Node::Transform { child, .. }) if *child == wall
         )
     })
+}
+
+/// Roughly the height of the 3D view in a capture, in points.
+///
+/// Only [`Scene::Snap`] needs it, and only to size the snap pull, which is a
+/// screen distance. Being a little out changes how hard the guide pulls, not
+/// whether there is one.
+const VIEWPORT_HEIGHT: f32 = 860.0;
+
+/// A move mid-drag, latched onto the plate it is being lined up with.
+///
+/// Left mid-gesture on purpose: the guide only exists while something is being
+/// dragged, so a capture taken after the release would show nothing.
+fn snap_scene(mut state: AppState) -> AppState {
+    state.new_document();
+    state.add_body(
+        sc_geom::Node::Box {
+            half: sc_geom::glam::Vec3::new(10.0, 10.0, 4.0),
+            round: 1.0,
+        },
+        "Plate",
+    );
+    // The height only sizes the snap pull, and the capture is always
+    // taken at the same size, so it can be stated here.
+    let Some(plate) = state.begin_move(sc_geom::glam::Vec3::ZERO, VIEWPORT_HEIGHT) else {
+        return state;
+    };
+    // An unround coordinate, so the guide in the capture cannot be
+    // mistaken for the part simply landing on a grid line.
+    state.place_at(plate, sc_geom::glam::Vec3::new(18.4, 0.0, 0.0));
+    state.finish_move();
+
+    state.add_body(
+        sc_geom::Node::Cylinder {
+            radius: 4.0,
+            half_height: 6.0,
+            round: 0.5,
+        },
+        "Boss",
+    );
+    let Some(boss) = state.begin_move(sc_geom::glam::Vec3::ZERO, VIEWPORT_HEIGHT) else {
+        return state;
+    };
+    let aim = sc_geom::glam::Vec3::new(18.1, 30.0, 0.0);
+    state.move_to(boss, aim);
+
+    state.frame_model();
+    state.rig.goal.yaw = -0.9;
+    state.rig.goal.pitch = 0.62;
+    state.rig.snap_to(state.rig.goal);
+    // Sampled again after the camera settles, so the status bar shows the
+    // readout of a drag rather than the message framing left behind. The
+    // pointer would still be moving here in the real thing.
+    state.move_to(boss, aim);
+    state
 }
 
 /// Builds the document and camera a scene asks for.
@@ -132,6 +219,7 @@ fn pose(scene: Scene) -> AppState {
             state.rig.snap_to(state.rig.goal);
             state.status = "Ready".to_string();
         }
+        Scene::Snap => return snap_scene(state),
         Scene::Grips => {
             state.new_document();
             state.add_body(
@@ -366,6 +454,63 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scen
 
 #[cfg(test)]
 mod tests {
+    /// Every scene needs a way to be asked for, or it is a capture nobody can
+    /// take. The match is exhaustive on purpose: a new variant stops this
+    /// compiling, which is the reminder to add its flag.
+    #[test]
+    fn every_scene_can_be_asked_for() {
+        let all = [
+            Scene::Engine,
+            Scene::Pattern,
+            Scene::Snap,
+            Scene::Tutorial,
+            Scene::Grips,
+            Scene::Empty,
+            Scene::Dialog,
+            Scene::Sample,
+            Scene::Hover,
+            Scene::Menu,
+            Scene::Showcase,
+        ];
+        for scene in all {
+            match scene {
+                // Empty is what you get by asking for nothing, so it has no
+                // flag of its own.
+                Scene::Empty => {}
+                Scene::Engine
+                | Scene::Pattern
+                | Scene::Snap
+                | Scene::Tutorial
+                | Scene::Grips
+                | Scene::Dialog
+                | Scene::Sample
+                | Scene::Hover
+                | Scene::Menu
+                | Scene::Showcase => assert!(
+                    Scene::FLAGS.iter().any(|(_, s)| *s == scene),
+                    "{scene:?} cannot be asked for"
+                ),
+            }
+        }
+        assert_eq!(Scene::from_args(&[]), Scene::Empty);
+        assert_eq!(
+            Scene::from_args(&["--snap".to_string()]),
+            Scene::Snap,
+            "the flag did not select its scene"
+        );
+    }
+
+    /// The snap scene exists to show a guide, so a change that stops one being
+    /// drawn turns the capture into a picture of nothing in particular.
+    #[test]
+    fn the_snap_scene_has_a_guide_to_show() {
+        let state = pose(Scene::Snap);
+        assert!(
+            state.guides.iter().any(Option::is_some),
+            "nothing latched, so there is no guide in the frame"
+        );
+    }
+
     use super::{pointer_for, pose, run, Scene, PASSES, PASS_SECONDS};
     use crate::motion::{Spring, Tuning};
 

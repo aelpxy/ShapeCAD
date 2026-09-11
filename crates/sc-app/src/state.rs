@@ -12,6 +12,7 @@ use sc_geom::glam::Vec2;
 use sc_geom::glam::Vec3;
 use sc_geom::{Node, NodeId, Transform};
 use sc_render::{CameraRig, OrbitCamera};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// What the camera frames when there is nothing in the document.
@@ -116,6 +117,17 @@ pub(crate) struct MoveDrag {
     /// coordinates at once whether that was wanted or not. Locking an axis is
     /// how you move something ten millimetres to the right and nowhere else.
     pub axis: Option<Vec3>,
+    /// Where the feature's own faces and centre sit relative to its origin.
+    ///
+    /// Measured once, when the gesture starts. A move changes the origin and
+    /// nothing else, so these do not change, and measuring them per frame would
+    /// let a rounding wobble in the bounds make the snap targets breathe.
+    pub extent: crate::snap::Extent,
+    /// How far a snap line pulls from, in world units.
+    ///
+    /// Taken from the camera at the start of the gesture rather than per frame,
+    /// so the pull does not change under a zoom made mid-drag.
+    pub reach: f32,
     /// Set when the constraint has just changed, so the next pointer sample
     /// becomes the new anchor.
     ///
@@ -183,8 +195,6 @@ pub(crate) struct AppState {
     pub last_edit_ms: f32,
     /// Whether that edit needed a pipeline rebuild or was only a buffer upload.
     pub last_edit_rebuilt: bool,
-    /// Which workspace the top bar has selected.
-    pub tab: usize,
     /// Which viewport tool is armed.
     pub tool: usize,
     /// Profile points placed so far, in build-plate coordinates.
@@ -230,6 +240,19 @@ pub(crate) struct AppState {
     pub drag: Option<Drag>,
     /// The free drag of the selection in progress, if any.
     pub moving: Option<MoveDrag>,
+    /// Coordinates the rest of the model offers the move in flight.
+    ///
+    /// Gathered once per gesture, indexed by axis. Empty when nothing is being
+    /// dragged, which is what makes an ordinary edit fall back to the grid.
+    pub snap_lines: [Vec<crate::snap::Line>; 3],
+    /// Where a guide should be drawn to on each axis, in world coordinates.
+    ///
+    /// Set every time the feature is placed, so it follows the drag. `None` on
+    /// an axis that only rounded to the grid: a line on screen through the whole
+    /// of every drag says nothing.
+    pub guides: [Option<Vec3>; 3],
+    /// A number being typed during a gesture, if one is.
+    pub entry: Option<crate::entry::Entry>,
     /// A feature waiting to be placed by the next click, if any.
     pub armed: Option<Armed>,
     /// The tutorial, while it is running.
@@ -255,7 +278,6 @@ impl AppState {
             status: "Ready".to_string(),
             last_edit_ms: 0.0,
             last_edit_rebuilt: false,
-            tab: 0,
             tool: 0,
             plane: SketchPlane::default(),
             attached_to: None,
@@ -272,6 +294,9 @@ impl AppState {
             system_scheme: None,
             drag: None,
             moving: None,
+            snap_lines: [Vec::new(), Vec::new(), Vec::new()],
+            guides: [None; 3],
+            entry: None,
             armed: None,
             tutorial: None,
         }
@@ -426,16 +451,24 @@ impl AppState {
         self.selected
     }
 
-    /// Starts dragging the selection around, returning the node that will move.
-    ///
-    /// `grabbed` is where the pointer met the drag plane, which is what makes
-    /// the feature travel with the pointer instead of jumping its centre there.
     /// Where the selection sits in the world, if it is somewhere.
+    ///
+    /// `placement_of` stops short of the node's own transform, because the
+    /// question it answers is which frame the node sits in. A placement's own
+    /// translation is exactly what the gizmo writes, so it has to be added back
+    /// here: the first drag makes the placement the selection, and without this
+    /// the arms would stay at the parent's origin from then on while the feature
+    /// they move walked away from them.
     #[must_use]
     pub(crate) fn selection_origin(&self) -> Option<Vec3> {
         let id = self.selected?;
         let root = self.doc.root()?;
-        Some(sc_geom::pick::placement_of(self.doc.arena(), root, id)?.apply_point(Vec3::ZERO))
+        let outer = sc_geom::pick::placement_of(self.doc.arena(), root, id)?;
+        let frame = match self.doc.arena().get(id) {
+            Some(Node::Transform { xform, .. }) => xform.then(&outer),
+            _ => outer,
+        };
+        Some(frame.apply_point(Vec3::ZERO))
     }
 
     /// The move gizmo for the selection, or empty if there is nothing to move.
@@ -507,7 +540,13 @@ impl AppState {
         }
     }
 
-    pub(crate) fn begin_move(&mut self, grabbed: Vec3) -> Option<NodeId> {
+    /// Starts dragging the selection around, returning the node that will move.
+    ///
+    /// `grabbed` is where the pointer met the drag plane, which is what makes
+    /// the feature travel with the pointer instead of jumping its centre there.
+    /// `viewport_height` sizes the snap pull, which is a screen distance so that
+    /// it feels the same at any zoom.
+    pub(crate) fn begin_move(&mut self, grabbed: Vec3, viewport_height: f32) -> Option<NodeId> {
         // One gesture at a time. A second begin would open a second step that
         // only one release could ever close.
         if self.moving.is_some() {
@@ -525,14 +564,104 @@ impl AppState {
             Some(Node::Transform { xform, .. }) => xform.translation,
             _ => Vec3::ZERO,
         };
+        // Gathered after `movable`, because that is what creates the placement
+        // this drag writes into, and the lines have to exclude it.
+        self.snap_lines = self.snap_lines_excluding(node);
+        let per_pixel = self.camera().world_per_pixel(viewport_height.max(1.0));
         self.moving = Some(MoveDrag {
             node,
             grabbed,
             from,
+            extent: self.extent_of(node),
+            reach: crate::snap::reach(per_pixel, self.grid),
             axis: None,
             reanchor: false,
         });
         Some(node)
+    }
+
+    /// Coordinates the rest of the model offers, indexed by axis.
+    ///
+    /// Only leaf features contribute. A boolean's bounding box is the box around
+    /// both of its operands, which is a number nobody drew and nobody wants to
+    /// line anything up with, and the root's is the whole model. Lining up with
+    /// a hole, a pad or a boss is what people actually mean.
+    ///
+    /// Measured in the frame the placement's own translation lives in, since
+    /// that is what the drag writes. Where an ancestor rotates that frame, an
+    /// axis-aligned box becomes a larger axis-aligned box, which is conservative
+    /// rather than wrong: it is the extent the feature appears to occupy.
+    #[must_use]
+    fn snap_lines_excluding(&self, ignore: NodeId) -> [Vec<crate::snap::Line>; 3] {
+        use crate::snap::{Edge, Line};
+
+        let mut lines: [Vec<Line>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let arena = self.doc.arena();
+        let Some(root) = self.doc.root() else {
+            return lines;
+        };
+        let Some(parent) = sc_geom::pick::placement_of(arena, root, ignore) else {
+            return lines;
+        };
+        let into = parent.inverse();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            // The whole subtree, not just the node: its own children move with
+            // it, so they would be snapping the drag to itself.
+            if id == ignore {
+                continue;
+            }
+            let Some(node) = arena.get(id) else {
+                continue;
+            };
+            let mut kids = node.children().peekable();
+            if kids.peek().is_some() {
+                stack.extend(node.children());
+                continue;
+            }
+            let Some(to_world) = sc_geom::pick::placement_of(arena, root, id) else {
+                continue;
+            };
+            let box3 = sc_geom::bounds(arena, id).transformed(&to_world.then(&into));
+            // A half-space is unbounded and an empty box has no coordinates. A
+            // line at infinity would swallow every drag that came near it.
+            if box3.is_empty() || !box3.is_finite() {
+                continue;
+            }
+            let centre = box3.center();
+            for (axis, out) in lines.iter_mut().enumerate() {
+                for (edge, at) in [
+                    (Edge::Min, box3.min[axis]),
+                    (Edge::Centre, centre[axis]),
+                    (Edge::Max, box3.max[axis]),
+                ] {
+                    out.push(Line {
+                        at,
+                        edge,
+                        from: centre,
+                    });
+                }
+            }
+        }
+        lines
+    }
+
+    /// Where a placement's own box sits relative to the origin it is moved by.
+    ///
+    /// Zero offsets when the feature has no finite box, which degrades to
+    /// snapping the origin alone rather than refusing to snap.
+    #[must_use]
+    fn extent_of(&self, node: NodeId) -> crate::snap::Extent {
+        let origin = self.placement_of(node).unwrap_or(Vec3::ZERO);
+        // A placement's bounds already carry its own transform, so this is
+        // measured in the same frame as the translation being written.
+        let box3 = sc_geom::bounds(self.doc.arena(), node);
+        if box3.is_empty() || !box3.is_finite() {
+            return crate::snap::Extent::default();
+        }
+        crate::snap::Extent {
+            offsets: [box3.min - origin, box3.center() - origin, box3.max - origin],
+        }
     }
 
     /// Slides the feature to wherever the pointer has reached on the drag plane.
@@ -609,38 +738,55 @@ impl AppState {
     }
 
     /// Moves a placement to `to`, snapped, in world coordinates.
+    ///
+    /// Snapping is against the other features in the model as well as the grid
+    /// while a drag is in flight, and against the grid alone otherwise: an edit
+    /// made from a menu was not aimed at anything, so there is nothing for it to
+    /// latch onto.
     pub(crate) fn move_to(&mut self, id: NodeId, to: Vec3) {
-        let snapped = self.snap_position(to);
-        for (name, value) in [("x", snapped.x), ("y", snapped.y), ("z", snapped.z)] {
+        let (extent, reach) = match self.moving {
+            Some(drag) if drag.node == id => (drag.extent, drag.reach),
+            _ => (crate::snap::Extent::default(), 0.0),
+        };
+        let (snapped, latched) =
+            crate::snap::position(to, extent, &self.snap_lines, reach, self.grid);
+        self.place_at(id, snapped);
+
+        // The guides are drawn in the world, and the snap was measured in the
+        // placement's own parent frame, so they have to be carried back out.
+        let out = self
+            .doc
+            .root()
+            .and_then(|root| sc_geom::pick::placement_of(self.doc.arena(), root, id))
+            .unwrap_or(Transform::IDENTITY);
+        for (guide, latch) in self.guides.iter_mut().zip(latched) {
+            *guide = latch.guide().map(|at| out.apply_point(at));
+        }
+
+        let mut readout = format!("{:.1}, {:.1}, {:.1} mm", snapped.x, snapped.y, snapped.z);
+        // Named, because "snapped" is not information. Knowing it was centre to
+        // centre is what lets you tell a wanted alignment from an accident.
+        for (axis, latch) in AXES.iter().zip(latched) {
+            if let Some(label) = latch.label() {
+                let _ = write!(readout, " \u{b7} {} {label}", axis.0);
+            }
+        }
+        self.status = readout;
+    }
+
+    /// Writes a placement's translation, exactly as given.
+    ///
+    /// The one path that does not snap, because a number that was typed is
+    /// already the number that was meant. Rounding it to the grid afterwards
+    /// would make typing 12.5 on a 1mm grid produce 13 and say nothing.
+    pub(crate) fn place_at(&mut self, id: NodeId, to: Vec3) {
+        for (name, value) in [("x", to.x), ("y", to.y), ("z", to.z)] {
             self.apply(Command::SetParam {
                 id,
                 name: name.to_string(),
                 value,
             });
         }
-        self.status = format!("{:.1}, {:.1}, {:.1} mm", snapped.x, snapped.y, snapped.z);
-    }
-
-    /// Rounds a position to the grid, with a stronger pull toward zero.
-    ///
-    /// Zero is not just another grid line. A feature on an axis, or centred on
-    /// the plate, is a thing people deliberately want and then check by reading
-    /// the number back, so it gets a wider catchment than the grid spacing
-    /// alone would give it. Everything else rounds normally.
-    #[must_use]
-    pub(crate) fn snap_position(&self, to: Vec3) -> Vec3 {
-        /// How many grid steps either side of zero snap to it.
-        const ZERO_PULL: f32 = 0.75;
-
-        let step = self.grid.max(0.01);
-        let axis = |v: f32| {
-            if v.abs() <= step * ZERO_PULL {
-                0.0
-            } else {
-                (v / step).round() * step
-            }
-        };
-        Vec3::new(axis(to.x), axis(to.y), axis(to.z))
     }
 
     /// Ends a free drag, keeping where it got to.
@@ -650,9 +796,21 @@ impl AppState {
     /// something else opened.
     pub(crate) fn finish_move(&mut self) {
         if self.moving.take().is_some() {
+            self.clear_snap();
             self.doc.end_step();
             self.status = "Ready".to_string();
         }
+    }
+
+    /// Drops everything that only meant something inside a gesture.
+    ///
+    /// The lines name nodes in this document and the guides are positions in it,
+    /// so leaving either behind draws a guide to a feature nothing is being
+    /// aligned with, and snaps the next drag to a model that has since changed.
+    fn clear_snap(&mut self) {
+        self.snap_lines = [Vec::new(), Vec::new(), Vec::new()];
+        self.guides = [None; 3];
+        self.entry = None;
     }
 
     /// Drops every pointer gesture in flight, closing the undo steps they hold.
@@ -674,6 +832,7 @@ impl AppState {
         if self.moving.take().is_some() {
             self.doc.end_step();
         }
+        self.clear_snap();
         self.armed = None;
         // A profile in progress is drawn in the old plane's coordinates, and
         // `attached_to` is another id belonging to the document being replaced.
@@ -879,9 +1038,131 @@ impl AppState {
     /// Ends the drag, keeping where it got to.
     pub(crate) fn finish_drag(&mut self) {
         if self.drag.take().is_some() {
+            self.entry = None;
             self.doc.end_step();
             self.status = "Ready".to_string();
         }
+    }
+
+    /// Takes one typed character into the number being entered.
+    ///
+    /// Returns whether it was used, so a key that means something else is left
+    /// for whatever else is listening rather than swallowed.
+    pub(crate) fn type_number(&mut self, c: char) -> bool {
+        if self.drag.is_none() && self.moving.is_none() {
+            return false;
+        }
+        let mut entry = self.entry.clone().unwrap_or_default();
+        if !entry.push(c) {
+            return false;
+        }
+        self.status = self.entry_readout(&entry);
+        self.entry = Some(entry);
+        true
+    }
+
+    /// Removes the last character typed, ending the entry when it empties.
+    pub(crate) fn entry_backspace(&mut self) {
+        let Some(mut entry) = self.entry.take() else {
+            return;
+        };
+        if entry.backspace() {
+            self.status = self.entry_readout(&entry);
+            self.entry = Some(entry);
+        } else {
+            self.status = "Typing cancelled, keep dragging".to_string();
+        }
+    }
+
+    /// Abandons the number, leaving the gesture in flight.
+    ///
+    /// Escape means "not that" rather than "not any of this": the drag is still
+    /// wanted, it was only the number that was wrong.
+    pub(crate) fn cancel_entry(&mut self) {
+        if self.entry.take().is_some() {
+            self.status = "Typing cancelled, keep dragging".to_string();
+        }
+    }
+
+    /// What the status bar says while a number is being typed.
+    fn entry_readout(&self, entry: &crate::entry::Entry) -> String {
+        let typed = entry.text();
+        if let Some(drag) = self.drag {
+            return format!("{} = {typed}, Enter to apply", drag.param);
+        }
+        match self.move_axis() {
+            Some(axis) => format!("{typed} mm along {}, Enter to apply", axis_name(axis)),
+            None => format!("{typed} mm, press X, Y or Z to say which way"),
+        }
+    }
+
+    /// Applies the typed number and ends the gesture it belonged to.
+    ///
+    /// A dimension takes it as the dimension, because "twelve" means a radius of
+    /// twelve. A move takes it as a distance along the locked axis, because
+    /// "twelve" means twelve millimetres that way, not twelve from the origin.
+    /// Both are what the word means in that context, and the readout says which
+    /// is being read while it is still being typed.
+    pub(crate) fn commit_entry(&mut self) {
+        let Some(entry) = self.entry.clone() else {
+            return;
+        };
+        let Some(value) = entry.value() else {
+            self.status = format!("{} is not a number", entry.text());
+            return;
+        };
+        if let Some(drag) = self.drag {
+            let Some(node) = self.doc.arena().get(drag.node) else {
+                self.finish_drag();
+                return;
+            };
+            // Refused rather than clamped. A drag stops at the limit because it
+            // is a continuous gesture passing through; a typed number is a
+            // statement, and silently applying a different one is worse than
+            // saying no.
+            let mut probe = node.clone();
+            if !probe.set_param(drag.param, value) || !probe.is_valid() {
+                self.status = format!("{} cannot be {value}", drag.param);
+                return;
+            }
+            self.apply(Command::SetParam {
+                id: drag.node,
+                name: drag.param.to_string(),
+                value,
+            });
+            self.finish_drag();
+            return;
+        }
+        let Some(drag) = self.moving else {
+            return;
+        };
+        let Some(axis) = drag.axis.or_else(|| self.travelled_axis(&drag)) else {
+            self.status = "Press X, Y or Z to say which way first".to_string();
+            return;
+        };
+        self.place_at(drag.node, drag.from + axis * value);
+        self.finish_move();
+        self.status = format!("Moved {value} mm along {}", axis_name(axis));
+    }
+
+    /// The axis a free drag has mostly travelled along, if it has travelled.
+    ///
+    /// A typed number needs a direction. Locking one is the explicit way to say
+    /// it, but somebody who has already dragged a hand's width to the right has
+    /// said it too, and making them press X as well would be pedantry. Refusing
+    /// when nothing has moved is not: there is genuinely no answer then.
+    fn travelled_axis(&self, drag: &MoveDrag) -> Option<Vec3> {
+        /// How far the drag must have gone before its direction is taken as
+        /// meant rather than as a wobble.
+        const MEANT: f32 = 0.5;
+
+        let now = self.placement_of(drag.node)?;
+        let delta = now - drag.from;
+        let (name, axis) = AXES
+            .iter()
+            .max_by(|a, b| delta.dot(a.1).abs().total_cmp(&delta.dot(b.1).abs()))?;
+        let _ = name;
+        (delta.dot(*axis).abs() >= self.grid.max(0.01) * MEANT).then_some(*axis)
     }
 
     /// Ends the drag and puts the dimension back where it started.
@@ -894,6 +1175,7 @@ impl AppState {
             name: drag.param.to_string(),
             value: drag.from,
         });
+        self.entry = None;
         self.doc.end_step();
         self.status = "Cancelled".to_string();
     }
@@ -3564,12 +3846,14 @@ mod tests {
         state.new_document();
         state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
 
-        let id = state.begin_move(Vec3::ZERO).expect("something to move");
+        let id = state
+            .begin_move(Vec3::ZERO, 940.0)
+            .expect("something to move");
         state.move_to(id, Vec3::new(10.0, 0.0, 0.0));
         state.finish_move();
         let after_one = state.doc.arena().live_ids().count();
 
-        let id = state.begin_move(Vec3::ZERO).expect("still movable");
+        let id = state.begin_move(Vec3::ZERO, 940.0).expect("still movable");
         state.move_to(id, Vec3::new(20.0, 5.0, 0.0));
         state.finish_move();
 
@@ -3593,7 +3877,7 @@ mod tests {
         state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
         let before = state.doc.hash().expect("rooted");
 
-        let id = state.begin_move(Vec3::ZERO).expect("movable");
+        let id = state.begin_move(Vec3::ZERO, 940.0).expect("movable");
         for step in 1..=20 {
             state.move_to(id, Vec3::new(step as f32, 0.0, 0.0));
         }
@@ -3651,7 +3935,7 @@ mod tests {
     fn a_locked_move_changes_only_its_own_axis() {
         let mut state = AppState::new();
         placed_block(&mut state);
-        let id = state.begin_move(Vec3::ZERO).expect("movable");
+        let id = state.begin_move(Vec3::ZERO, 940.0).expect("movable");
         state.constrain_move(Some(Vec3::X));
 
         // A pointer travelling diagonally across the plane.
@@ -3681,7 +3965,7 @@ mod tests {
     fn locking_part_way_through_keeps_the_ground_already_covered() {
         let mut state = AppState::new();
         placed_block(&mut state);
-        let id = state.begin_move(Vec3::ZERO).expect("movable");
+        let id = state.begin_move(Vec3::ZERO, 940.0).expect("movable");
         state.move_to_plane(Vec3::new(0.0, 12.0, 0.0));
 
         state.constrain_move(Some(Vec3::X));
@@ -3715,11 +3999,262 @@ mod tests {
     fn locking_the_same_axis_twice_releases_it() {
         let mut state = AppState::new();
         placed_block(&mut state);
-        state.begin_move(Vec3::ZERO).expect("movable");
+        state.begin_move(Vec3::ZERO, 940.0).expect("movable");
         state.constrain_move(Some(Vec3::Y));
         assert_eq!(state.move_axis(), Some(Vec3::Y));
         state.constrain_move(None);
         assert_eq!(state.move_axis(), None);
+    }
+
+    /// Puts one sphere at an unround coordinate and returns the placement of a
+    /// second one, mid-drag, ready to be aimed near it.
+    fn two_spheres(state: &mut AppState) -> NodeId {
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "First");
+        let first = state
+            .begin_move(Vec3::ZERO, 940.0)
+            .expect("something to move");
+        // Placed rather than moved, so it sits somewhere the grid would never
+        // put it and a test that passes cannot be passing by rounding.
+        state.place_at(first, Vec3::new(20.4, 0.0, 0.0));
+        state.finish_move();
+
+        state.add_body(Node::Sphere { radius: 6.0 }, "Second");
+        state.begin_move(Vec3::ZERO, 940.0).expect("movable")
+    }
+
+    /// The gizmo has to sit on the thing it moves. Dragging a feature makes the
+    /// selection its placement, and a placement's own translation is exactly
+    /// what the gizmo writes, so leaving it out parks the arms at the parent's
+    /// origin from the first drag onwards.
+    #[test]
+    fn the_gizmo_follows_the_feature_it_moves() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        let id = state.begin_move(Vec3::ZERO, 940.0).expect("movable");
+        state.move_to(id, Vec3::new(10.0, 4.0, 0.0));
+        state.finish_move();
+
+        assert_eq!(
+            state.selected,
+            Some(id),
+            "the drag did not leave the placement selected"
+        );
+        let at = state.selection_origin().expect("somewhere");
+        assert_eq!(
+            at,
+            Vec3::new(10.0, 4.0, 0.0),
+            "the gizmo stayed behind at {at:?}"
+        );
+    }
+
+    /// The whole point. A coordinate a fraction off a neighbour's centreline
+    /// has to land on the centreline, not on the nearest round number, or
+    /// lining two features up by hand is impossible however carefully you drag.
+    #[test]
+    fn a_drag_latches_onto_another_feature() {
+        let mut state = AppState::new();
+        let second = two_spheres(&mut state);
+
+        // 20.1 rounds to 20.0 on a 1mm grid, so a pass here cannot come from
+        // rounding: only the neighbour's centre at 20.4 gives 20.4.
+        state.move_to(second, Vec3::new(20.1, 0.0, 0.0));
+        let at = state.placement_of(second).expect("a placement");
+        assert!(
+            (at.x - 20.4).abs() < 1.0e-4,
+            "did not latch onto the neighbour, landed at {at:?}"
+        );
+        state.finish_move();
+    }
+
+    /// A latch has to be visible, or it reads as the part sticking rather than
+    /// as the part lining up.
+    #[test]
+    fn a_latch_puts_a_guide_on_the_axis_it_latched() {
+        let mut state = AppState::new();
+        let second = two_spheres(&mut state);
+        state.move_to(second, Vec3::new(20.1, 0.0, 0.0));
+
+        assert!(
+            state.guides[0].is_some(),
+            "no guide on the axis that latched"
+        );
+        assert!(
+            state.guides[1].is_none() && state.guides[2].is_none(),
+            "a guide was drawn for an axis that only rounded to the grid"
+        );
+        state.finish_move();
+    }
+
+    /// A feature must not offer itself a coordinate. It moves with the drag, so
+    /// it would offer wherever it already is, and the part would refuse to
+    /// leave the spot it started from.
+    #[test]
+    fn a_feature_does_not_snap_to_itself() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Only");
+        let id = state.begin_move(Vec3::ZERO, 940.0).expect("movable");
+        state.place_at(id, Vec3::new(20.4, 0.0, 0.0));
+        state.finish_move();
+
+        // A fresh gesture, so the lines are gathered with the feature already
+        // sitting at 20.4. Offering itself that coordinate would hold it there.
+        let id = state.begin_move(Vec3::ZERO, 940.0).expect("still movable");
+        state.move_to(id, Vec3::new(20.1, 0.0, 0.0));
+        let at = state.placement_of(id).expect("a placement");
+        assert!(
+            (at.x - 20.0).abs() < 1.0e-4,
+            "it snapped to its own last position, landing at {at:?}"
+        );
+        state.finish_move();
+    }
+
+    /// Typing is how you state a number rather than hunt for it. The value has
+    /// to arrive exactly, which means it must not be rounded to the grid on the
+    /// way in: 12.5 on a 1mm grid would come out as 13.
+    #[test]
+    fn a_typed_distance_moves_exactly_that_far() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        let id = state.begin_move(Vec3::ZERO, 940.0).expect("movable");
+        state.constrain_move(Some(Vec3::X));
+
+        for c in "12.5".chars() {
+            assert!(state.type_number(c), "rejected {c}");
+        }
+        state.commit_entry();
+
+        let at = state.placement_of(id).expect("a placement");
+        assert!(
+            (at.x - 12.5).abs() < 1.0e-4,
+            "the typed distance was not used, landed at {at:?}"
+        );
+        assert!(state.moving.is_none(), "the gesture was left open");
+        assert!(state.entry.is_none(), "the number was left behind");
+    }
+
+    /// A dimension takes a typed number as the dimension itself, because
+    /// "twelve" means a radius of twelve, not twelve more than it was.
+    #[test]
+    fn a_typed_dimension_is_absolute() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        let id = state.selected.expect("selected");
+        state.begin_drag(Drag {
+            node: id,
+            param: "radius",
+            from: 6.0,
+            value: 6.0,
+            axis: Vec2::X,
+            gain: 0.1,
+            origin: Vec2::ZERO,
+        });
+
+        for c in "9".chars() {
+            state.type_number(c);
+        }
+        state.commit_entry();
+
+        let radius = state
+            .doc
+            .arena()
+            .get(id)
+            .and_then(|n| {
+                n.params()
+                    .iter()
+                    .find(|(k, _)| *k == "radius")
+                    .map(|(_, v)| *v)
+            })
+            .expect("a radius");
+        assert!((radius - 9.0).abs() < 1.0e-4, "got {radius}");
+        assert!(state.drag.is_none(), "the drag was left open");
+    }
+
+    /// A typed number is a statement, so a bad one is refused rather than
+    /// quietly turned into a different number. A drag stops at the limit
+    /// because it is a continuous gesture passing through; typing is not.
+    #[test]
+    fn a_typed_dimension_that_cannot_be_is_refused() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        let id = state.selected.expect("selected");
+        state.begin_drag(Drag {
+            node: id,
+            param: "radius",
+            from: 6.0,
+            value: 6.0,
+            axis: Vec2::X,
+            gain: 0.1,
+            origin: Vec2::ZERO,
+        });
+
+        for c in "-3".chars() {
+            state.type_number(c);
+        }
+        state.commit_entry();
+
+        assert!(state.drag.is_some(), "a refused number ended the drag");
+        let radius = state
+            .doc
+            .arena()
+            .get(id)
+            .and_then(|n| {
+                n.params()
+                    .iter()
+                    .find(|(k, _)| *k == "radius")
+                    .map(|(_, v)| *v)
+            })
+            .expect("a radius");
+        assert!(
+            (radius - 6.0).abs() < 1.0e-4,
+            "it was applied anyway: {radius}"
+        );
+        state.cancel_drag();
+    }
+
+    /// Escape while typing means "not that number", not "not any of this". The
+    /// drag is still wanted; it was only the number that was wrong.
+    #[test]
+    fn escape_clears_the_number_and_keeps_the_drag() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        state.begin_move(Vec3::ZERO, 940.0).expect("movable");
+        state.constrain_move(Some(Vec3::X));
+        state.type_number('7');
+
+        state.cancel_entry();
+        assert!(state.entry.is_none(), "the number survived");
+        assert!(state.moving.is_some(), "escape ended the drag as well");
+        state.finish_move();
+    }
+
+    /// A typed number needs a direction. Somebody who has already dragged a
+    /// long way has said which one; somebody who has not has said nothing, and
+    /// guessing would move the part somewhere they did not ask for.
+    #[test]
+    fn a_typed_distance_with_no_direction_is_refused() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        let id = state.begin_move(Vec3::ZERO, 940.0).expect("movable");
+        state.type_number('7');
+        state.commit_entry();
+
+        assert!(state.moving.is_some(), "it committed without a direction");
+        let at = state.placement_of(id).expect("a placement");
+        assert_eq!(at, Vec3::ZERO, "the part moved anyway, to {at:?}");
+
+        // Having dragged, the direction is no longer in doubt.
+        state.move_to(id, Vec3::new(9.0, 0.0, 0.0));
+        state.commit_entry();
+        let at = state.placement_of(id).expect("a placement");
+        assert!((at.x - 7.0).abs() < 1.0e-4, "landed at {at:?}");
     }
 
     /// Zero gets a wider catchment than the grid alone gives it. A feature on an
@@ -3729,25 +4264,34 @@ mod tests {
     #[test]
     fn a_position_near_zero_snaps_to_it() {
         let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
         state.grid = 0.5;
 
+        let id = state
+            .begin_move(Vec3::ZERO, 940.0)
+            .expect("something to move");
         // Chosen so plain rounding would not give zero: 0.3 rounds to 0.5, and
         // only the wider catchment brings it home. A value that rounds to zero
         // anyway would pass with the pull removed and prove nothing.
-        let pulled = state.snap_position(Vec3::new(0.3, -0.3, 0.3));
+        state.move_to(id, Vec3::new(0.3, -0.3, 0.3));
+        let pulled = state.placement_of(id).expect("a placement");
         assert_eq!(pulled, Vec3::ZERO, "zero did not pull, got {pulled:?}");
 
         // But not so wide that the grid line next to zero is unreachable.
-        let near = state.snap_position(Vec3::new(0.5, 0.0, 0.0));
+        state.move_to(id, Vec3::new(0.5, 0.0, 0.0));
+        let near = state.placement_of(id).expect("a placement");
         assert!(
             (near.x - 0.5).abs() < 0.01,
             "the first grid line was swallowed, got {near:?}"
         );
-        let far = state.snap_position(Vec3::new(7.1, 0.0, 0.0));
+        state.move_to(id, Vec3::new(7.1, 0.0, 0.0));
+        let far = state.placement_of(id).expect("a placement");
         assert!(
             (far.x - 7.0).abs() < 0.01,
             "ordinary rounding broke, got {far:?}"
         );
+        state.finish_move();
     }
 
     /// The plane a locked drag is measured against has to contain the axis, or
@@ -4033,7 +4577,7 @@ mod tests {
         let mut state = AppState::new();
         state.new_document();
         state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
-        state.begin_move(Vec3::ZERO).expect("movable");
+        state.begin_move(Vec3::ZERO, 940.0).expect("movable");
 
         state.load_sample();
         assert!(
@@ -4061,7 +4605,7 @@ mod tests {
         let mut state = AppState::new();
         state.new_document();
         state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
-        let id = state.begin_move(Vec3::ZERO).expect("movable");
+        let id = state.begin_move(Vec3::ZERO, 940.0).expect("movable");
 
         state.apply(Command::SetRoot { root: None });
         state.apply(Command::Delete { id });

@@ -5,11 +5,13 @@
 //! top in a second pass. No intermediate texture, no copy.
 
 mod dialog;
+mod entry;
 mod handle;
 mod icon;
 mod motion;
 mod plane;
 mod settings;
+mod snap;
 mod snapshot;
 mod state;
 mod theme;
@@ -31,27 +33,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--snapshot") {
         let path = args.get(i + 1).map_or("shapecad.png", String::as_str);
-        let scene = if args.iter().any(|a| a == "--dialog") {
-            snapshot::Scene::Dialog
-        } else if args.iter().any(|a| a == "--sample") {
-            snapshot::Scene::Sample
-        } else if args.iter().any(|a| a == "--hover") {
-            snapshot::Scene::Hover
-        } else if args.iter().any(|a| a == "--menu") {
-            snapshot::Scene::Menu
-        } else if args.iter().any(|a| a == "--tutorial") {
-            snapshot::Scene::Tutorial
-        } else if args.iter().any(|a| a == "--grips") {
-            snapshot::Scene::Grips
-        } else if args.iter().any(|a| a == "--engine") {
-            snapshot::Scene::Engine
-        } else if args.iter().any(|a| a == "--pattern") {
-            snapshot::Scene::Pattern
-        } else if args.iter().any(|a| a == "--showcase") {
-            snapshot::Scene::Showcase
-        } else {
-            snapshot::Scene::Empty
-        };
+        let scene = snapshot::Scene::from_args(&args);
         // Both palettes have to be capturable, or the dark one can only be
         // checked by running the application and looking at it.
         if args.iter().any(|a| a == "--dark") {
@@ -1043,7 +1025,7 @@ impl App {
         let Some(grabbed) = self.drag_plane_hit() else {
             return false;
         };
-        if self.state.begin_move(grabbed).is_none() {
+        if self.state.begin_move(grabbed, height).is_none() {
             return false;
         }
         self.input.gesture = Gesture::None;
@@ -1765,7 +1747,7 @@ mod tests {
         let mut app = App::new();
         app.state.new_document();
         app.state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
-        app.state.begin_move(Vec3::ZERO).expect("movable");
+        app.state.begin_move(Vec3::ZERO, 940.0).expect("movable");
 
         // No release is coming: the window lost focus with the button down.
         app.end_gesture();

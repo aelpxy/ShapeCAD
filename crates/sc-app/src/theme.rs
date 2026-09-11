@@ -1270,25 +1270,6 @@ pub(crate) fn icon_segmented(
     segmented_core(ui, "icons", current, &segments, Vec2::new(30.0, 26.0))
 }
 
-/// A segmented control of words, for the workspace tabs.
-pub(crate) fn segmented(ui: &mut egui::Ui, current: &mut usize, labels: &[(&str, &str)]) -> bool {
-    let segments: Vec<Segment<'_>> = labels
-        .iter()
-        .map(|(label, help)| Segment {
-            glyph: None,
-            label,
-            help,
-        })
-        .collect();
-    match segmented_core(ui, "words", *current, &segments, Vec2::new(84.0, 26.0)) {
-        Some(picked) => {
-            *current = picked;
-            true
-        }
-        None => false,
-    }
-}
-
 /// Replaces a sharp corner with an arc tangent to both edges.
 ///
 /// The corner is used as the control point of a quadratic, which is tangency by

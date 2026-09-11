@@ -17,20 +17,6 @@ use sc_doc::Command;
 use sc_geom::glam::{Vec2 as GVec2, Vec3};
 use sc_geom::{Node, NodeId, Profile};
 
-/// The size of the workspace switch, which has to be known before it is drawn
-/// so that it can be placed clear of the buttons on either side of it.
-const SWITCH: Vec2 = Vec2::new(180.0, 34.0);
-
-const WORKSPACES: [(&str, &str); 2] = [
-    (
-        "Model",
-        "Build the part: sketch, pad, pocket and edit dimensions.",
-    ),
-    (
-        "Print",
-        "Checks for printability such as wall thickness and overhangs. Not built yet.",
-    ),
-];
 /// Only tools that do something. A button that does nothing is worse than
 /// no button.
 const TOOLS: [(Icon, &str, &str); 2] = [
@@ -399,6 +385,50 @@ fn empty_menu(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// Keyboard shortcuts, consumed before any widget sees them.
+/// Feeds typed digits to the gesture in flight.
+///
+/// Dragging is how you find a size and typing is how you state one, and the
+/// moment you know the number is usually a second after you started reaching for
+/// it, so the drag is not interrupted and does not have to be started again.
+fn typed_number(ctx: &egui::Context, state: &mut AppState) {
+    use egui::{Key, Modifiers};
+
+    if state.drag.is_none() && state.moving.is_none() {
+        return;
+    }
+    let typing = state.entry.is_some();
+    let (escape, enter, back) = ctx.input_mut(|i| {
+        (
+            typing && i.consume_key(Modifiers::NONE, Key::Escape),
+            i.consume_key(Modifiers::NONE, Key::Enter),
+            i.consume_key(Modifiers::NONE, Key::Backspace),
+        )
+    });
+    if escape {
+        state.cancel_entry();
+    } else if enter {
+        state.commit_entry();
+    } else if back {
+        state.entry_backspace();
+    } else {
+        // Taken from the text events rather than from the key codes, so the
+        // main row, the keypad and a layout that puts the digits somewhere else
+        // all arrive as the character they produced.
+        let typed: String = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect()
+        });
+        for c in typed.chars() {
+            state.type_number(c);
+        }
+    }
+}
+
 fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
     use egui::{Key, KeyboardShortcut, Modifiers};
 
@@ -428,10 +458,18 @@ fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
     // Escape abandons a drag and puts the dimension back. Checked before
     // anything else that consumes Escape, so that a drag started by mistake can
     // always be taken back without looking for undo.
-    if state.drag.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+    //
+    // Read before the number being typed, because Escape with nothing typed has
+    // to keep meaning "put this back".
+    if state.drag.is_some()
+        && state.entry.is_none()
+        && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+    {
         state.cancel_drag();
         return;
     }
+
+    typed_number(ctx, state);
 
     // X, Y and Z lock a move to one axis while it is in flight, and the same
     // key again lets it go. Pressed during a drag rather than before it, because
@@ -528,27 +566,6 @@ fn file_browser(ctx: &egui::Context, state: &mut AppState) {
     }
 }
 
-/// Where the workspace switch goes.
-///
-/// Centred in the bar, which is what it is for, but never over one of the two
-/// groups of buttons it sits between: on a narrow window the exact centre put
-/// the pill straight across Sample and Save. If the gap is narrower than the
-/// switch there is nothing left to do but centre it in the gap.
-fn centred_between(bar: egui::Rect, left_end: f32, right_start: f32, size: Vec2) -> egui::Rect {
-    let gap = egui::Rect::from_min_max(
-        egui::pos2(left_end, bar.top()),
-        egui::pos2(right_start.max(left_end), bar.bottom()),
-    );
-    let x = if gap.width() >= size.x {
-        bar.center()
-            .x
-            .clamp(gap.left() + size.x * 0.5, gap.right() - size.x * 0.5)
-    } else {
-        gap.center().x
-    };
-    egui::Rect::from_center_size(egui::pos2(x, bar.center().y), size)
-}
-
 /// A top bar button that drops its label when the bar is short of room.
 ///
 /// The glyph and the tooltip carry the meaning either way, and a bar whose
@@ -569,10 +586,10 @@ fn bar_button(
 
 /// Bar width below which the file buttons drop their labels.
 ///
-/// Below this the three groups cannot all fit and the middle one ends up
-/// painted over the file buttons. Shedding the wordmark and the labels buys
-/// about 250 points, measured against the 900 point minimum window at 150
-/// percent zoom, where the bar has 600 points to work with.
+/// Below this the two groups cannot both fit and they end up painted over one
+/// another. Shedding the wordmark and the labels buys about 250 points, measured
+/// against the 900 point minimum window at 150 percent zoom, where the bar has
+/// 600 points to work with.
 const ROOM_FOR_WORDS: f32 = 1060.0;
 /// And below this, the wordmark goes too.
 const ROOM_FOR_NAME: f32 = 900.0;
@@ -583,11 +600,6 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
         .frame(theme::bar())
         .show(ui, |ui| {
             let full = ui.max_rect();
-            // Where the two groups of buttons ended, so the switch between them
-            // can be placed without running over either.
-            let mut left_end = full.left();
-            let mut right_start = full.right();
-
             let compact = full.width() < ROOM_FOR_WORDS;
 
             ui.horizontal_centered(|ui| {
@@ -654,30 +666,10 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
                     state.save();
                 }
 
-                left_end = ui.cursor().left();
-                right_start = ui
-                    .with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        top_bar_actions(ui, state);
-                    })
-                    .response
-                    .rect
-                    .left();
-            });
-
-            // Centred exactly, which a horizontal layout cannot do on its own.
-            //
-            // Dropped entirely when the bar is short. Measured at the 900 point
-            // minimum and 150 percent zoom, the three groups want about 680
-            // points of a 600 point bar, so one of them has to go, and this is
-            // the one: it is a two state view toggle whose second state is not
-            // built yet, against file actions and export, which do things. When
-            // Print exists this should move somewhere that scales instead.
-            if !compact {
-                let switch = centred_between(full, left_end + 8.0, right_start - 8.0, SWITCH);
-                ui.scope_builder(egui::UiBuilder::new().max_rect(switch), |ui| {
-                    theme::segmented(ui, &mut state.tab, &WORKSPACES);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    top_bar_actions(ui, state);
                 });
-            }
+            });
         });
 }
 
@@ -1815,6 +1807,7 @@ fn overlays(
     claimed: &mut Vec<egui::Rect>,
 ) {
     move_gizmo(ui, state, viewport);
+    snap_guides(ui, state, viewport);
     grips(ui, state, viewport);
     armed_preview(ui, state, viewport);
     tutorial_card(ui, state, slots.tutorial, claimed);
@@ -2275,6 +2268,42 @@ fn armed_preview(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
 /// degrees of freedom and a pointer has two, so every free move changes two
 /// coordinates whether that was wanted or not. Grabbing an arm moves along it
 /// and nothing else.
+/// Draws a line to whatever the drag has latched onto.
+///
+/// One per axis, tinted like that axis, running from the feature the coordinate
+/// came from to the feature being dragged. A snap the user cannot see is a
+/// feature that reads as the part sticking: the line is what turns "it stopped
+/// here" into "it stopped here because it is in line with that".
+fn snap_guides(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
+    let rect = [
+        viewport.min.x,
+        viewport.min.y,
+        viewport.width(),
+        viewport.height(),
+    ];
+    let Some(origin) = state.selection_origin() else {
+        return;
+    };
+    let painter = ui.painter_at(viewport);
+    for (guide, (name, _)) in state.guides.iter().zip(crate::state::AXES) {
+        let Some(other) = *guide else {
+            continue;
+        };
+        let (Some(a), Some(b)) = (
+            state.world_to_screen(other, rect),
+            state.world_to_screen(origin, rect),
+        ) else {
+            continue;
+        };
+        let (a, b) = (egui::pos2(a.x, a.y), egui::pos2(b.x, b.y));
+        let colour = theme::axis_tint(name);
+        painter.line_segment([a, b], egui::Stroke::new(1.5, colour.gamma_multiply(0.7)));
+        // A mark on the feature that offered the coordinate, so it is clear
+        // which of several nearby things is the one being lined up with.
+        painter.circle_filled(a, 3.0, colour);
+    }
+}
+
 fn move_gizmo(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
     let rect = [
         viewport.min.x,
@@ -3190,28 +3219,6 @@ mod layout_tests {
             );
             assert!(panel_width(window, 292.0) >= 0.0);
         }
-    }
-
-    /// The workspace switch is centred in the top bar, but not at the cost of
-    /// covering the buttons on either side of it.
-    #[test]
-    fn the_workspace_switch_keeps_clear_of_the_buttons() {
-        use super::centred_between;
-
-        let bar = egui::Rect::from_min_size(egui::pos2(14.0, 0.0), egui::vec2(872.0, 62.0));
-        let size = egui::vec2(180.0, 34.0);
-
-        // Room to spare: exactly centred.
-        let wide = centred_between(bar, 200.0, 800.0, size);
-        assert!((wide.center().x - bar.center().x).abs() < 0.01);
-
-        // Tight: pushed off centre rather than over a button.
-        let tight = centred_between(bar, 420.0, 620.0, size);
-        assert!(tight.left() >= 420.0 && tight.right() <= 620.0, "{tight:?}");
-
-        // No room at all: centred in what gap there is, and still inside it.
-        let none = centred_between(bar, 500.0, 520.0, size);
-        assert!((none.center().x - 510.0).abs() < 0.01, "{none:?}");
     }
 
     /// Two pieces of floating chrome that overlap take each other's clicks,
