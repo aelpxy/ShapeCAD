@@ -155,6 +155,24 @@ fn bounds_memo(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, Aabb>) -> A
             Aabb::from_half(Vec3::new(major + minor, major + minor, minor))
         }
         Node::Plane { .. } => Aabb::INFINITE,
+        // The voxel footprint, which is half a voxel wider than the outermost
+        // sample centres and at least two voxels wider than the surface.
+        Node::Mesh { ref grid, .. } => grid.bounds(),
+        // Bounded across the profile, unbounded along the sweep. A prism only
+        // ever appears as the tool of a difference or an intersection, and both
+        // take their bounds from the other operand, so the infinity is contained
+        // in every position the node is meant to occupy.
+        Node::Prism { .. } => {
+            let Some(Node::Prism { profile }) = arena.get(id) else {
+                return Aabb::EMPTY;
+            };
+            let (lo, hi) = profile.bounds();
+            Aabb {
+                min: Vec3::new(lo.x, lo.y, f32::NEG_INFINITY),
+                max: Vec3::new(hi.x, hi.y, f32::INFINITY),
+            }
+        }
+
         Node::Extrude { .. } => {
             // Re-fetched by reference: a profile is not `Copy`, so it cannot be
             // bound by the surrounding match on `*node`.
@@ -179,7 +197,7 @@ fn bounds_memo(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, Aabb>) -> A
             .intersection(bounds_memo(arena, b, memo))
             .expand(smooth),
 
-        Node::Transform { child, xform } => bounds_memo(arena, child, memo).transformed(&xform),
+        Node::Transform { child, xform, .. } => bounds_memo(arena, child, memo).transformed(&xform),
         Node::Offset { child, distance } => {
             bounds_memo(arena, child, memo).expand(distance.max(0.0))
         }

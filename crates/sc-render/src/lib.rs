@@ -12,4 +12,4 @@ pub mod shader;
 pub mod snapshot;
 
 pub use camera::{CameraRig, OrbitCamera};
-pub use renderer::Renderer;
+pub use renderer::{Renderer, ScenePalette};

@@ -21,7 +21,7 @@ in place, but sketching, feature dependencies and mesh export still need work.
 The code was written with OpenAI Codex and Claude Code, with me directing and
 reviewing the work. I haven't hand-written the code.
 
-## What you can do
+## Implemented so far
 
 - Draw a closed polygon on the XY, XZ or YZ plane, snap points to a grid,
   and extrude it.
@@ -29,10 +29,18 @@ reviewing the work. I haven't hand-written the code.
   Change the hexagon's side count to make other regular polygons.
 - Add spheres, boxes and cylinders, or cut rectangular, circular and hexagonal
   pockets through a part.
-- Start a polygon sketch or a pocket on an existing pad's top surface.
+- Build pads and pockets on an existing pad's top surface. Attached features
+  follow their supporting feature when it changes.
 - Select bodies and boolean joints in the viewport or design tree, then edit
   dimensions and blend radii in the property panel.
-- Save and open designs as readable JSON, and export meshes as STL.
+- Apply shells and offsets, move features with numeric coordinates, and detach
+  features from their supporting surface.
+- Undo and redo whole modeling actions, save and open designs, and export STL.
+- Choose light, dark or system appearance.
+
+The Rust libraries also support STL and OBJ import, converting triangle meshes
+into voxel distance grids for modeling operations. Import is not yet exposed in
+the desktop file browser or CLI.
 
 Numeric edits update the viewport through a GPU parameter buffer. They don't
 recompile the shader unless the generated shader code changes.
@@ -44,14 +52,13 @@ recompile the shader unless the generated shader code changes.
   profile before using it in several features.
 - There are no push/pull handles or direct movement tools in the viewport.
   Dimensions are edited in the side panel.
-- Completed features keep a fixed placement. Changing the depth of a supporting
-  pad won't move a sketch extrusion built on its top surface, and a through-cut
-  won't automatically extend to follow a thicker part.
-- Shell, offset and move currently affect the visible model only when applied
-  to its root. Applying them to a child creates a modifier without reconnecting
-  it to the model.
-- Undo and redo work per command. Creating a feature or dragging a value can
-  leave several undo steps for one action.
+- Move starts with a 10 mm step along X, then lets you edit coordinates. For an
+  attached placement, movement is stored relative to its supporting surface.
+- Dimension drags can still leave several undo steps. Feature creation and
+  modifiers are grouped into one step.
+- Imported geometry is sampled onto a voxel grid. Its detail depends on the
+  grid resolution, and it does not recover the original model's sketches or
+  editable dimensions.
 - Some exports have non-manifold edges. The CLI can still report these as
   manifold, so its success message isn't a guarantee. See
   [the meshing notes](docs/meshing.md).
@@ -92,9 +99,9 @@ cargo run -p sc-cli -- selftest
 
 ## How it works
 
-ShapeCAD stores geometry as a directed acyclic graph of implicit operations. The viewport
-evaluates that tree on the GPU, and a dual contouring mesher turns it into
-triangles for export.
+ShapeCAD stores geometry as a directed acyclic graph of implicit operations.
+The viewport evaluates the field on the GPU, and a dual contouring mesher turns
+it into triangles for export. Imported meshes use sampled distance grids.
 
 This makes it possible to combine shapes and blend their joins without managing
 surface topology at each edit. It also comes with tradeoffs: there's no exact
@@ -106,8 +113,8 @@ The workspace has six crates:
 | Crate | Purpose |
 | --- | --- |
 | `sc-geom` | Geometry tree, evaluation, bounds, hashing and shader generation |
-| `sc-doc` | Documents, commands, undo and the file format |
-| `sc-mesh` | Dual contouring and STL export |
+| `sc-doc` | Documents, commands, undo, the file format and imported assets |
+| `sc-mesh` | Dual contouring, STL export, STL/OBJ import and voxelization |
 | `sc-render` | Viewport rendering and camera controls |
 | `sc-app` | Desktop interface |
 | `sc-cli` | Headless commands |
@@ -116,6 +123,16 @@ Document edits go through `Document::apply`, which keeps the command history
 and undo behavior consistent. Commands are atomic: a rejected edit leaves the
 document unchanged. This command interface is also the basis for planned agent
 support.
+
+## Design files
+
+Designs are saved as readable `.shapecad` JSON. Parts containing imported mesh
+geometry also have a companion assets directory, such as `part.assets/` beside
+`part.shapecad`. Keep the file and directory together when moving or sharing a
+design. Saving to a new path copies the required assets.
+
+Undo history lasts for the current session and is not saved. See
+[the file format reference](docs/file-format.md) for details.
 
 ## Development
 
@@ -130,8 +147,10 @@ Tests cover geometry evaluation, bounds, undo, meshing and rendering. Property
 tests exercise randomly generated models, and the CLI's `selftest` checks a
 reference part against its saved geometry hash.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions and
-[docs/](docs/) for architecture and implementation notes.
+Start with the [developer API reference](docs/api-reference.md) for types,
+methods, commands and examples. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+development conventions and [docs/](docs/) for architecture and implementation
+notes.
 
 ## License
 

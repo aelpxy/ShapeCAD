@@ -15,21 +15,105 @@ application.
 
 ## The palette
 
-A single neutral ramp, one accent, one red. Nothing else.
+A single neutral ramp, one accent, one red. Nothing else. Read `theme::palette()`
+rather than naming a colour at the call site; it returns whichever of the two
+schemes is in force.
 
-| Constant | Used for |
+| Field | Used for |
 |---|---|
-| `CANVAS` | The space between cards |
-| `SURFACE` | A card, a popup, a floating bar |
-| `SURFACE_ALT` | A hovered or active row, an input field |
-| `BORDER` | The hairline that separates a card from the canvas |
-| `TEXT` / `TEXT_DIM` | Primary and secondary text |
-| `ACCENT` / `ACCENT_SOFT` | Selection, and the tint behind it |
-| `DANGER` | Destructive actions only |
-| `INK` | The single primary button, and the application mark |
+| `canvas` | The space between cards |
+| `surface` | A card, a popup, a floating bar |
+| `surface_alt` | A hovered or active row, an input field |
+| `border` | The hairline that separates a card from the canvas |
+| `text` / `text_dim` | Primary and secondary text |
+| `accent` / `accent_soft` | Selection, and the tint behind it |
+| `danger` | Destructive actions only |
+| `ink` / `on_ink` | The single primary button and the application mark, and what is written on them |
+| `sky` / `haze` / `plate` / `grid` | The viewport: background sweep, build plate, grid lines |
 
 Depth comes from the border, not from shadows. Only things that genuinely float
 over the 3D view get one, and even then it is faint.
+
+## Grouped lists
+
+The tool panel is a grouped list, which is the shape this kind of list takes on
+Apple's platforms. Rows carry no chrome of their own: the group is a raised
+surface, the rows inside it are divided by hairlines inset to where the label
+starts, and the section header sits outside the group and above it.
+
+A group only reads as raised against the canvas, so the sections deliberately sit
+directly on the panel background rather than inside a card. Nested in one they
+would be surface on surface and the separators would be doing all the work.
+
+Use `theme::grouped`, which hands you a `Rows` and puts the hairlines in. The
+separator belongs between rows and nowhere else, which is fiddly to get right by
+hand in a list whose length depends on what is selected.
+
+## Light and dark
+
+Two palettes, chosen by `Settings::appearance`: `Light`, `Dark`, or `System`.
+`System` is a request, not a result. It becomes one of the other two by asking
+winit what the desktop is set to, and `None` is a normal answer there: several
+Wayland compositors never report a scheme, in which case there is nothing to
+follow and it resolves to light.
+
+The scheme is a process-wide `AtomicU8` rather than a value threaded through
+every function that draws. A desktop application has exactly one appearance at a
+time, and passing a palette into every label would be ceremony with no reader.
+
+Three things need doing together when it changes, and missing any one shows:
+
+- `theme::set_scheme` swaps the palette.
+- `theme::apply` rebuilds egui's style, which caches colours rather than reading
+  them per frame. Calling it again is safe; it is written to be idempotent.
+- `field_dirty` is set, so the viewport rebuilds. Its colours live in the
+  shader's uniform, which nothing repaints on its own.
+
+egui stays pinned to its light style in both schemes. Every colour that shows is
+set from the palette, and letting egui swap its own base underneath would change
+the handful that are not named here, giving a scheme assembled from two sources.
+
+**The viewport colours are linear, the chrome colours are sRGB.** The shader
+writes into a linear target and the swapchain encodes on the way out, so a value
+picked to look right as a hex colour comes out about two and a half times too
+light. `#1F1F23` is `0.0137`, not `0.12`. The first dark viewport was written as
+if it were sRGB and came out mid grey, which read as a dimmed light mode rather
+than a dark one. `the_dark_scene_is_actually_dark` pins it.
+
+## Motion
+
+Animation is driven by springs, in `motion.rs`, not by a duration and an easing
+curve. The difference shows when something changes target mid-flight, which in a
+tool that responds to every click is most of the time: a tween restarts from
+where it was and loses its velocity, so an interrupted animation stutters. A
+spring carries the velocity across and bends toward the new target.
+
+Tunings are a response time and a damping fraction, the two numbers a person can
+reason about. Stiffness and mass are not.
+
+| Tuning | For |
+|---|---|
+| `SMOOTH` | Hover fills, colour changes, anything a pointer is driving. No overshoot |
+| `BOUNCY` | Things that appear: a menu opening, a selection moving to a new segment |
+| `SNAPPY` | Press feedback. Slower than this reads as lag, because the finger has already gone |
+
+`animate` keeps its state in egui's memory under an id, so a caller owns nothing,
+and requests a repaint while the spring is moving. `animate_from` is for things
+that appear and therefore have no previous position to carry; whoever uses it
+must `forget` the id when the thing goes away, or the next appearance starts
+where the last one finished.
+
+Two traps, both found by the tests rather than by looking:
+
+**Integrate in fixed slices, not once per frame.** One step per frame makes the
+motion depend on the frame rate: at a response of 0.3 seconds a 60Hz frame is a
+third of a radian, far enough into the integration error to see. The same motion
+reached 0.68 at 60Hz and 0.63 at 144Hz. `MAX_SUBSTEP` fixes it at four slices
+per frame at 60Hz, which costs nothing.
+
+**Clamp the frame time.** A frame longer than `MAX_STEP` is a stall, not a slow
+frame: the window was occluded, or a shader was compiling. Integrating it
+honestly flings every spring in the interface at once.
 
 ## Widgets
 

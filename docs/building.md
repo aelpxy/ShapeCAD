@@ -90,6 +90,10 @@ scene:
 | `--menu` | The context menu open on the sample model's root. |
 | `--showcase` | The sample part posed for the readme screenshot, with the wall selected. |
 
+`--dark` captures any of these in the dark palette. Both schemes are worth
+looking at after a change to the interface: they are two sets of colours over one
+layout, and a contrast that works in one can vanish in the other.
+
 Two details matter if you touch that path. `RawInput::screen_rect` is in *points*,
 not pixels, so it must be divided by the scale. And several frames must be run:
 egui gives a newly created area a sizing pass before it can place itself, and

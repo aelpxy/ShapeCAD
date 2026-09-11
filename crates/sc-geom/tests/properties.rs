@@ -15,7 +15,8 @@
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
 use sc_geom::glam::{Quat, Vec3};
-use sc_geom::{bounds, eval, Arena, Builder, NodeId, Transform};
+use sc_geom::{bounds, eval, Arena, AssetId, Builder, Grid, NodeId, Transform};
+use std::sync::Arc;
 
 /// A symbolic shape, generated first and then materialised into an [`Arena`].
 ///
@@ -29,6 +30,9 @@ enum Shape {
     Cylinder(f32, f32, f32),
     Torus(f32, f32),
     Extrude(usize, f32, f32),
+    /// An imported mesh: a radius, a voxel count per axis, and whether the
+    /// voxelized shape is a cube rather than a sphere.
+    Mesh(f32, u32, bool),
     Union(Box<Shape>, Box<Shape>, f32),
     Difference(Box<Shape>, Box<Shape>, f32),
     Intersection(Box<Shape>, Box<Shape>, f32),
@@ -37,6 +41,18 @@ enum Shape {
     Scale(Box<Shape>, f32),
     Offset(Box<Shape>, f32),
     Shell(Box<Shape>, f32),
+    /// A feature placed on another and joined to it, its placement recording
+    /// where it came from. That derivation is provenance, so every property
+    /// here has to hold exactly as it would without it.
+    On(Box<Shape>, Box<Shape>, [f32; 3]),
+    /// A through cut: a shape with an unbounded prism taken out of it.
+    ///
+    /// Only ever generated in this position. A prism alone is unbounded along
+    /// its sweep, so the bounds properties would have nothing finite to check
+    /// and the mesher no region to work in. As the tool of a difference it is
+    /// doing exactly the job it exists for, and the bounds come from the solid
+    /// being cut.
+    ThroughCut(Box<Shape>, f32),
 }
 
 fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
@@ -62,6 +78,29 @@ fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
             },
             *height,
         ),
+        Shape::Mesh(radius, dims, boxy) => {
+            let (radius, dims) = (*radius, *dims);
+            // Spacing is derived from the radius so that every generated grid
+            // holds the padding precondition with three voxels to spare, which
+            // is what makes the field outside it a lower bound on distance.
+            let spacing = 2.0 * radius / (dims - 7) as f32;
+            let half = (dims - 1) as f32 * spacing * 0.5;
+            let field = |p: Vec3| {
+                if *boxy {
+                    let q = p.abs() - Vec3::splat(radius);
+                    q.max(Vec3::ZERO).length() + q.max_element().min(0.0)
+                } else {
+                    p.length() - radius
+                }
+            };
+            let grid = Grid::from_fn([dims; 3], Vec3::splat(-half), spacing, field);
+            debug_assert!(
+                grid.boundary_clearance() >= Grid::REQUIRED_CLEARANCE as f32 * spacing,
+                "generated an unpadded grid: {grid:?}"
+            );
+            b.arena
+                .insert(sc_geom::Node::mesh(AssetId(0), Arc::new(grid)))
+        }
         Shape::Union(x, y, k) => {
             let (a, c) = (materialize(x, b)?, materialize(y, b)?);
             b.smooth_union(a, c, *k)
@@ -101,6 +140,50 @@ fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
             let a = materialize(x, b)?;
             b.shell(a, *t)
         }
+        Shape::ThroughCut(x, radius) => {
+            let solid = materialize(x, b)?;
+            let tool = b.arena.insert(sc_geom::Node::Prism {
+                profile: sc_geom::Profile::Circle { radius: *radius },
+            })?;
+            b.smooth_difference(solid, tool, 0.0)
+        }
+        Shape::On(x, base, t) => {
+            let under = materialize(base, b)?;
+            let child = materialize(x, b)?;
+            let placed = b.arena.insert(sc_geom::Node::Transform {
+                child,
+                xform: Transform::from_translation(Vec3::from_array(*t)),
+                on: Some(under),
+            })?;
+            b.union(under, placed)
+        }
+    }
+}
+
+/// Whether the tree contains an imported mesh anywhere.
+fn contains_mesh(s: &Shape) -> bool {
+    match s {
+        Shape::Mesh(..) => true,
+        Shape::Union(a, b, _) | Shape::Difference(a, b, _) | Shape::Intersection(a, b, _) => {
+            contains_mesh(a) || contains_mesh(b)
+        }
+        Shape::On(a, base, _) => contains_mesh(a) || contains_mesh(base),
+        Shape::Translate(a, _)
+        | Shape::Rotate(a, _)
+        | Shape::Scale(a, _)
+        | Shape::Offset(a, _)
+        | Shape::Shell(a, _)
+        // The cutting prism is generated here, never from a mesh.
+        | Shape::ThroughCut(a, _) => contains_mesh(a),
+        // Matched out rather than caught by a wildcard. This function exists so
+        // that a node cannot go missing from the shader quietly, and a wildcard
+        // here is exactly how it would: a new shape holding a mesh would report
+        // no mesh, and the property would pass by agreeing with itself.
+        Shape::Sphere(..)
+        | Shape::Cuboid(..)
+        | Shape::Cylinder(..)
+        | Shape::Torus(..)
+        | Shape::Extrude(..) => false,
     }
 }
 
@@ -112,27 +195,43 @@ fn build(s: &Shape) -> (Arena, NodeId) {
 
 /// Leaf primitives with parameters kept in a range where a 3D printer could
 /// plausibly reproduce them.
-fn arb_leaf() -> impl Strategy<Value = Shape> {
-    prop_oneof![
+///
+/// `inexact` admits leaves whose field is not an exact distance, which today
+/// means an imported mesh. Voxel counts are kept small: the properties build
+/// thousands of trees and a grid is the only leaf whose cost is not constant.
+fn arb_leaf(inexact: bool) -> impl Strategy<Value = Shape> {
+    let exact = prop_oneof![
         (0.5f32..10.0).prop_map(Shape::Sphere),
         ((0.5f32..8.0, 0.5f32..8.0, 0.5f32..8.0), 0.0f32..2.0)
             .prop_map(|((x, y, z), r)| Shape::Cuboid([x, y, z], r)),
         (0.5f32..8.0, 0.5f32..8.0, 0.0f32..1.0).prop_map(|(r, h, o)| Shape::Cylinder(r, h, o)),
         (1.0f32..8.0, 0.2f32..3.0).prop_map(|(a, b)| Shape::Torus(a, b)),
         ((3usize..10), 1.0f32..6.0, 1.0f32..8.0).prop_map(|(n, r, h)| Shape::Extrude(n, r, h)),
+    ];
+    if !inexact {
+        return exact.boxed();
+    }
+    prop_oneof![
+        5 => exact,
+        1 => (1.0f32..6.0, 9u32..15, proptest::bool::ANY)
+            .prop_map(|(r, n, boxy)| Shape::Mesh(r, n, boxy)),
     ]
+    .boxed()
 }
 
-/// Random trees. `smooth` controls whether blend radii may be non-zero, because
-/// a polynomial smooth-minimum is deliberately not an exact distance field and
-/// so is excluded from the strict Lipschitz property.
-fn arb_shape(smooth: bool) -> impl Strategy<Value = Shape> {
-    let blend: BoxedStrategy<f32> = if smooth {
+/// Random trees. `inexact` controls whether the tree may contain anything whose
+/// field is not an exact signed distance, which is both a non-zero blend radius
+/// and an imported mesh. Both are excluded from the strict Lipschitz property:
+/// a polynomial smooth-minimum deliberately under-reports, and trilinear
+/// interpolation of a sampled field has a gradient of up to `sqrt(3)` at a kink.
+/// See `known_limitation_trilinear_sampling_is_not_lipschitz_at_a_kink`.
+fn arb_shape(inexact: bool) -> impl Strategy<Value = Shape> {
+    let blend: BoxedStrategy<f32> = if inexact {
         (0.0f32..2.0).boxed()
     } else {
         Just(0.0f32).boxed()
     };
-    arb_leaf().prop_recursive(4, 24, 2, move |inner| {
+    arb_leaf(inexact).prop_recursive(4, 24, 2, move |inner| {
         let blend = blend.clone();
         prop_oneof![
             (inner.clone(), inner.clone(), blend.clone()).prop_map(|(a, b, k)| Shape::Union(
@@ -156,7 +255,18 @@ fn arb_shape(smooth: bool) -> impl Strategy<Value = Shape> {
                 .prop_map(|(a, e)| Shape::Rotate(Box::new(a), [e.0, e.1, e.2])),
             (inner.clone(), 0.3f32..3.0).prop_map(|(a, s)| Shape::Scale(Box::new(a), s)),
             (inner.clone(), -1.0f32..2.0).prop_map(|(a, d)| Shape::Offset(Box::new(a), d)),
-            (inner, 0.2f32..2.0).prop_map(|(a, t)| Shape::Shell(Box::new(a), t)),
+            (inner.clone(), 0.2f32..2.0).prop_map(|(a, t)| Shape::Shell(Box::new(a), t)),
+            (
+                inner.clone(),
+                inner.clone(),
+                (-8.0f32..8.0, -8.0f32..8.0, -8.0f32..8.0)
+            )
+                .prop_map(|(a, base, t)| Shape::On(
+                    Box::new(a),
+                    Box::new(base),
+                    [t.0, t.1, t.2]
+                )),
+            (inner, 0.3f32..2.0).prop_map(|(a, r)| Shape::ThroughCut(Box::new(a), r)),
         ]
     })
 }
@@ -230,7 +340,7 @@ proptest! {
     /// A blend adds material; it never removes any.
     #[test]
     fn smooth_union_never_removes_material(
-        a in arb_leaf(), b in arb_leaf(), k in 0.1f32..3.0, pts in arb_points()
+        a in arb_leaf(true), b in arb_leaf(true), k in 0.1f32..3.0, pts in arb_points()
     ) {
         let hard = Shape::Union(Box::new(a.clone()), Box::new(b.clone()), 0.0);
         let soft = Shape::Union(Box::new(a), Box::new(b), k);
@@ -244,7 +354,7 @@ proptest! {
 
     /// Cutting can only ever remove material.
     #[test]
-    fn difference_never_adds_material(a in arb_leaf(), b in arb_leaf(), pts in arb_points()) {
+    fn difference_never_adds_material(a in arb_leaf(true), b in arb_leaf(true), pts in arb_points()) {
         let (aa, ar) = build(&a);
         let diff = Shape::Difference(Box::new(a), Box::new(b), 0.0);
         let (da, dr) = build(&diff);
@@ -258,7 +368,7 @@ proptest! {
     /// and every downstream offset and blend is subtly wrong.
     #[test]
     fn transform_preserves_the_metric(
-        s in arb_leaf(), scale in 0.3f32..3.0, t in (-5.0f32..5.0, -5.0f32..5.0, -5.0f32..5.0),
+        s in arb_leaf(true), scale in 0.3f32..3.0, t in (-5.0f32..5.0, -5.0f32..5.0, -5.0f32..5.0),
         pts in arb_points()
     ) {
         let (base_arena, base) = build(&s);
@@ -285,7 +395,7 @@ proptest! {
 
     /// An inward shell is always a subset of the solid it hollows.
     #[test]
-    fn shell_is_a_subset_of_its_child(s in arb_leaf(), t in 0.2f32..3.0, pts in arb_points()) {
+    fn shell_is_a_subset_of_its_child(s in arb_leaf(true), t in 0.2f32..3.0, pts in arb_points()) {
         let (ca, cr) = build(&s);
         let shelled = Shape::Shell(Box::new(s), t);
         let (sa, sr) = build(&shelled);
@@ -307,6 +417,14 @@ proptest! {
         prop_assert!(
             generated.params.iter().all(|v| v.is_finite()),
             "non-finite parameter for {s:?}"
+        );
+        // A mesh has no shader form yet, and the one thing that must not happen
+        // is that it goes missing without saying so.
+        prop_assert_eq!(
+            generated.is_complete(),
+            !contains_mesh(&s),
+            "unsupported nodes misreported for {:?}",
+            s
         );
         let module = naga::front::wgsl::parse_str(src)
             .unwrap_or_else(|e| panic!("WGSL parse failed: {e:?}\n{src}"));

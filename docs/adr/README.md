@@ -9,6 +9,8 @@ revisited on its merits rather than rediscovered by accident.
 | [0002](0002-rust.md) | Write everything in Rust | accepted |
 | [0003](0003-command-log.md) | All mutation flows through an id-explicit command log | accepted |
 | [0004](0004-selection-by-seam.md) | Selection and filleting work on nodes and seams, not edges | accepted |
+| [0005](0005-derived-placements.md) | A placement records what it was derived from, and is regenerated on edit | accepted |
+| [0006](0006-sidecar-assets.md) | Imported geometry lives in sidecar binaries, not in the document | accepted |
 
 0001 is the load-bearing one; nearly everything else follows from it. If you are
 about to contradict a record, write the next one rather than quietly diverging.

@@ -48,6 +48,29 @@ pub struct Generated {
     pub source: String,
     /// Values for the `sc_params` storage buffer, in binding order.
     pub params: Vec<f32>,
+    /// Nodes the shader does not represent, in the order they were reached.
+    ///
+    /// **A non-empty list means `source` is not the model.** Those nodes emit
+    /// empty space, so anything that displays the shader without checking this
+    /// shows a part with a piece missing and no indication that it is missing.
+    /// Check it and refuse to display, or fall back to the CPU field.
+    ///
+    /// Today this is only [`Node::Mesh`]: a voxel grid is megabytes of samples
+    /// and belongs in a texture the shader reads, not in generated source text,
+    /// and that GPU path is not built yet. [`generate`] cannot return an error
+    /// because the viewport regenerates on every structural edit and has nowhere
+    /// to put one, so the fact is reported alongside the source instead of being
+    /// swallowed. [`try_generate`] is the same thing as a `Result` for callers
+    /// that can refuse.
+    pub unsupported: Vec<NodeId>,
+}
+
+impl Generated {
+    /// Whether the shader faithfully represents the whole model.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.unsupported.is_empty()
+    }
 }
 
 /// Emits a module exposing `sc_sdf` and `sc_selected`, plus the values they read.
@@ -60,6 +83,23 @@ pub fn generate(arena: &Arena, root: Option<NodeId>) -> Generated {
     // always calls it, and one empty function is cheaper than two shader
     // variants.
     compose(arena, &[("sc_sdf", root), ("sc_selected", None)])
+}
+
+/// As [`generate`], but refuses a model the shader cannot represent.
+///
+/// # Errors
+/// [`GeomError::NotInShader`] naming the first offending node, so a caller that
+/// has somewhere to report an error is not left inspecting
+/// [`Generated::unsupported`] by hand.
+pub fn try_generate(arena: &Arena, root: Option<NodeId>) -> crate::Result<Generated> {
+    let generated = generate(arena, root);
+    match generated.unsupported.first() {
+        None => Ok(generated),
+        Some(&node) => Err(crate::GeomError::NotInShader {
+            node,
+            kind: arena.get(node).map_or("dead", Node::kind),
+        }),
+    }
 }
 
 /// As [`generate`], plus a second field covering only the selected subtree.
@@ -91,6 +131,7 @@ fn compose(arena: &Arena, fields: &[(&str, Option<NodeId>)]) -> Generated {
         counter: 0,
         memo: HashMap::new(),
         params: Vec::new(),
+        unsupported: Vec::new(),
     };
 
     let mut functions = String::new();
@@ -122,6 +163,7 @@ fn compose(arena: &Arena, fields: &[(&str, Option<NodeId>)]) -> Generated {
     Generated {
         source,
         params: e.params,
+        unsupported: e.unsupported,
     }
 }
 
@@ -139,6 +181,8 @@ struct Emitter<'a> {
     memo: HashMap<(NodeId, String), String>,
     /// Values hoisted out of the source, in binding order.
     params: Vec<f32>,
+    /// Nodes that had to be emitted as empty space.
+    unsupported: Vec<NodeId>,
 }
 
 impl Emitter<'_> {
@@ -185,6 +229,7 @@ impl Emitter<'_> {
         };
 
         let d = match node {
+            Node::Mesh { asset, .. } => self.emit_unsupported(id, asset),
             Node::Sphere { .. }
             | Node::Box { .. }
             | Node::Cylinder { .. }
@@ -197,7 +242,24 @@ impl Emitter<'_> {
         d
     }
 
-    /// Closed-form distance functions. Each is exact, not merely a bound.
+    /// Emits empty space for a node the shader cannot express, and records it.
+    ///
+    /// Empty space is the only thing that can be emitted here: the function has
+    /// to return a distance and the module has to compile, since a shader that
+    /// fails to build reaches the user as an opaque driver error. What must not
+    /// happen is that it does so quietly, hence [`Generated::unsupported`] and a
+    /// comment naming the node in the source itself.
+    fn emit_unsupported(&mut self, id: NodeId, asset: crate::sdf::AssetId) -> String {
+        if !self.unsupported.contains(&id) {
+            self.unsupported.push(id);
+        }
+        let d = self.fresh("d");
+        self.line(&format!(
+            "let {d} = 1e30; // sc-geom: {id} is a mesh ({asset}); no GPU path yet"
+        ));
+        d
+    }
+
     /// Closed-form distance functions. Each is exact, not merely a bound.
     fn emit_primitive(&mut self, node: &Node, p: &str) -> String {
         match *node {
@@ -306,7 +368,7 @@ impl Emitter<'_> {
                 self.combine("max", "sc_smax", &da, &db, smooth)
             }
 
-            Node::Transform { child, xform } => self.emit_transform(child, &xform, p),
+            Node::Transform { child, xform, .. } => self.emit_transform(child, &xform, p),
 
             Node::Offset { child, distance } => {
                 let dc = self.emit(child, p);
@@ -324,6 +386,15 @@ impl Emitter<'_> {
                 self.counter += 1;
                 let name = format!("sc_extrude_{}", self.counter);
                 self.emit_extrude_fn(&name, profile, depth);
+                let d = self.fresh("d");
+                self.line(&format!("let {d} = {name}({p});"));
+                d
+            }
+
+            Node::Prism { ref profile } => {
+                self.counter += 1;
+                let name = format!("sc_prism_{}", self.counter);
+                self.emit_prism_fn(&name, profile);
                 let d = self.fresh("d");
                 self.line(&format!("let {d} = {name}({p});"));
                 d
@@ -348,7 +419,35 @@ impl Emitter<'_> {
     /// bound, while the vertices come from the parameter buffer, so dragging a
     /// dimension does not recompile anything.
     fn emit_extrude_fn(&mut self, name: &str, profile: &crate::Profile, depth: f32) {
-        let plane = match profile {
+        let plane = self.emit_profile_block(profile);
+        let h = self.p(depth);
+        let _ = write!(
+            self.helpers,
+            "\nfn {name}(p: vec3<f32>) -> f32 {{
+{plane}    let slab = max(-p.z, p.z - {h});
+    return min(max(plane, slab), 0.0) + length(max(vec2<f32>(plane, slab), vec2<f32>(0.0)));
+}}\n"
+        );
+    }
+
+    /// A prism is the profile distance and nothing else: no slab term, because
+    /// the sweep has no end to be inside or outside of.
+    fn emit_prism_fn(&mut self, name: &str, profile: &crate::Profile) {
+        let plane = self.emit_profile_block(profile);
+        let _ = write!(
+            self.helpers,
+            "\nfn {name}(p: vec3<f32>) -> f32 {{
+{plane}    return plane;
+}}\n"
+        );
+    }
+
+    /// WGSL binding `plane` to the signed distance from `p.xy` to the profile.
+    ///
+    /// Shared by the two swept nodes, so a fix to the polygon winding rule or
+    /// the rounded-rectangle form lands in both.
+    fn emit_profile_block(&mut self, profile: &crate::Profile) -> String {
+        match profile {
             crate::Profile::Rect { width, height } => {
                 let (hw, hh) = (self.p(width * 0.5), self.p(height * 0.5));
                 format!(
@@ -388,16 +487,7 @@ impl Emitter<'_> {
 "
                 )
             }
-        };
-
-        let h = self.p(depth);
-        let _ = write!(
-            self.helpers,
-            "\nfn {name}(p: vec3<f32>) -> f32 {{
-{plane}    let slab = max(-p.z, p.z - {h});
-    return min(max(plane, slab), 0.0) + length(max(vec2<f32>(plane, slab), vec2<f32>(0.0)));
-}}\n"
-        );
+        }
     }
 
     /// Peephole: a placement is usually a pure translation, and the identity

@@ -21,7 +21,9 @@ always an enclosing `Transform`, so there is exactly one way to express it.
 | `Cylinder` | `radius`, `half_height`, `round` | Capped, along +Z |
 | `Torus` | `major`, `minor` | In the XY plane, axis along Z |
 | `Plane` | `normal`, `offset` | Half-space. Unbounded |
+| `Mesh` | none | An imported triangle mesh, voxelized to a signed distance grid at import |
 | `Extrude` | `profile`, `height` | Closed polygon in local XY swept from z = 0 to z = `height` |
+| `Prism` | `profile` | The same profile swept without end along Z. Unbounded, so only meaningful as the tool of a difference or an intersection. How a through cut is expressed: an end condition rather than a measurement, so growing the part cannot close the hole |
 | `Union` | `a`, `b`, `smooth` | `smooth` is a blend radius in millimetres |
 | `Difference` | `a`, `b`, `smooth` | `a` minus `b` |
 | `Intersection` | `a`, `b`, `smooth` | |
@@ -37,6 +39,27 @@ needs no rebuild, and can be dragged in real time.
 
 The consequence is that a blend applies wherever the two shapes meet. You cannot
 fillet three of a box's twelve edges; there are no edges to select.
+
+### An imported mesh is a field like any other
+
+`Mesh` carries a voxel grid of samples, read back by trilinear interpolation, so
+booleans, shells, offsets and blends work on an imported STL without knowing it
+was ever triangles. The grid is megabytes, so it lives beside the document as an
+asset and the node holds an `AssetId` and a shared handle to the resolved grid.
+Evaluation takes no asset context: the document resolves the id at load, and a
+node whose grid is still the unresolved placeholder fails `is_valid` rather than
+rendering as empty space.
+
+It is the one node whose field is an approximation. It agrees with the true
+distance to within the interpolation error, its gradient can reach `sqrt(3)` at a
+kink, and outside the grid it returns a lower bound built from the distance to
+the grid box and the boundary sample. That bound is only sound if the voxelizer
+pads the grid so the surface stays two voxels clear of every face, which is a
+documented precondition of `Grid`.
+
+There is no WGSL for a mesh yet. Codegen reports it in `Generated::unsupported`
+instead of quietly emitting empty space; `wgsl::try_generate` turns that into an
+error.
 
 ### Uniform scale only
 
@@ -62,7 +85,9 @@ a single bad evaluation can make a whole model vanish.
 by at most `t`. This is the defining property of a signed distance field and the
 reason sphere tracing terminates: the renderer steps by exactly the distance the
 field reports, so a violation lets a ray step straight through a surface. The
-strict test excludes smooth blends, which deliberately under-report.
+strict test excludes smooth blends, which deliberately under-report, and
+imported meshes, where trilinear interpolation of a sampled field reaches a
+gradient of `sqrt(3)` at a kink.
 
 **Bounds never under-report.** `bounds()` may be loose but must never exclude
 solid material, because too-small bounds silently clip geometry out of an export.

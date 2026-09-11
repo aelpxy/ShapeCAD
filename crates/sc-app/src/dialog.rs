@@ -128,14 +128,14 @@ impl FileBrowser {
                 ui.label(
                     RichText::new(self.directory.display().to_string())
                         .size(12.0)
-                        .color(theme::TEXT_DIM),
+                        .color(theme::palette().text_dim),
                 );
             });
             ui.add_space(8.0);
 
             let (dirs, files) = self.entries();
             egui::Frame::new()
-                .fill(theme::SURFACE_ALT)
+                .fill(theme::palette().surface_alt)
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
@@ -148,7 +148,7 @@ impl FileBrowser {
                                 ui.label(
                                     RichText::new("Nothing here")
                                         .size(12.0)
-                                        .color(theme::TEXT_DIM),
+                                        .color(theme::palette().text_dim),
                                 );
                             }
                             for dir in dirs {
@@ -172,7 +172,11 @@ impl FileBrowser {
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Name").size(12.0).color(theme::TEXT_DIM));
+                ui.label(
+                    RichText::new("Name")
+                        .size(12.0)
+                        .color(theme::palette().text_dim),
+                );
                 ui.add_sized(
                     Vec2::new(ui.available_width() - 180.0, 28.0),
                     egui::TextEdit::singleline(&mut self.filename),

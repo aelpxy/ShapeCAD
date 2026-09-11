@@ -34,6 +34,12 @@ struct ScCamera {
     up: vec4<f32>,
     // xyz = forward vector, w = angular size of one pixel in radians
     forward: vec4<f32>,
+    // Scene colours, so the viewport follows the interface palette rather than
+    // keeping a second one of its own. xyz each; w unused.
+    sky: vec4<f32>,
+    haze: vec4<f32>,
+    plate: vec4<f32>,
+    grid: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> cam: ScCamera;
@@ -105,9 +111,7 @@ fn soft_shadow(origin: vec3<f32>, dir: vec3<f32>, far: f32, bias: f32) -> f32 {
 fn background(ndc: vec2<f32>) -> vec3<f32> {
     // A soft studio sweep: brighter toward the horizon, cooler above.
     let v = ndc.y * 0.5 + 0.5;
-    let top = vec3<f32>(0.700, 0.735, 0.790);
-    let bottom = vec3<f32>(0.930, 0.943, 0.962);
-    return mix(bottom, top, smoothstep(0.0, 1.0, v));
+    return mix(cam.haze.xyz, cam.sky.xyz, smoothstep(0.0, 1.0, v));
 }
 
 // One axis of grid lines, antialiased by the screen-space derivative so the
@@ -125,8 +129,8 @@ fn ground(p: vec3<f32>, dist: f32, far: f32) -> vec3<f32> {
     let axis_x = 1.0 - min(abs(p.y) / max(fwidth(p.y), 1.0e-6), 1.0);
     let axis_y = 1.0 - min(abs(p.x) / max(fwidth(p.x), 1.0e-6), 1.0);
 
-    var base = vec3<f32>(0.895, 0.910, 0.930);
-    base = mix(base, vec3<f32>(0.66, 0.69, 0.73), max(minor, major));
+    var base = cam.plate.xyz;
+    base = mix(base, cam.grid.xyz, max(minor, major));
     base = mix(base, vec3<f32>(0.78, 0.36, 0.36), axis_x * 0.8);
     base = mix(base, vec3<f32>(0.40, 0.62, 0.40), axis_y * 0.8);
 

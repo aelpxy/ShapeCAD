@@ -97,3 +97,18 @@ pub enum Effect {
         name: Option<String>,
     },
 }
+
+impl Effect {
+    /// The node this effect carries, if it carries one.
+    ///
+    /// These are the copies that keep a deleted node's geometry alive for undo,
+    /// so anything asking what a session still depends on has to look here as
+    /// well as in the arena.
+    #[must_use]
+    pub fn node(&self) -> Option<&Node> {
+        match self {
+            Effect::Create { node, .. } | Effect::Replace { node, .. } => Some(node),
+            Effect::Destroy { .. } | Effect::SetRoot { .. } | Effect::SetName { .. } => None,
+        }
+    }
+}

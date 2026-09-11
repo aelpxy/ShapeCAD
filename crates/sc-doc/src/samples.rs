@@ -43,6 +43,7 @@ pub fn bracket() -> Document {
         Node::Transform {
             child: wall,
             xform: Transform::from_translation(Vec3::new(0.0, 17.0, 15.0)),
+            on: None,
         },
     )
     .unwrap();
@@ -75,6 +76,7 @@ pub fn bracket() -> Document {
             Node::Transform {
                 child: drill,
                 xform: Transform::from_translation(Vec3::new(x, 0.0, 0.0)),
+                on: None,
             },
         )
         .unwrap();
@@ -97,6 +99,7 @@ pub fn bracket() -> Document {
         Node::Transform {
             child: part,
             xform: Transform::from_translation(Vec3::new(0.0, 0.0, 3.0)),
+            on: None,
         },
     )
     .unwrap();

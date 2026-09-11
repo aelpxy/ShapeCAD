@@ -8,20 +8,44 @@
 //! The edit log is deliberately *not* saved. It grows without bound, whereas the
 //! arena is proportional to the model. Undo history is a property of a session,
 //! not of a part.
+//!
+//! Voxel grids are the one thing that is not in the JSON. They are megabytes of
+//! binary and would cost the format both of the properties it was chosen for, so
+//! they live in a sidecar directory beside the document and the JSON references
+//! them by id. See [`crate::asset`].
 
-use crate::{DocError, Document};
+use crate::asset::{AssetError, AssetStore};
+use crate::{AttachError, DocError, Document};
 use sc_geom::{Arena, NodeId};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Bumped whenever the on-disk shape changes incompatibly.
 ///
 /// Version 2 made an extrusion's profile parametric. A rectangle is now a width
 /// and a height rather than four points, which an older build cannot read.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// Version 3 added mesh nodes, which name a voxel grid stored in the sidecar
+/// directory beside the document. An older build cannot evaluate one, and would
+/// not know to look for the directory either.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Conventional file extension, without the dot.
 pub const EXTENSION: &str = "shapecad";
+
+/// Extension of the sidecar directory, without the dot.
+pub const ASSET_DIR_EXTENSION: &str = "assets";
+
+/// The sidecar directory belonging to a document path: `part.shapecad` keeps its
+/// grids in `part.assets`.
+///
+/// Derived from the path rather than recorded in the file, so moving or renaming
+/// the pair keeps them associated and no absolute path is ever baked into a
+/// document.
+#[must_use]
+pub fn sidecar_dir(path: &Path) -> PathBuf {
+    path.with_extension(ASSET_DIR_EXTENSION)
+}
 
 /// The serialised form of a document.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,6 +76,12 @@ pub enum FileError {
     UnsupportedVersion(u32),
     /// The file parsed but describes an inconsistent model.
     Invalid(DocError),
+    /// The sidecar directory could not be read or written.
+    Asset(AssetError),
+    /// A mesh node was left without its geometry. Reported rather than handed
+    /// back, because a document containing a placeholder is silently empty where
+    /// it should be solid.
+    Unresolved(AttachError),
 }
 
 impl std::fmt::Display for FileError {
@@ -66,6 +96,8 @@ impl std::fmt::Display for FileError {
                 )
             }
             FileError::Invalid(e) => write!(f, "document is inconsistent: {e}"),
+            FileError::Asset(e) => write!(f, "geometry sidecar: {e}"),
+            FileError::Unresolved(e) => write!(f, "missing imported geometry: {e}"),
         }
     }
 }
@@ -113,6 +145,10 @@ impl Document {
             arena,
             root: file.root,
             names,
+            // Every mesh node in a freshly parsed snapshot holds a placeholder;
+            // `attach_assets` is what makes them real, and it brings the store
+            // with it.
+            assets: AssetStore::new(),
             entries: Vec::new(),
             cursor: 0,
             step: 0,
@@ -121,24 +157,62 @@ impl Document {
     }
 }
 
-/// Writes a document to `path` as pretty-printed JSON.
+/// Writes a document to `path` as pretty-printed JSON, with its voxel grids in
+/// the sidecar directory beside it.
+///
+/// The assets always follow the document. Saving to a new path writes a full
+/// copy of the sidecar directory there rather than referring back to the old
+/// one, because a document that pointed at grids somewhere else would break the
+/// moment either copy moved, and a saved file that cannot be opened on its own
+/// is not a saved file. The cost is that a save-as rewrites every grid, which
+/// for a part carrying a few large imports is the slowest thing the application
+/// does.
+///
+/// Only assets a live node references are written, and files for assets no
+/// longer referenced are removed afterwards. A document with no imported meshes
+/// produces exactly one file and no directory.
+///
+/// The order matters: grids are added first, then the document, then the dead
+/// grids are removed. Nothing the document on disk refers to is ever deleted
+/// before its replacement is in place, so a save that fails part way through
+/// leaves the previous document openable.
 ///
 /// # Errors
-/// [`FileError::Io`] or [`FileError::Parse`] on failure.
+/// [`FileError::Io`], [`FileError::Parse`] or [`FileError::Asset`] on failure.
 pub fn save(doc: &Document, path: &Path) -> Result<(), FileError> {
     let text = serde_json::to_string_pretty(&doc.snapshot()).map_err(FileError::Parse)?;
-    std::fs::write(path, text).map_err(FileError::Io)
+    let dir = sidecar_dir(path);
+    let referenced = doc.referenced_assets();
+
+    doc.assets()
+        .write_dir(&dir, &referenced)
+        .map_err(FileError::Asset)?;
+    std::fs::write(path, text).map_err(FileError::Io)?;
+    AssetStore::prune_dir(&dir, &referenced).map_err(FileError::Asset)
 }
 
-/// Reads a document from `path`.
+/// Reads a document from `path`, together with any grids it references.
+///
+/// A file with no mesh nodes needs no sidecar directory, and the absence of one
+/// is therefore not an error. That is what keeps version 2 documents, which
+/// cannot contain a mesh node, loading unchanged.
 ///
 /// # Errors
-/// [`FileError`] for any I/O, parse, version or consistency problem.
+/// [`FileError`] for any I/O, parse, version or consistency problem, including
+/// [`FileError::Unresolved`] if a mesh node's grid never arrived.
 pub fn open(path: &Path) -> Result<Document, FileError> {
     let text = std::fs::read_to_string(path).map_err(FileError::Io)?;
     let file: DocumentFile = serde_json::from_str(&text).map_err(FileError::Parse)?;
     if file.format > FORMAT_VERSION {
         return Err(FileError::UnsupportedVersion(file.format));
     }
-    Document::from_snapshot(file).map_err(FileError::Invalid)
+    let mut doc = Document::from_snapshot(file).map_err(FileError::Invalid)?;
+
+    let required = doc.referenced_assets();
+    if required.is_empty() {
+        return Ok(doc);
+    }
+    let store = AssetStore::read_dir(&sidecar_dir(path), &required).map_err(FileError::Asset)?;
+    doc.attach_assets(store).map_err(FileError::Unresolved)?;
+    Ok(doc)
 }

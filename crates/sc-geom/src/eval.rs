@@ -66,13 +66,19 @@ pub fn eval(arena: &Arena, id: NodeId, p: Vec3) -> f32 {
 
         Node::Plane { normal, offset } => p.dot(normal.normalize()) - offset,
 
+        // Trilinear inside the grid, and a lower bound on the true distance
+        // outside it. See [`Grid::sample`](crate::sdf::Grid::sample): this is
+        // the one node whose field is an approximation rather than an exact
+        // distance, bounded by the voxel spacing chosen at import.
+        Node::Mesh { ref grid, .. } => grid.sample(p),
+
         Node::Union { a, b, smooth } => smin(eval(arena, a, p), eval(arena, b, p), smooth),
 
         Node::Difference { a, b, smooth } => smax(eval(arena, a, p), -eval(arena, b, p), smooth),
 
         Node::Intersection { a, b, smooth } => smax(eval(arena, a, p), eval(arena, b, p), smooth),
 
-        Node::Transform { child, xform } => {
+        Node::Transform { child, xform, .. } => {
             xform.apply_distance(eval(arena, child, xform.inverse_point(p)))
         }
 
@@ -81,6 +87,10 @@ pub fn eval(arena: &Arena, id: NodeId, p: Vec3) -> f32 {
         // A profile swept along +Z. Combining the in-plane distance with the
         // slab distance this way keeps the result exact rather than merely
         // bounding, which matters for offsets and blends applied on top.
+        // No z term at all: that is what "without end" means, and it makes the
+        // prism the cheapest node in the kernel rather than the dearest.
+        Node::Prism { ref profile } => profile.distance(Vec2::new(p.x, p.y)),
+
         Node::Extrude { ref profile, depth } => {
             let plane = profile.distance(Vec2::new(p.x, p.y));
             let slab = (-p.z).max(p.z - depth);

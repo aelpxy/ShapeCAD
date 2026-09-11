@@ -72,6 +72,12 @@ fn showcase_subject(state: &AppState) -> Option<sc_geom::NodeId> {
 /// Builds the document and camera a scene asks for.
 fn pose(scene: Scene) -> AppState {
     let mut state = AppState::new();
+    // The capture sets the palette directly, so the switch has to be told what
+    // it is showing or it would report the wrong one.
+    state.settings.appearance = match crate::theme::scheme() {
+        crate::theme::Scheme::Dark => crate::settings::Appearance::Dark,
+        crate::theme::Scheme::Light => crate::settings::Appearance::Light,
+    };
     match scene {
         // Hover changes where the pointer is, not what the document holds.
         Scene::Empty | Scene::Hover => {}
@@ -131,7 +137,7 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scen
     };
 
     let generated = state.wgsl();
-    let field = Renderer::new(&device, &queue, capture::FORMAT, &generated);
+    let mut field = Renderer::new(&device, &queue, capture::FORMAT, &generated);
     let mut egui_renderer = egui_wgpu::Renderer::new(
         &device,
         capture::FORMAT,
@@ -149,9 +155,15 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scen
     // entire UI.
     let mut chrome = crate::ui::Chrome::default();
     let mut output = None;
-    // A tooltip only appears after the pointer has rested on a widget, and its
-    // Area then needs its own sizing pass, so the hover capture runs longer.
-    let passes = if scene == Scene::Hover { 8 } else { 3 };
+    // Enough passes for every spring to come to rest. The interface animates
+    // with springs, and the integrator clamps a frame to a thirtieth of a second
+    // however much virtual time a pass claims to cover, so settling the slowest
+    // tuning takes roughly twenty passes. Three of them caught the context menu
+    // a third of the way through growing: half transparent and slightly small.
+    //
+    // A tooltip needs a few of these anyway, to rest on the widget and then have
+    // its own Area sized.
+    let passes = 24;
     for pass in 0..passes {
         // Time has to advance between passes or egui's animations never run:
         // a modal would be captured mid fade-in, half transparent.
@@ -184,6 +196,7 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scen
     };
 
     let image = capture::capture(&device, &queue, width, height, |encoder, view| {
+        field.set_scene(crate::theme::scene());
         field.draw_in(
             &queue,
             encoder,

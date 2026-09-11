@@ -37,6 +37,14 @@ pub enum GeomError {
     },
     /// Tried to recreate a node at an id that is currently live.
     SlotOccupied(NodeId),
+    /// The node has no representation in generated WGSL, so the shader would
+    /// show the model with that piece missing.
+    NotInShader {
+        /// The node that cannot be emitted.
+        node: NodeId,
+        /// Its kind, as reported by [`Node::kind`](crate::node::Node::kind).
+        kind: &'static str,
+    },
 }
 
 impl std::fmt::Display for GeomError {
@@ -54,6 +62,9 @@ impl std::fmt::Display for GeomError {
                 write!(f, "cannot delete {node}: still referenced by {by}")
             }
             GeomError::SlotOccupied(id) => write!(f, "node {id} is already live"),
+            GeomError::NotInShader { node, kind } => {
+                write!(f, "{kind} node {node} cannot be expressed in a shader")
+            }
         }
     }
 }

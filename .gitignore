@@ -2,3 +2,10 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Agent worktrees, created in-tree by the coding harness.
+.claude/worktrees/
+
+# The app's default save name. Real documents are meant to be tracked: the format
+# is plain JSON precisely so it diffs in version control.
+/untitled.shapecad

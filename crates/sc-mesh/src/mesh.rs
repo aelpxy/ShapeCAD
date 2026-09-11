@@ -59,10 +59,77 @@ impl Topology {
 }
 
 impl Mesh {
+    /// Builds an indexed mesh from a triangle soup, welding bit-identical
+    /// vertices and recomputing normals.
+    ///
+    /// STL has no vertex sharing at all, so a file of `n` triangles arrives as
+    /// `3n` positions of which roughly `n/2` are distinct. Welding them is what
+    /// lets [`Mesh::topology`] say anything useful about an imported file, and
+    /// it shrinks the BVH the voxelizer builds over the result.
+    ///
+    /// Welding is exact rather than tolerance-based. A tolerance would need a
+    /// spatial structure and would silently collapse genuinely thin features;
+    /// every writer that emits a shared vertex emits the same bits for it.
+    ///
+    /// # Panics
+    /// If welding produces more than `u32::MAX` distinct vertices, which needs
+    /// an input of over four billion triangles.
+    #[must_use]
+    pub fn from_triangles(triangles: &[[Vec3; 3]]) -> Self {
+        let mut mesh = Self {
+            positions: Vec::new(),
+            normals: Vec::new(),
+            indices: Vec::with_capacity(triangles.len()),
+        };
+        let mut seen: HashMap<[u32; 3], u32> = HashMap::new();
+        for tri in triangles {
+            let mut face = [0u32; 3];
+            for (slot, &p) in face.iter_mut().zip(tri.iter()) {
+                // Negative zero and positive zero are the same point but not
+                // the same bits, so fold one onto the other before hashing.
+                let p = p + Vec3::ZERO;
+                let key = [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+                *slot = *seen.entry(key).or_insert_with(|| {
+                    mesh.positions.push(p);
+                    u32::try_from(mesh.positions.len() - 1).expect("vertex count fits in u32")
+                });
+            }
+            mesh.indices.push(face);
+        }
+        mesh.recompute_normals();
+        mesh
+    }
+
     /// Number of triangles.
     #[must_use]
     pub fn triangle_count(&self) -> usize {
         self.indices.len()
+    }
+
+    /// Replaces `normals` with the area-weighted average of the incident face
+    /// normals.
+    ///
+    /// Imported files either carry no normals at all (OBJ without `vn`) or
+    /// carry per-face normals that a writer may have got wrong, so an importer
+    /// recomputes rather than trusts. Weighting by the cross product length
+    /// rather than normalizing first means a sliver triangle does not pull a
+    /// vertex normal around as hard as a large one.
+    pub fn recompute_normals(&mut self) {
+        self.normals = vec![Vec3::ZERO; self.positions.len()];
+        for &[a, b, c] in &self.indices {
+            let (pa, pb, pc) = (
+                self.positions[a as usize],
+                self.positions[b as usize],
+                self.positions[c as usize],
+            );
+            let n = (pb - pa).cross(pc - pa);
+            for i in [a, b, c] {
+                self.normals[i as usize] += n;
+            }
+        }
+        for n in &mut self.normals {
+            *n = n.normalize_or_zero();
+        }
     }
 
     /// Bounding box of the vertices.

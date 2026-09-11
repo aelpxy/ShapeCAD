@@ -30,6 +30,9 @@ pub(crate) enum Icon {
     Download,
     Frame,
     Cursor,
+    Sun,
+    Moon,
+    Monitor,
     Layers,
     Plane,
     Union,
@@ -280,6 +283,30 @@ fn action_glyph(pen: &Pen<'_>, icon: Icon) -> bool {
 /// Viewport furniture: the pointer, the framing control, the stack of bodies.
 fn view_glyph(pen: &Pen<'_>, icon: Icon) -> bool {
     match icon {
+        Icon::Sun => {
+            pen.circle(12.0, 12.0, 4.2);
+            // Eight rays on the diagonals and axes, drawn as short segments so
+            // they keep the 2px stroke rather than tapering.
+            for i in 0..8 {
+                let a = std::f32::consts::TAU * i as f32 / 8.0;
+                let (s, c) = a.sin_cos();
+                pen.line(
+                    (12.0 + c * 7.2, 12.0 + s * 7.2),
+                    (12.0 + c * 9.8, 12.0 + s * 9.8),
+                );
+            }
+        }
+        Icon::Moon => {
+            // A crescent as two arcs rather than a filled shape, so it reads at
+            // the same weight as every other glyph.
+            pen.arc(12.0, 12.0, 9.0, 9.0, 0.6, 4.2);
+            pen.arc(15.5, 9.0, 8.4, 8.4, 1.9, 3.6);
+        }
+        Icon::Monitor => {
+            pen.rounded_rect(3.0, 4.0, 18.0, 12.0, 2.0);
+            pen.line((8.0, 20.0), (16.0, 20.0));
+            pen.line((12.0, 16.0), (12.0, 20.0));
+        }
         Icon::Cursor => {
             pen.path(
                 &[

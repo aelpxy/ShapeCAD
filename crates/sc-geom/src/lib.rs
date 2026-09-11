@@ -22,6 +22,7 @@ pub mod node;
 pub mod ops;
 pub mod pick;
 pub mod profile;
+pub mod sdf;
 pub mod wgsl;
 
 pub use arena::Arena;
@@ -34,6 +35,7 @@ pub use node::{Node, NodeId};
 pub use ops::Builder;
 pub use pick::{pick, Hit};
 pub use profile::Profile;
+pub use sdf::{AssetId, Grid};
 
 pub use glam;
 
@@ -341,6 +343,269 @@ mod tests {
         assert_ne!(h1, h2, "0.01mm change went unnoticed");
     }
 
+    /// A sphere of radius 3 sampled on a 25^3 grid of 0.5mm voxels, which leaves
+    /// the surface six voxels clear of every face.
+    fn sphere_mesh_node(asset: u32) -> Node {
+        let grid = Grid::from_fn([25; 3], Vec3::splat(-6.0), 0.5, |p| p.length() - 3.0);
+        assert!(
+            grid.boundary_clearance() >= Grid::REQUIRED_CLEARANCE as f32 * grid.spacing,
+            "test fixture does not meet the padding precondition"
+        );
+        Node::mesh(AssetId(asset), std::sync::Arc::new(grid))
+    }
+
+    #[test]
+    fn an_imported_mesh_booleans_against_modelled_geometry() {
+        // The whole point of voxelizing on import: the boolean does not know or
+        // care that one side of it came from a triangle mesh.
+        let mut b = Builder::new();
+        let imported = b.arena.insert(sphere_mesh_node(1)).unwrap();
+        let block = b.cuboid(Vec3::new(4.0, 1.0, 1.0)).unwrap();
+        let moved = b.translate(block, Vec3::new(5.0, 0.0, 0.0)).unwrap();
+        let joined = b.union(imported, moved).unwrap();
+
+        let analytic_union = |p: Vec3| {
+            let sphere = p.length() - 3.0;
+            let q = (p - Vec3::new(5.0, 0.0, 0.0)).abs() - Vec3::new(4.0, 1.0, 1.0);
+            let block = q.max(Vec3::ZERO).length() + q.max_element().min(0.0);
+            sphere.min(block)
+        };
+
+        for i in 0..80 {
+            let t = i as f32 / 79.0;
+            for p in [
+                Vec3::new(t * 12.0 - 4.0, 0.0, 0.0),
+                Vec3::new(t * 12.0 - 4.0, 0.7, -0.4),
+                Vec3::new(2.0, t * 8.0 - 4.0, 1.0),
+            ] {
+                let field = eval(&b.arena, joined, p);
+                let expected = analytic_union(p);
+                assert!(
+                    (field - expected).abs() <= 0.5,
+                    "at {p:?}: union field {field}, analytic {expected}"
+                );
+                // Inside a voxel of the surface the two may legitimately
+                // disagree on which side a point is; anywhere else they must
+                // not.
+                if expected.abs() > 0.5 {
+                    assert_eq!(
+                        field < 0.0,
+                        expected < 0.0,
+                        "at {p:?}: solid disagrees, {field} against {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_mesh_node_is_a_leaf_with_no_editable_parameters() {
+        let node = sphere_mesh_node(4);
+        assert_eq!(node.kind(), "mesh");
+        assert!(node.params().is_empty(), "a mesh has nothing to drag");
+        assert_eq!(node.children().count(), 0);
+        assert_eq!(node.mesh_resolution(), Some([25, 25, 25]));
+        let mut copy = node.clone();
+        assert!(
+            !copy.set_param("resolution", 64.0),
+            "resolution is read-only"
+        );
+        assert!(!copy.set_param("radius", 1.0));
+    }
+
+    #[test]
+    fn meshes_compare_by_identity_not_by_contents() {
+        // Two nodes over one import are the same node. Two imports that happen
+        // to hold identical samples are not, and neither comparison reads a
+        // single voxel.
+        let shared = std::sync::Arc::new(Grid::from_fn([5; 3], Vec3::splat(-2.0), 1.0, |p| {
+            p.length() - 1.0
+        }));
+        let one = Node::mesh(AssetId(1), shared.clone());
+        assert_eq!(one, Node::mesh(AssetId(1), shared.clone()));
+        assert_ne!(one, Node::mesh(AssetId(2), shared.clone()));
+
+        let identical_copy = std::sync::Arc::new((*shared).clone());
+        assert_eq!(*identical_copy, *shared, "the grids really are equal");
+        assert_ne!(
+            one,
+            Node::mesh(AssetId(1), identical_copy),
+            "equal contents must not make two imports one node"
+        );
+    }
+
+    #[test]
+    fn every_node_kind_equals_a_copy_of_itself() {
+        // `PartialEq` for `Node` is written out rather than derived, so a new
+        // variant can be forgotten and fall into the catch-all as unequal to
+        // itself. Nothing else in the kernel would notice.
+        let mut b = Builder::new();
+        let leaf = b.sphere(1.0).unwrap();
+        let profile = Profile::Circle { radius: 1.0 };
+        let nodes = vec![
+            Node::Sphere { radius: 1.0 },
+            Node::Box {
+                half: Vec3::ONE,
+                round: 0.1,
+            },
+            Node::Cylinder {
+                radius: 1.0,
+                half_height: 2.0,
+                round: 0.0,
+            },
+            Node::Torus {
+                major: 2.0,
+                minor: 0.5,
+            },
+            Node::Plane {
+                normal: Vec3::Z,
+                offset: 1.0,
+            },
+            sphere_mesh_node(9),
+            Node::Union {
+                a: leaf,
+                b: leaf,
+                smooth: 0.2,
+            },
+            Node::Difference {
+                a: leaf,
+                b: leaf,
+                smooth: 0.0,
+            },
+            Node::Intersection {
+                a: leaf,
+                b: leaf,
+                smooth: 0.3,
+            },
+            Node::Transform {
+                child: leaf,
+                xform: Transform::from_scale(2.0),
+                on: None,
+            },
+            Node::Offset {
+                child: leaf,
+                distance: 0.5,
+            },
+            Node::Extrude {
+                profile,
+                depth: 3.0,
+            },
+            Node::Shell {
+                child: leaf,
+                thickness: 1.0,
+            },
+        ];
+        for node in &nodes {
+            assert_eq!(
+                node,
+                &node.clone(),
+                "a {} is not equal to itself",
+                node.kind()
+            );
+        }
+        for (i, a) in nodes.iter().enumerate() {
+            for other in &nodes[i + 1..] {
+                assert_ne!(a, other, "{} equals a {}", a.kind(), other.kind());
+            }
+        }
+    }
+
+    #[test]
+    fn an_unresolved_mesh_is_refused_by_the_arena() {
+        let mut b = Builder::new();
+        let placeholder = Node::mesh(AssetId(0), std::sync::Arc::new(Grid::default()));
+        assert!(!placeholder.is_valid());
+        assert!(
+            b.arena.insert(placeholder).is_err(),
+            "an unresolved asset must not reach the renderer as empty space"
+        );
+    }
+
+    #[test]
+    fn the_geometry_hash_sees_the_voxels() {
+        let mut b = Builder::new();
+        let node = b.arena.insert(sphere_mesh_node(1)).unwrap();
+        let before = geometry_hash(&b.arena, node);
+
+        // Same asset id, same dimensions, one voxel different.
+        let Node::Mesh { asset, grid } = b.arena.get(node).unwrap().clone() else {
+            unreachable!("just inserted a mesh")
+        };
+        let mut edited = (*grid).clone();
+        edited.data[7000] -= 1.0;
+        b.arena
+            .replace(node, Node::mesh(asset, std::sync::Arc::new(edited)))
+            .unwrap();
+
+        let after = geometry_hash(&b.arena, node);
+        assert_ne!(
+            before.structure, after.structure,
+            "a changed voxel left the structure hash alone"
+        );
+    }
+
+    #[test]
+    fn codegen_reports_a_mesh_rather_than_quietly_dropping_it() {
+        let mut b = Builder::new();
+        let imported = b.arena.insert(sphere_mesh_node(3)).unwrap();
+        let solid = b.cube(1.0).unwrap();
+        let root = b.union(imported, solid).unwrap();
+
+        let generated = wgsl::generate(&b.arena, Some(root));
+        assert!(!generated.is_complete(), "the mesh was emitted silently");
+        assert_eq!(generated.unsupported, vec![imported]);
+        // Still a shader that compiles: a module that fails to build reaches the
+        // user as an opaque driver error, which is worse than a reported gap.
+        validate_wgsl(&generated.source);
+        assert!(generated.source.contains("no GPU path yet"));
+
+        match wgsl::try_generate(&b.arena, Some(root)) {
+            Err(GeomError::NotInShader { node, kind }) => {
+                assert_eq!(node, imported);
+                assert_eq!(kind, "mesh");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // A model without a mesh is unaffected.
+        assert!(wgsl::generate(&b.arena, Some(solid)).is_complete());
+        assert!(wgsl::try_generate(&b.arena, Some(solid)).is_ok());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_deserialized_mesh_is_a_placeholder_that_fails_validation() {
+        // The samples are not in the document, so what comes back is a stub the
+        // loader is expected to fill in from the sidecar asset.
+        let node = sphere_mesh_node(12);
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("\"asset\""), "{json}");
+        assert!(
+            !json.contains("grid"),
+            "the grid was written into the document: {json}"
+        );
+
+        let back: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind(), "mesh");
+        assert_eq!(back.mesh_resolution(), Some([0, 0, 0]));
+        assert!(back.mesh_grid().unwrap().is_placeholder());
+        assert!(
+            !back.is_valid(),
+            "an unresolved mesh passed validation and would render as nothing"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_grid_survives_a_round_trip_of_its_own() {
+        // Not through the document, which stores grids beside it, but the sidecar
+        // writer needs some serialisation and this pins that it is lossless.
+        let grid = Grid::from_fn([5, 6, 7], Vec3::splat(-2.0), 0.75, |p| p.length() - 1.0);
+        let back: Grid = serde_json::from_str(&serde_json::to_string(&grid).unwrap()).unwrap();
+        assert_eq!(grid, back);
+        assert_eq!(grid.digest(), back.digest());
+    }
+
     #[test]
     fn wgsl_generation_covers_every_node_kind() {
         let mut b = Builder::new();
@@ -469,6 +734,7 @@ mod tests {
                 Node::Transform {
                     child: s,
                     xform: Transform::from_scale(2.0),
+                    on: None,
                 },
             )
             .unwrap();

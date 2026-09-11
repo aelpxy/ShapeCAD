@@ -6,44 +6,13 @@
 
 use crate::dialog::{FileBrowser, Purpose};
 use crate::plane::SketchPlane;
-use crate::settings::Settings;
+use crate::settings::{Appearance, Settings};
 use sc_doc::{file, samples, Command, Document};
 use sc_geom::glam::Vec2;
 use sc_geom::glam::Vec3;
 use sc_geom::{Node, NodeId, Transform};
 use sc_render::{CameraRig, OrbitCamera};
 use std::path::{Path, PathBuf};
-
-/// A box's extent along a direction, measured from `origin`, as `(near, far)`.
-///
-/// Projects all eight corners, because the direction may point down any axis.
-fn span_along(bounds: sc_geom::Aabb, origin: Vec3, direction: Vec3) -> (f32, f32) {
-    let mut lo = f32::INFINITY;
-    let mut hi = f32::NEG_INFINITY;
-    for i in 0..8u32 {
-        let corner = Vec3::new(
-            if i & 1 == 0 {
-                bounds.min.x
-            } else {
-                bounds.max.x
-            },
-            if i & 2 == 0 {
-                bounds.min.y
-            } else {
-                bounds.max.y
-            },
-            if i & 4 == 0 {
-                bounds.min.z
-            } else {
-                bounds.max.z
-            },
-        );
-        let d = (corner - origin).dot(direction);
-        lo = lo.min(d);
-        hi = hi.max(d);
-    }
-    (lo, hi)
-}
 
 /// What the camera frames when there is nothing in the document.
 ///
@@ -114,9 +83,13 @@ pub(crate) struct AppState {
     /// When set, the sketch plane rides on the far face of this feature.
     ///
     /// Held as a node id rather than a coordinate, so changing the feature's
-    /// depth moves the plane and everything built on it. This is what an
-    /// attached work plane means here, and it needs no topological naming
-    /// because ids are stable.
+    /// depth moves the plane. It needs no topological naming because ids are
+    /// stable.
+    ///
+    /// This is the plane the *next* feature will be drawn on, and nothing more.
+    /// What keeps features already built on that face attached to it is the
+    /// derivation recorded in their placement, which [`Document::apply`]
+    /// regenerates; this field is forgotten as soon as the plane is detached.
     pub attached_to: Option<NodeId>,
     /// Sketch points snap to this spacing, in millimetres.
     ///
@@ -135,6 +108,8 @@ pub(crate) struct AppState {
     pub settings: Settings,
     /// The context menu, while one is open.
     pub menu: Option<ContextMenu>,
+    /// What the window system says the desktop's colour scheme is, if it says.
+    pub system_scheme: Option<crate::theme::Scheme>,
 }
 
 impl Default for AppState {
@@ -170,6 +145,7 @@ impl AppState {
             ui_scale: 1.0,
             settings: Settings::load(),
             menu: None,
+            system_scheme: None,
         }
     }
 
@@ -204,6 +180,37 @@ impl AppState {
     pub(crate) fn set_display(&mut self, name: Option<String>) {
         self.settings.display = name;
         self.settings.save();
+    }
+
+    /// Chooses light, dark, or the desktop's own setting, and remembers it.
+    ///
+    /// Sets `field_dirty` so the viewport picks up the new scene colours: they
+    /// live in the shader's uniform, so nothing repaints them until the frame is
+    /// rebuilt.
+    pub(crate) fn set_appearance(&mut self, appearance: Appearance) {
+        self.settings.appearance = appearance;
+        self.settings.save();
+        self.apply_appearance();
+    }
+
+    /// Resolves the preference against what the window system reports and puts
+    /// the resulting palette in force.
+    pub(crate) fn apply_appearance(&mut self) {
+        crate::theme::set_scheme(self.settings.appearance.resolve(self.system_scheme));
+        self.field_dirty = true;
+    }
+
+    /// Records what the desktop says its colour scheme is.
+    ///
+    /// `None` where the window system declines to answer, which on some Wayland
+    /// compositors it does. Following a setting nobody will state is not an
+    /// error, so the preference simply resolves to light there.
+    pub(crate) fn set_system_scheme(&mut self, scheme: Option<crate::theme::Scheme>) {
+        if self.system_scheme == scheme {
+            return;
+        }
+        self.system_scheme = scheme;
+        self.apply_appearance();
     }
 
     /// Changes interface zoom and remembers the choice.
@@ -493,7 +500,10 @@ impl AppState {
     /// long as it exists.
     pub(crate) fn add_pad(&mut self, profile: sc_geom::Profile, label: &str) {
         self.as_one_step(|s| {
-            let plane = s.plane;
+            // The sketch frame, not the datum plane: a pad dropped on an
+            // attached face belongs on that face, exactly like one drawn there
+            // by hand.
+            let frame = s.sketch_frame();
             let node = Node::Extrude {
                 profile,
                 depth: s.extrude_height,
@@ -502,7 +512,7 @@ impl AppState {
                 return;
             };
 
-            let Some(id) = s.place(extrude, plane.placement()) else {
+            let Some(id) = s.place(extrude, frame) else {
                 return;
             };
             s.apply(Command::SetName {
@@ -521,35 +531,22 @@ impl AppState {
     /// default is a hole all the way through rather than a blind recess. Its
     /// depth and position stay editable afterwards like any other feature.
     pub(crate) fn add_pocket(&mut self, profile: sc_geom::Profile, label: &str) {
-        /// Overshoot at each end, so the cut opens on both faces rather than
-        /// leaving a skin where it meets the surface exactly.
-        const MARGIN: f32 = 1.0;
-
         let Some(root) = self.doc.root() else {
             self.status = "Nothing to cut into yet".to_string();
             return;
         };
-        let Some(bounds) = self.doc.bounds() else {
-            return;
-        };
-
-        // Measured from the sketch plane's own origin, because the offset below
-        // is applied in the plane's frame. Using world coordinates here
-        // double-counts an attached plane's height.
-        let (near, far) = span_along(bounds, self.plane_origin(), self.plane_normal());
-        let start = near - MARGIN;
-        let depth = (far - near) + 2.0 * MARGIN;
 
         self.as_one_step(|s| {
-            let node = Node::Extrude { profile, depth };
+            // A prism rather than an extrusion sized to the model. "Through all"
+            // is an end condition, not a measurement: a cut sized from the part
+            // as it stands today silently becomes a blind recess the first time
+            // the part grows.
+            let node = Node::Prism { profile };
             let Some(cut) = s.apply(Command::Add { node }) else {
                 return;
             };
-            // Shift the cut back along the normal so it begins outside the
-            // material.
-            let frame =
-                Transform::from_translation(Vec3::new(0.0, 0.0, start)).then(&s.sketch_frame());
-            let Some(placed) = s.place(cut, frame) else {
+            let frame = s.sketch_frame();
+            let Some(placed) = s.place_offset(cut, Transform::IDENTITY, frame) else {
                 return;
             };
 
@@ -651,13 +648,7 @@ impl AppState {
     pub(crate) fn sketch_frame(&self) -> Transform {
         let attached = self.attached_to.and_then(|id| {
             let root = self.doc.root()?;
-            let placement = sc_geom::pick::placement_of(self.doc.arena(), root, id)?;
-            // The far face of an extrusion is at z = depth in its own frame.
-            let depth = match self.doc.arena().get(id)? {
-                Node::Extrude { depth, .. } => *depth,
-                _ => return None,
-            };
-            Some(Transform::from_translation(Vec3::new(0.0, 0.0, depth)).then(&placement))
+            sc_geom::pick::face_placement(self.doc.arena(), root, id)
         });
         attached.unwrap_or_else(|| self.plane.placement())
     }
@@ -688,10 +679,42 @@ impl AppState {
         Vec2::new(local.x, local.y)
     }
 
-    /// Wraps a node in a placement, unless the placement does nothing.
-    ///
-    /// An identity transform in the tree is noise, so the build plate adds none.
+    /// Wraps a node in a placement on the current sketch frame.
     fn place(&mut self, node: NodeId, frame: Transform) -> Option<NodeId> {
+        self.place_offset(node, Transform::IDENTITY, frame)
+    }
+
+    /// Wraps a node in a placement, unless the placement does nothing, and
+    /// records the face the frame came from.
+    ///
+    /// `local` is the feature's own offset within the sketch frame, which a
+    /// pocket uses to begin its cut outside the material. It is kept in a
+    /// placement of its own rather than folded into the frame, because
+    /// regeneration rewrites the derived placement wholesale: composed into one
+    /// node, the offset would be erased the next time the face moved.
+    ///
+    /// An identity transform in the tree is noise, so the build plate adds
+    /// none. A derived placement is kept even so: dropping it would drop the
+    /// dependency with it, and the feature would stop following its face.
+    fn place_offset(&mut self, node: NodeId, local: Transform, frame: Transform) -> Option<NodeId> {
+        let Some(on) = self.attached_to else {
+            // Nothing to regenerate, so the two halves can collapse into the
+            // single placement this has always produced.
+            return self.place_plain(node, local.then(&frame));
+        };
+        let inner = self.place_plain(node, local)?;
+        self.apply(Command::Add {
+            node: Node::Transform {
+                child: inner,
+                xform: frame,
+                on: Some(on),
+            },
+        })
+    }
+
+    /// A placement with no dependency behind it, skipped when it would be the
+    /// identity.
+    fn place_plain(&mut self, node: NodeId, frame: Transform) -> Option<NodeId> {
         if frame == Transform::IDENTITY {
             return Some(node);
         }
@@ -699,6 +722,7 @@ impl AppState {
             node: Node::Transform {
                 child: node,
                 xform: frame,
+                on: None,
             },
         })
     }
@@ -709,12 +733,169 @@ impl AppState {
             self.status = "Select a pad to sketch on first".to_string();
             return;
         };
-        if !matches!(self.doc.arena().get(id), Some(Node::Extrude { .. })) {
-            self.status = "Only a pad's face can be sketched on for now".to_string();
+        let Some(pad) = self.attachable_face(id) else {
+            self.status = "That selection has no single pad face to sketch on".to_string();
+            return;
+        };
+        self.attached_to = Some(pad);
+        self.status = "Sketching on the face of that pad".to_string();
+    }
+
+    /// Moves the selection, keeping any attachment it has.
+    ///
+    /// A derived placement belongs to regeneration, which rewrites it whole the
+    /// next time its face moves. So the move goes underneath it instead, in the
+    /// feature's own frame, which is the same place a pocket keeps the overshoot
+    /// that opens its bore. The feature still follows its face; it simply sits
+    /// somewhere else on it.
+    ///
+    /// That frame is also the one a user means. A pad attached to a face slides
+    /// across that face in x and y and lifts off it in z, rather than moving
+    /// along the world axes, which on an angled face would be unusable.
+    ///
+    /// Anything not attached is wrapped in a placement of its own, as before.
+    pub(crate) fn move_selection(&mut self, delta: Vec3) {
+        let Some(target) = self.selected else {
+            self.status = "Nothing selected".to_string();
+            return;
+        };
+        let derived = match self.doc.arena().get(target) {
+            Some(Node::Transform {
+                child, on: Some(_), ..
+            }) => Some(*child),
+            _ => None,
+        };
+        let Some(child) = derived else {
+            self.wrap_selection(
+                |child| Node::Transform {
+                    child,
+                    xform: Transform::from_translation(delta),
+                    on: None,
+                },
+                "Move",
+            );
+            return;
+        };
+        self.as_one_step(|s| {
+            s.slide_under(target, child, delta);
+            s.status = "Moved along the face it is attached to".to_string();
+        });
+    }
+
+    /// Adds `delta` to the local offset beneath a derived placement, creating
+    /// one if this is the first move.
+    ///
+    /// Accumulates rather than stacking a new node per move, so ten nudges leave
+    /// one offset in the tree instead of ten.
+    fn slide_under(&mut self, derived: NodeId, child: NodeId, delta: Vec3) {
+        if let Some(Node::Transform {
+            child: inner,
+            xform,
+            on: None,
+        }) = self.doc.arena().get(child).cloned()
+        {
+            let moved = Transform {
+                translation: xform.translation + delta,
+                ..xform
+            };
+            self.apply(Command::Replace {
+                id: child,
+                node: Node::Transform {
+                    child: inner,
+                    xform: moved,
+                    on: None,
+                },
+            });
             return;
         }
-        self.attached_to = Some(id);
-        self.status = "Sketching on the face of that pad".to_string();
+        let Some(offset) = self.apply(Command::Add {
+            node: Node::Transform {
+                child,
+                xform: Transform::from_translation(delta),
+                on: None,
+            },
+        }) else {
+            return;
+        };
+        let Some(Node::Transform { xform, on, .. }) = self.doc.arena().get(derived).cloned() else {
+            return;
+        };
+        self.apply(Command::Replace {
+            id: derived,
+            node: Node::Transform {
+                child: offset,
+                xform,
+                on,
+            },
+        });
+    }
+
+    /// Breaks a derived placement's link to the face it was built on.
+    ///
+    /// Deliberately explicit. Moving an attached feature keeps the attachment,
+    /// so the only way to stop one following its face is to say so, and the
+    /// resolved placement is kept exactly as it stands so nothing jumps at the
+    /// moment the link is cut.
+    pub(crate) fn detach_selection(&mut self) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let Some(Node::Transform {
+            child,
+            xform,
+            on: Some(_),
+        }) = self.doc.arena().get(id).cloned()
+        else {
+            self.status = "That is not attached to a face".to_string();
+            return;
+        };
+        self.apply(Command::Replace {
+            id,
+            node: Node::Transform {
+                child,
+                xform,
+                on: None,
+            },
+        });
+        self.status = "Detached; it will stay where it is now".to_string();
+    }
+
+    /// Whether the selection is a placement that follows a face.
+    #[must_use]
+    pub(crate) fn selection_is_attached(&self) -> bool {
+        self.selected
+            .and_then(|id| self.doc.arena().get(id))
+            .and_then(Node::derived_from)
+            .is_some()
+    }
+
+    /// The pad whose face a sketch would land on, given what is selected.
+    ///
+    /// A user selects what they can see, and what they can see is the finished
+    /// feature: the offset, shell or transform wrapping a pad rather than the
+    /// pad itself. Those each have exactly one child, so there is no question
+    /// which pad is underneath, and refusing to look through them greys the Face
+    /// button out while the pointer is on the very face it describes.
+    ///
+    /// Stops at a boolean. Both sides of a union have a face and nothing here
+    /// can tell which one was meant, so the honest answer is none.
+    #[must_use]
+    pub(crate) fn attachable_face(&self, id: NodeId) -> Option<NodeId> {
+        let mut at = id;
+        // Terminates because the arena refuses a cycle, so the walk is bounded
+        // by the depth of the tree.
+        loop {
+            let node = self.doc.arena().get(at)?;
+            if matches!(node, Node::Extrude { .. }) {
+                return Some(at);
+            }
+            let mut children = node.children();
+            let only = children.next()?;
+            if children.next().is_some() {
+                return None;
+            }
+            at = only;
+        }
     }
 
     /// Returns the sketch plane to a datum.
@@ -1560,6 +1741,7 @@ mod tests {
             |child| Node::Transform {
                 child,
                 xform: Transform::from_translation(Vec3::new(100.0, 0.0, 0.0)),
+                on: None,
             },
             "Move",
         );
@@ -1807,6 +1989,494 @@ mod tests {
             steps,
             "redo replayed only part of the action"
         );
+    }
+
+    /// A 40 by 30 base pad with a square boss sketched on its top face.
+    ///
+    /// Returns the state, the base extrusion and the boss extrusion, which are
+    /// the two nodes a dimension edit lands on.
+    fn base_with_a_boss(base_depth: f32, boss_depth: f32) -> (AppState, NodeId, NodeId) {
+        let mut state = AppState::new();
+        state.new_document();
+        state.extrude_height = base_depth;
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 40.0,
+                height: 30.0,
+            },
+            "Base",
+        );
+        let base = state.selected.expect("the base pad is selected");
+
+        state.select(Some(base));
+        state.attach_to_selection();
+        state.start_sketch();
+        for (x, y) in [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)] {
+            state.add_sketch_point(Vec2::new(x, y));
+        }
+        state.extrude_height = boss_depth;
+        state.finish_sketch();
+        let placed = state.selected.expect("the boss is selected");
+        let boss = extrude_under(&state, placed);
+        (state, base, boss)
+    }
+
+    /// The extrusion under a placement, which is what carries the depth.
+    fn extrude_under(state: &AppState, id: NodeId) -> NodeId {
+        match state.doc.arena().get(id) {
+            Some(Node::Extrude { .. }) => id,
+            Some(node) => node
+                .children()
+                .next()
+                .map(|c| extrude_under(state, c))
+                .expect("a placement has a child"),
+            None => panic!("{id} is not in the arena"),
+        }
+    }
+
+    fn solid_at_point(state: &AppState, p: Vec3) -> bool {
+        let root = state.doc.root().expect("rooted");
+        sc_geom::eval(state.doc.arena(), root, p) < 0.0
+    }
+
+    fn solid_at(state: &AppState, z: f32) -> bool {
+        solid_at_point(state, Vec3::new(0.0, 0.0, z))
+    }
+
+    fn z_span(state: &AppState) -> (f32, f32) {
+        let b = state.doc.bounds().expect("rooted");
+        (b.min.z, b.max.z)
+    }
+
+    /// A feature built on a face has to follow that face. Frozen at creation it
+    /// leaves the model in two disconnected pieces with a gap in between, and
+    /// nothing in the interface says so.
+    #[test]
+    fn an_attached_pad_follows_its_base() {
+        let (mut state, base, _boss) = base_with_a_boss(10.0, 5.0);
+        assert_eq!(z_span(&state), (0.0, 15.0), "the boss did not start on top");
+
+        state.apply(Command::SetParam {
+            id: base,
+            name: "depth".into(),
+            value: 4.0,
+        });
+
+        let (lo, hi) = z_span(&state);
+        assert!(
+            lo.abs() < 1.0e-3 && (hi - 9.0).abs() < 1.0e-3,
+            "the boss did not follow the face: stack spans {lo}..{hi}"
+        );
+        for z in [1.0, 3.9, 4.1, 6.0, 8.9] {
+            assert!(solid_at(&state, z), "gap in the stack at z={z}");
+        }
+    }
+
+    /// Derived placements chain: a boss on a boss on a base. Moving the base
+    /// moves the face the first boss sits on, which moves the face under the
+    /// second.
+    #[test]
+    fn a_chain_of_attached_features_all_follow() {
+        let (mut state, base, boss) = base_with_a_boss(10.0, 5.0);
+
+        state.select(Some(boss));
+        state.attach_to_selection();
+        state.start_sketch();
+        for (x, y) in [(-2.0, -2.0), (2.0, -2.0), (2.0, 2.0), (-2.0, 2.0)] {
+            state.add_sketch_point(Vec2::new(x, y));
+        }
+        state.extrude_height = 3.0;
+        state.finish_sketch();
+        assert_eq!(z_span(&state), (0.0, 18.0), "the chain did not stack up");
+
+        state.apply(Command::SetParam {
+            id: base,
+            name: "depth".into(),
+            value: 4.0,
+        });
+
+        let (lo, hi) = z_span(&state);
+        assert!(
+            lo.abs() < 1.0e-3 && (hi - 12.0).abs() < 1.0e-3,
+            "the chain did not follow: stack spans {lo}..{hi}"
+        );
+        for z in [1.0, 4.1, 8.9, 9.1, 11.9] {
+            assert!(solid_at(&state, z), "gap in the chain at z={z}");
+        }
+    }
+
+    /// A pocket follows the face it was cut from, and keeps the overshoot that
+    /// makes it start outside the material. Regeneration rewrites a derived
+    /// placement wholesale, so an offset folded into that placement would be
+    /// erased the first time the face moved, leaving a skin over the hole.
+    #[test]
+    fn a_pocket_follows_the_face_it_was_cut_from() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.extrude_height = 10.0;
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 40.0,
+                height: 30.0,
+            },
+            "Base",
+        );
+        let base = state.selected.expect("the base pad is selected");
+        state.select(Some(base));
+        state.attach_to_selection();
+        state.add_pocket(sc_geom::Profile::Circle { radius: 4.0 }, "Bore");
+
+        for z in [0.5, 5.0, 9.5] {
+            assert!(!solid_at(&state, z), "the bore did not open at z={z}");
+        }
+
+        state.apply(Command::SetParam {
+            id: base,
+            name: "depth".into(),
+            value: 6.0,
+        });
+
+        for z in [0.5, 3.0, 5.5] {
+            assert!(!solid_at(&state, z), "the bore closed up at z={z}");
+        }
+        assert!(
+            solid_at_point(&state, Vec3::new(15.0, 0.0, 3.0)),
+            "the part was cut away entirely"
+        );
+    }
+
+    /// Bug A: the pad tools resolved their placement from the datum plane, so a
+    /// rectangle dropped on an attached face landed buried inside the base.
+    #[test]
+    fn the_pad_tools_honour_the_attached_face() {
+        for profile in [
+            sc_geom::Profile::Rect {
+                width: 10.0,
+                height: 10.0,
+            },
+            sc_geom::Profile::Circle { radius: 5.0 },
+            sc_geom::Profile::RegularPolygon {
+                sides: 6,
+                radius: 5.0,
+            },
+        ] {
+            let mut state = AppState::new();
+            state.new_document();
+            state.extrude_height = 10.0;
+            state.add_pad(
+                sc_geom::Profile::Rect {
+                    width: 40.0,
+                    height: 30.0,
+                },
+                "Base",
+            );
+            let base = state.selected.expect("the base pad is selected");
+            state.select(Some(base));
+            state.attach_to_selection();
+
+            state.extrude_height = 5.0;
+            state.add_pad(profile.clone(), "Boss");
+
+            let (lo, hi) = z_span(&state);
+            assert!(
+                lo.abs() < 1.0e-3 && (hi - 15.0).abs() < 1.0e-3,
+                "{profile:?} ignored the attached face: stack spans {lo}..{hi}"
+            );
+            assert!(solid_at(&state, 12.5), "{profile:?} is not on the face");
+        }
+    }
+
+    /// A user selects the finished feature, which is whatever wraps the pad. The
+    /// Face button was keyed on the bare extrude, so selecting the offset or the
+    /// shell that a user can actually see greyed it out while pointing straight
+    /// at the face it describes.
+    #[test]
+    fn a_face_is_found_through_the_wrappers_around_a_pad() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 20.0,
+                height: 20.0,
+            },
+            "Pad",
+        );
+        let pad = state.selected.expect("the pad is selected");
+
+        for wrap in [
+            Node::Offset {
+                child: pad,
+                distance: 1.0,
+            },
+            Node::Shell {
+                child: pad,
+                thickness: 1.0,
+            },
+        ] {
+            let id = state
+                .apply(Command::Add { node: wrap })
+                .expect("valid wrapper");
+            assert_eq!(
+                state.attachable_face(id),
+                Some(pad),
+                "{} hid the pad underneath it",
+                state.doc.arena().get(id).expect("just added").kind()
+            );
+        }
+
+        state.select(Some(pad));
+        state.attach_to_selection();
+        assert_eq!(state.attached_to, Some(pad), "a bare pad still attaches");
+    }
+
+    /// Both sides of a boolean have a face, so there is no single answer and the
+    /// button has to stay off rather than guess.
+    #[test]
+    fn a_boolean_has_no_single_face_to_attach_to() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 20.0,
+                height: 20.0,
+            },
+            "Pad",
+        );
+        state.add_body(Node::Sphere { radius: 5.0 }, "Ball");
+        let root = state.doc.root().expect("the union became the root");
+
+        assert_eq!(state.attachable_face(root), None);
+
+        state.select(Some(root));
+        state.attach_to_selection();
+        assert_eq!(state.attached_to, None, "it guessed a face anyway");
+    }
+
+    fn attached_stack(state: &mut AppState) -> (NodeId, NodeId) {
+        state.new_document();
+        state.extrude_height = 10.0;
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 40.0,
+                height: 40.0,
+            },
+            "Base",
+        );
+        let base = state.selected.expect("the base is selected");
+        state.attach_to_selection();
+        state.extrude_height = 5.0;
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 8.0,
+                height: 8.0,
+            },
+            "Boss",
+        );
+        let placed = state
+            .doc
+            .arena()
+            .parents_of(state.selected.expect("the boss is selected"))
+            .into_iter()
+            .find(|id| state.doc.arena().get(*id).and_then(Node::derived_from) == Some(base))
+            .expect("the boss was placed on the face");
+        (base, placed)
+    }
+
+    /// Moving an attached feature must not cost it the attachment. The move goes
+    /// underneath the derived placement, so the boss slides across the face and
+    /// still follows it when the base changes height.
+    #[test]
+    fn moving_an_attached_feature_keeps_it_on_its_face() {
+        let mut state = AppState::new();
+        let (base, placed) = attached_stack(&mut state);
+
+        state.select(Some(placed));
+        state.move_selection(Vec3::new(12.0, 0.0, 0.0));
+
+        assert_eq!(
+            state.doc.arena().get(placed).and_then(Node::derived_from),
+            Some(base),
+            "the move broke the attachment"
+        );
+        assert!(
+            solid_at_point(&state, Vec3::new(12.0, 0.0, 12.0)),
+            "the boss did not move to where it was sent"
+        );
+
+        state.apply(Command::SetParam {
+            id: base,
+            name: "depth".into(),
+            value: 4.0,
+        });
+        assert!(
+            solid_at_point(&state, Vec3::new(12.0, 0.0, 6.0)),
+            "the moved boss stopped following its face"
+        );
+    }
+
+    /// Two moves leave one offset behind, not one per nudge.
+    #[test]
+    fn repeated_moves_accumulate_into_a_single_offset() {
+        let mut state = AppState::new();
+        let (_, placed) = attached_stack(&mut state);
+        state.select(Some(placed));
+
+        state.move_selection(Vec3::new(6.0, 0.0, 0.0));
+        let after_one = state.doc.arena().live_ids().count();
+        state.move_selection(Vec3::new(6.0, 0.0, 0.0));
+
+        assert_eq!(
+            state.doc.arena().live_ids().count(),
+            after_one,
+            "the second move stacked another placement instead of accumulating"
+        );
+        assert!(
+            solid_at_point(&state, Vec3::new(12.0, 0.0, 12.0)),
+            "the two moves did not add up"
+        );
+    }
+
+    /// A through cut has to stay through. Sizing one from the model as it stood
+    /// at the moment of the cut leaves it frozen, so growing the part turns the
+    /// hole into a blind recess with a skin over the far end.
+    #[test]
+    fn a_through_cut_stays_open_when_the_part_grows() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.extrude_height = 10.0;
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 40.0,
+                height: 40.0,
+            },
+            "Base",
+        );
+        let base = state.selected.expect("the base is selected");
+        state.add_pocket(sc_geom::Profile::Circle { radius: 4.0 }, "Bore");
+
+        for z in [0.5, 5.0, 9.5] {
+            assert!(!solid_at(&state, z), "the bore did not open at z={z}");
+        }
+
+        state.apply(Command::SetParam {
+            id: base,
+            name: "depth".into(),
+            value: 30.0,
+        });
+
+        for z in [0.5, 15.0, 29.5] {
+            assert!(
+                !solid_at(&state, z),
+                "the bore closed up at z={z} after the part grew"
+            );
+        }
+        assert!(
+            solid_at_point(&state, Vec3::new(15.0, 0.0, 29.5)),
+            "the part did not actually grow"
+        );
+    }
+
+    /// The prism is unbounded, but it is only ever a cutting tool, and a
+    /// difference takes its bounds from the solid being cut. The infinity must
+    /// not escape into the camera framing or the mesher.
+    #[test]
+    fn a_through_cut_leaves_the_model_bounded() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 40.0,
+                height: 40.0,
+            },
+            "Base",
+        );
+        state.add_pocket(sc_geom::Profile::Circle { radius: 4.0 }, "Bore");
+
+        let b = state.doc.bounds().expect("a rooted model has bounds");
+        assert!(
+            b.min.is_finite() && b.max.is_finite(),
+            "a through cut made the model unbounded: {b:?}"
+        );
+    }
+
+    /// Detaching is the explicit way to stop following a face, and it must not
+    /// move anything at the moment the link is cut.
+    #[test]
+    fn detaching_leaves_the_feature_exactly_where_it_is() {
+        let mut state = AppState::new();
+        let (base, placed) = attached_stack(&mut state);
+        let before = state.doc.hash().expect("a rooted model hashes");
+
+        state.select(Some(placed));
+        state.detach_selection();
+
+        assert_eq!(
+            state.doc.hash().expect("still rooted"),
+            before,
+            "detaching moved the feature"
+        );
+        assert_eq!(
+            state.doc.arena().get(placed).and_then(Node::derived_from),
+            None,
+            "the link survived the detach"
+        );
+
+        state.apply(Command::SetParam {
+            id: base,
+            name: "depth".into(),
+            value: 4.0,
+        });
+        assert!(
+            !solid_at_point(&state, Vec3::new(0.0, 0.0, 6.0)),
+            "a detached feature followed its old face anyway"
+        );
+    }
+
+    /// A derived placement is rewritten by regeneration, so an edit to its
+    /// coordinates is refused rather than silently reverted. It still reports
+    /// them, because they are the node's data and the geometry hash is built
+    /// from what `params` returns.
+    #[test]
+    fn a_derived_placement_refuses_coordinate_edits_but_still_reports_them() {
+        let mut state = AppState::new();
+        let (_, placed) = attached_stack(&mut state);
+
+        let names: Vec<&str> = state
+            .doc
+            .arena()
+            .get(placed)
+            .expect("still there")
+            .params()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(names.contains(&"z"), "got {names:?}");
+
+        let before = state.doc.hash().expect("a rooted model hashes");
+        state.apply(Command::SetParam {
+            id: placed,
+            name: "z".into(),
+            value: 99.0,
+        });
+        assert_eq!(
+            state.doc.hash().expect("still rooted"),
+            before,
+            "a refused edit changed the model"
+        );
+    }
+
+    /// Two placements at different spots on the same face must not hash alike.
+    /// Emptying `params` for a derived placement would have made them.
+    #[test]
+    fn moving_an_attached_feature_changes_the_hash() {
+        let mut state = AppState::new();
+        let (_, placed) = attached_stack(&mut state);
+        let before = state.doc.hash().expect("a rooted model hashes");
+
+        state.select(Some(placed));
+        state.move_selection(Vec3::new(9.0, 0.0, 0.0));
+
+        assert_ne!(state.doc.hash().expect("still rooted"), before);
     }
 
     /// Framing something that was already deleted must not move the camera.

@@ -6,7 +6,7 @@
 //! requiring the sketch to be redrawn.
 //!
 //! Profiles live on the feature node rather than in the arena. Entities are two
-//! dimensional and [`crate::eval`] is three dimensional, so giving them node
+//! dimensional and [`crate::eval()`] is three dimensional, so giving them node
 //! ids would introduce a kind of node that cannot be evaluated, and a 2D/3D
 //! split running through the kernel. The cost of keeping them here is that one
 //! profile cannot yet be shared between two features.

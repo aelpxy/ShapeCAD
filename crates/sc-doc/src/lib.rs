@@ -5,20 +5,25 @@
 //! interface are all the same mechanism viewed from different angles, which is
 //! why the log is built before any UI exists.
 
+/// Voxel grid assets and the sidecar directory they are stored in.
+pub mod asset;
 /// The command vocabulary shared by the UI, the CLI and the agent layer.
 pub mod command;
 /// Document-level error types.
 pub mod error;
 #[cfg(feature = "serde")]
 pub mod file;
+mod mesh;
 pub mod samples;
 
+pub use asset::{AssetId, AssetStore, Grid};
 pub use command::{Command, Effect};
-pub use error::{DocError, Result};
+pub use error::{AttachError, DocError, Result};
 
 use sc_geom::{bounds, wgsl, Aabb, Arena, GeometryHash, Node, NodeId};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 /// One applied mutation plus the effect that reverses it.
 ///
@@ -39,6 +44,10 @@ pub struct Document {
     arena: Arena,
     root: Option<NodeId>,
     names: HashMap<NodeId, String>,
+    /// The voxel grids this document's mesh nodes refer to. Not part of the
+    /// model: the nodes carry their own grids, and this is the index that
+    /// makes them findable by id when saving and loading.
+    assets: AssetStore,
     entries: Vec<Entry>,
     /// Number of entries currently applied. Everything at or past this index is
     /// a redo candidate.
@@ -73,6 +82,136 @@ impl Document {
     #[must_use]
     pub fn name(&self, id: NodeId) -> Option<&str> {
         self.names.get(&id).map(String::as_str)
+    }
+
+    /// The voxel grids this document's mesh nodes refer to.
+    #[must_use]
+    pub fn assets(&self) -> &AssetStore {
+        &self.assets
+    }
+
+    /// Registers a grid and returns the id a mesh node should reference it by.
+    ///
+    /// This is not a mutation of the model, so it deliberately does not go
+    /// through [`Document::apply`] and is not logged: the arena is untouched and
+    /// the document still hashes exactly as it did. The mutation is the
+    /// [`Command::Add`] of the node that references the grid, which must follow.
+    /// An id that no node ever references holds nothing alive: it is collected
+    /// at the next garbage collection and is never written to disk.
+    pub fn import_grid(&mut self, grid: Grid) -> AssetId {
+        self.assets.insert(grid)
+    }
+
+    /// Imports a grid and adds the mesh node that uses it.
+    ///
+    /// # Errors
+    /// Propagates any [`DocError`] from [`Document::apply`], which for a mesh
+    /// means the grid did not describe a usable field.
+    ///
+    /// # Panics
+    /// Never in practice; the grid is inserted immediately before it is read
+    /// back.
+    pub fn add_mesh(&mut self, grid: Grid) -> Result<NodeId> {
+        let asset = self.assets.insert(grid);
+        let stored = Arc::clone(
+            self.assets
+                .get(asset)
+                .expect("the grid was just inserted under this id"),
+        );
+        add(self, mesh::mesh_node(asset, stored))
+    }
+
+    /// The assets a saved copy of this document would need: those named by a
+    /// node that is still live in the arena.
+    ///
+    /// This is the write rule. A tombstoned node is not written to the file, so
+    /// its grid cannot be reached from the file either, and writing it would put
+    /// megabytes of unreachable binary beside every part that has ever had a
+    /// mesh deleted from it.
+    #[must_use]
+    pub fn referenced_assets(&self) -> BTreeSet<AssetId> {
+        self.arena
+            .live_ids()
+            .filter_map(|id| self.arena.get(id).and_then(mesh::asset_of))
+            .collect()
+    }
+
+    /// The assets this session must keep in memory.
+    ///
+    /// Wider than [`Document::referenced_assets`] by exactly the undo log. A
+    /// deleted mesh node lives on inside the `Destroy` entry's inverse, so undo
+    /// can put it back, and dropping its grid would make a perfectly ordinary
+    /// press of undo resurrect a node with no geometry in it. The whole of
+    /// `entries` counts, not just the applied prefix, because the redo tail is
+    /// reachable too.
+    fn reachable_assets(&self) -> BTreeSet<AssetId> {
+        let mut keep = self.referenced_assets();
+        for entry in &self.entries {
+            for effect in [&entry.effect, &entry.inverse] {
+                if let Some(asset) = effect.node().and_then(mesh::asset_of) {
+                    keep.insert(asset);
+                }
+            }
+        }
+        keep
+    }
+
+    /// Drops grids nothing can reach any more.
+    ///
+    /// Only worth running when the redo tail has just been discarded, because
+    /// that is the one moment an asset stops being reachable. Undo and redo move
+    /// the cursor without shortening `entries`, so nothing dies there.
+    fn collect_assets(&mut self) {
+        if self.assets.is_empty() {
+            return;
+        }
+        let keep = self.reachable_assets();
+        self.assets.retain(&keep);
+    }
+
+    /// Fills in the grid of every mesh node from `store`, and adopts it.
+    ///
+    /// A mesh node deserialises to an empty placeholder, because its grid is
+    /// megabytes of binary that the JSON does not carry. This is the step that
+    /// makes such a document real, and it is part of construction rather than an
+    /// edit, so it is deliberately not routed through [`Document::apply`]: an
+    /// opened file has no undo history, and filling a hole is not something a
+    /// user did.
+    ///
+    /// # Errors
+    /// [`AttachError`] if a node's grid is absent or unusable. Failing here is
+    /// the point: a document that finished loading with a placeholder still in
+    /// it would render and export as silently empty geometry.
+    pub fn attach_assets(&mut self, store: AssetStore) -> std::result::Result<(), AttachError> {
+        self.assets = store;
+        for id in self.arena.live_ids().collect::<Vec<_>>() {
+            let Some(node) = self.arena.get(id) else {
+                continue;
+            };
+            let Some(asset) = mesh::asset_of(node) else {
+                continue;
+            };
+            if !mesh::is_placeholder(node) {
+                continue;
+            }
+            // An empty grid is not a grid; accepting one would put the
+            // placeholder back under a different name.
+            let grid = match self.assets.get(asset) {
+                Some(g) if !g.data.is_empty() => Arc::clone(g),
+                _ => return Err(AttachError::Unresolved { node: id, asset }),
+            };
+            let Some(filled) = mesh::with_grid(node, grid) else {
+                continue;
+            };
+            self.arena
+                .replace(id, filled)
+                .map_err(|cause| AttachError::Invalid {
+                    node: id,
+                    asset,
+                    cause,
+                })?;
+        }
+        Ok(())
     }
 
     /// Conservative bounds of the rooted model.
@@ -157,14 +296,68 @@ impl Document {
     /// any validation failure in the underlying geometry edit.
     pub fn apply(&mut self, command: Command) -> Result<Option<NodeId>> {
         let effect = self.lower(command)?;
+        // Set the redo tail aside. A fresh edit invalidates it, but a rejected
+        // one has to leave it exactly where it was.
+        let tail = self.entries.split_off(self.cursor);
+        let mark = self.cursor;
+
+        // The edit and whatever it drags along with it are one action. A user
+        // who shortens a base and watches the boss on top follow it down has
+        // done one thing, and should press undo once to take it back.
+        self.begin_step();
+        let out = self.commit(effect).and_then(|out| {
+            self.regenerate()?;
+            Ok(out)
+        });
+        self.end_step();
+
+        // An edit is no longer a single effect: regeneration follows it. If that
+        // fails the edit has already landed, so it has to be taken back out
+        // again, or a rejected command leaves behind exactly the half-edited
+        // model the guarantee above exists to rule out.
+        if out.is_err() {
+            self.rewind(mark);
+            self.entries.extend(tail);
+        } else if !tail.is_empty() {
+            // The edit stuck, so the redo tail is gone for good, and with it the
+            // only thing that was keeping the grids named in it reachable.
+            self.collect_assets();
+        }
+        out
+    }
+
+    /// Unwinds applied entries back to `mark`, discarding them.
+    ///
+    /// Every entry carries its own inverse, so this is undo without the history:
+    /// the model returns to where it was and no record is left that it ever
+    /// moved.
+    fn rewind(&mut self, mark: usize) {
+        while self.cursor > mark {
+            let inverse = self.entries[self.cursor - 1].inverse.clone();
+            // An inverse built from state that existed a moment ago can only be
+            // rejected by a bug in inverse construction, and there is no better
+            // recovery available here than to keep unwinding and leave the model
+            // as close to untouched as it can be.
+            let _ = self.run(inverse);
+            self.cursor -= 1;
+        }
+        self.entries.truncate(self.cursor);
+    }
+
+    /// Runs an effect and logs it under the step currently open.
+    ///
+    /// Every mutation [`Document::apply`] makes goes through here, the
+    /// regeneration that follows an edit included, so nothing can change the
+    /// model without leaving a replayable record and an inverse behind.
+    fn commit(&mut self, effect: Effect) -> Result<Option<NodeId>> {
         let inverse = self.invert(&effect)?;
         let out = self.run(effect.clone())?;
 
-        // A fresh edit invalidates the redo tail.
+        // A fresh edit invalidates the redo tail. Collecting the grids it was
+        // keeping alive is not done here: `apply` sets the tail aside so it can
+        // be put back if the edit fails, so by this point there is nothing left
+        // to truncate and nothing has actually been given up yet.
         self.entries.truncate(self.cursor);
-        if self.open == 0 {
-            self.step += 1;
-        }
         self.entries.push(Entry {
             effect,
             inverse,
@@ -172,6 +365,77 @@ impl Document {
         });
         self.cursor += 1;
         Ok(out)
+    }
+
+    /// Puts every derived placement back on the face it was built on.
+    ///
+    /// Run at the end of [`Document::apply`], inside the same step. The moves
+    /// are emitted as ordinary [`Effect::Replace`]s rather than applied behind
+    /// the log's back, so history stays the whole story: [`Document::replay`]
+    /// feeds those effects straight to `run` and must not regenerate again on
+    /// top of them, or it would be deriving from a model it is only half way
+    /// through rebuilding.
+    ///
+    /// Derived placements chain, and moving one moves the face the next sits
+    /// on, so this iterates. Each pass settles at least the shallowest
+    /// placement that is still stale, which bounds the work by the number of
+    /// derived placements and stops a malformed document spinning here.
+    fn regenerate(&mut self) -> Result<()> {
+        let Some(root) = self.root else {
+            return Ok(());
+        };
+        let derived: Vec<NodeId> = self
+            .arena
+            .live_ids()
+            .filter(|&id| self.arena.get(id).and_then(Node::derived_from).is_some())
+            .collect();
+
+        for _ in 0..derived.len() {
+            let mut moved = false;
+            for &id in &derived {
+                if let Some(effect) = self.regenerated(root, id) {
+                    self.commit(effect)?;
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The effect that puts one derived placement back on its face, or `None`
+    /// if it is already there.
+    ///
+    /// Also `None` when either end has no position: a feature detached from the
+    /// model is not wrong, it is simply nowhere, and guessing a placement for it
+    /// would move it the moment it was joined back on.
+    fn regenerated(&self, root: NodeId, id: NodeId) -> Option<Effect> {
+        let node = self.arena.get(id)?;
+        let on = node.derived_from()?;
+        let Node::Transform { child, xform, .. } = node else {
+            return None;
+        };
+
+        let face = sc_geom::pick::face_placement(&self.arena, root, on)?;
+        // A placement is expressed in its parent's frame rather than the
+        // world's, so anything above it has to be divided back out. Skipping
+        // this double-applies an enclosing move.
+        let above = sc_geom::pick::placement_of(&self.arena, root, id)?;
+        let wanted = face.then(&above.inverse());
+        if settled(xform, &wanted) {
+            return None;
+        }
+
+        Some(Effect::Replace {
+            id,
+            node: Node::Transform {
+                child: *child,
+                xform: wanted,
+                on: Some(on),
+            },
+        })
     }
 
     /// Starts grouping: every command applied until the matching
@@ -302,10 +566,12 @@ impl Document {
         Ok(match effect {
             Effect::Create { id, node } => {
                 self.arena.create_at(id, node)?;
+                Self::register(&mut self.assets, &self.arena, id);
                 Some(id)
             }
             Effect::Replace { id, node } => {
                 self.arena.replace(id, node)?;
+                Self::register(&mut self.assets, &self.arena, id);
                 Some(id)
             }
             Effect::Destroy { id } => {
@@ -327,6 +593,29 @@ impl Document {
                 Some(id)
             }
         })
+    }
+
+    /// Indexes the grid a node carries, if it carries one.
+    ///
+    /// The store is maintained from the nodes rather than alongside them, so a
+    /// caller that builds a mesh node by hand and applies [`Command::Add`] gets
+    /// a saveable document without having to know the store exists. Takes the
+    /// two fields rather than `&mut self` because it reads one and writes the
+    /// other.
+    fn register(assets: &mut AssetStore, arena: &Arena, id: NodeId) {
+        let Some(node) = arena.get(id) else {
+            return;
+        };
+        let (Some(asset), Some(grid)) = (mesh::asset_of(node), mesh::grid_of(node)) else {
+            return;
+        };
+        // A node straight out of the JSON carries an empty placeholder. Priming
+        // the store with the hole is exactly what would stop a load noticing
+        // that the real grid never arrived.
+        if grid.data.is_empty() || assets.contains(asset) {
+            return;
+        }
+        assets.insert_at(asset, Arc::clone(grid));
     }
 
     /// A compact, human- and model-readable rendering of the tree.
@@ -378,6 +667,26 @@ impl Document {
     }
 }
 
+/// Whether a recomputed placement is close enough to the one in the tree to
+/// leave alone.
+///
+/// Compared at the hashing quantum, a tenth of a micrometre: below that the
+/// document cannot tell the two apart anyway, and logging the difference would
+/// put an effect in the history for every command that changed nothing.
+fn settled(current: &sc_geom::Transform, wanted: &sc_geom::Transform) -> bool {
+    let close = |a: f32, b: f32| (a - b).abs() <= sc_geom::hash::QUANTUM;
+    close(current.translation.x, wanted.translation.x)
+        && close(current.translation.y, wanted.translation.y)
+        && close(current.translation.z, wanted.translation.z)
+        && close(current.scale, wanted.scale)
+        && current
+            .rotation
+            .to_array()
+            .iter()
+            .zip(wanted.rotation.to_array())
+            .all(|(a, b)| close(*a, b))
+}
+
 /// Convenience: add a node and return its id.
 ///
 /// # Errors
@@ -400,6 +709,45 @@ mod tests {
 
     fn sphere(r: f32) -> Node {
         Node::Sphere { radius: r }
+    }
+
+    /// Regeneration runs after the edit that caused it, so a failure there has
+    /// to take the edit back out with it. The unwinding is tested directly
+    /// because the failure that would trigger it is not reachable today, and an
+    /// untested recovery path is one that stops working without anyone noticing.
+    #[test]
+    fn unwinding_a_step_restores_both_the_model_and_the_log() {
+        let mut doc = Document::new();
+        let a = add(&mut doc, sphere(5.0)).unwrap();
+        doc.apply(Command::SetRoot { root: Some(a) }).unwrap();
+        let before = doc.hash().unwrap();
+        let mark = doc.log_len();
+
+        doc.begin_step();
+        let b = add(&mut doc, sphere(2.0)).unwrap();
+        let u = add(&mut doc, Node::Union { a, b, smooth: 0.0 }).unwrap();
+        doc.apply(Command::SetRoot { root: Some(u) }).unwrap();
+        doc.end_step();
+        assert_ne!(
+            doc.hash().unwrap(),
+            before,
+            "the edit did not reach the model"
+        );
+
+        doc.rewind(mark);
+
+        assert_eq!(
+            doc.hash().unwrap(),
+            before,
+            "unwinding left the model changed"
+        );
+        assert_eq!(doc.log_len(), mark, "unwinding left entries applied");
+        assert!(!doc.arena().is_alive(b), "unwinding left a node behind");
+        assert!(!doc.arena().is_alive(u), "unwinding left a node behind");
+        assert!(
+            !doc.can_redo(),
+            "an unwound entry stayed behind as a redo candidate"
+        );
     }
 
     /// A feature is several commands underneath, so one press of undo has to
@@ -658,6 +1006,148 @@ mod tests {
         let replayed = Document::replay(doc.log().cloned().collect::<Vec<_>>()).unwrap();
         assert_eq!(replayed.root(), doc.root(), "root id diverged on replay");
         assert_eq!(replayed.hash(), doc.hash());
+    }
+
+    /// A base pad, a boss placed on its far face, and the two joined.
+    ///
+    /// Returns the document, the base extrusion that carries the depth, and the
+    /// derived placement regeneration has to move.
+    fn base_and_boss(base_depth: f32) -> (Document, NodeId, NodeId) {
+        use sc_geom::{Profile, Transform};
+        let mut doc = Document::new();
+        let base = add(
+            &mut doc,
+            Node::Extrude {
+                profile: Profile::Rect {
+                    width: 20.0,
+                    height: 20.0,
+                },
+                depth: base_depth,
+            },
+        )
+        .unwrap();
+        let body = add(
+            &mut doc,
+            Node::Extrude {
+                profile: Profile::Rect {
+                    width: 6.0,
+                    height: 6.0,
+                },
+                depth: 5.0,
+            },
+        )
+        .unwrap();
+        let boss = add(
+            &mut doc,
+            Node::Transform {
+                child: body,
+                xform: Transform::from_translation(Vec3::new(0.0, 0.0, base_depth)),
+                on: Some(base),
+            },
+        )
+        .unwrap();
+        let joined = add(
+            &mut doc,
+            Node::Union {
+                a: base,
+                b: boss,
+                smooth: 0.0,
+            },
+        )
+        .unwrap();
+        doc.apply(Command::SetRoot { root: Some(joined) }).unwrap();
+        (doc, base, boss)
+    }
+
+    fn placement_z(doc: &Document, id: NodeId) -> f32 {
+        match doc.arena().get(id) {
+            Some(Node::Transform { xform, .. }) => xform.translation.z,
+            other => panic!("{id} is not a placement: {other:?}"),
+        }
+    }
+
+    /// A derived placement follows the face it names when that face moves.
+    #[test]
+    fn a_derived_placement_follows_the_face_it_names() {
+        let (mut doc, base, boss) = base_and_boss(10.0);
+        assert!((placement_z(&doc, boss) - 10.0).abs() < 1.0e-4);
+
+        doc.apply(Command::SetParam {
+            id: base,
+            name: "depth".into(),
+            value: 4.0,
+        })
+        .unwrap();
+
+        assert!(
+            (placement_z(&doc, boss) - 4.0).abs() < 1.0e-4,
+            "the boss stayed at {} after the base shrank",
+            placement_z(&doc, boss)
+        );
+    }
+
+    /// The edit and the regeneration it causes are one user action, so one
+    /// press of undo takes back both. Checking the hash alone would not catch a
+    /// missing bracket: undoing the parameter would restore the base's size
+    /// while leaving the boss hanging where the regeneration put it.
+    #[test]
+    fn a_base_edit_and_its_regeneration_are_one_undo_step() {
+        let (mut doc, base, boss) = base_and_boss(10.0);
+        let before = doc.hash().unwrap();
+        let steps = doc.log_len();
+
+        doc.apply(Command::SetParam {
+            id: base,
+            name: "depth".into(),
+            value: 4.0,
+        })
+        .unwrap();
+        assert_eq!(
+            doc.log_len(),
+            steps + 2,
+            "the regeneration was not logged as a real effect"
+        );
+
+        assert!(doc.undo().unwrap());
+        assert_eq!(
+            doc.log_len(),
+            steps,
+            "undo took back only half of the action"
+        );
+        assert!(
+            (placement_z(&doc, boss) - 10.0).abs() < 1.0e-4,
+            "the boss was left where regeneration put it"
+        );
+        assert_eq!(
+            doc.hash().unwrap(),
+            before,
+            "undo did not restore the model"
+        );
+
+        assert!(doc.redo().unwrap());
+        assert!(
+            (placement_z(&doc, boss) - 4.0).abs() < 1.0e-4,
+            "redo replayed only part of the action"
+        );
+    }
+
+    /// Regeneration emits real effects, so the log stays the whole story. Replay
+    /// applies them directly and must not regenerate again on top.
+    #[test]
+    fn a_regenerated_document_replays_exactly() {
+        let (mut doc, base, boss) = base_and_boss(10.0);
+        doc.apply(Command::SetParam {
+            id: base,
+            name: "depth".into(),
+            value: 4.0,
+        })
+        .unwrap();
+
+        let log: Vec<Effect> = doc.log().cloned().collect();
+        let replayed = Document::replay(log).unwrap();
+        assert_eq!(replayed.hash(), doc.hash(), "replaying the log diverged");
+        assert_eq!(replayed.log_len(), doc.log_len(), "replay grew the log");
+        assert!((placement_z(&replayed, boss) - 4.0).abs() < 1.0e-4);
     }
 
     #[test]

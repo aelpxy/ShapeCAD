@@ -100,7 +100,7 @@ fn gather(
     path.push(id);
 
     match *node {
-        Node::Transform { child, xform } => {
+        Node::Transform { child, xform, .. } => {
             gather(
                 arena,
                 child,
@@ -244,12 +244,35 @@ pub fn placement_of(arena: &Arena, root: NodeId, target: NodeId) -> Option<crate
             return Some(acc);
         }
         let node = arena.get(id)?;
-        if let Node::Transform { child, xform } = node {
+        if let Node::Transform { child, xform, .. } = node {
             return walk(arena, *child, target, xform.then(&acc));
         }
         node.children().find_map(|c| walk(arena, c, target, acc))
     }
     walk(arena, root, target, crate::Transform::IDENTITY)
+}
+
+/// Where a sketch drawn on `target`'s far face sits in the model.
+///
+/// This is [`placement_of`] with the face's own offset applied: an [`Extrude`]
+/// runs from z = 0 to z = `depth` in its own frame, so its far face is a lift of
+/// `depth` along the local +Z. `None` if the node is not reachable from `root`,
+/// or is not a kind of feature with a face to sketch on.
+///
+/// One definition, used both when a sketch is being drawn and when a feature
+/// already built on that face is regenerated. Two would drift, and a boss that
+/// lands correctly and then moves the first time anything else is edited is
+/// worse than one that is simply in the wrong place.
+///
+/// [`Extrude`]: crate::Node::Extrude
+#[must_use]
+pub fn face_placement(arena: &Arena, root: NodeId, target: NodeId) -> Option<crate::Transform> {
+    let placement = placement_of(arena, root, target)?;
+    let depth = match arena.get(target)? {
+        Node::Extrude { depth, .. } => *depth,
+        _ => return None,
+    };
+    Some(crate::Transform::from_translation(Vec3::new(0.0, 0.0, depth)).then(&placement))
 }
 
 #[cfg(test)]
@@ -282,6 +305,37 @@ mod placement_tests {
 
         let placed = placement_of(&b.arena, u, c).expect("reachable");
         assert!((placed.apply_point(Vec3::ZERO) - Vec3::new(4.0, 0.0, 0.0)).length() < 1.0e-4);
+    }
+
+    #[test]
+    fn a_face_placement_sits_on_the_far_end_of_the_extrusion() {
+        let mut b = Builder::new();
+        let pad = b
+            .extrude(
+                crate::Profile::Rect {
+                    width: 10.0,
+                    height: 10.0,
+                },
+                7.0,
+            )
+            .unwrap();
+        let lifted = b.translate(pad, Vec3::new(0.0, 0.0, 2.0)).unwrap();
+
+        let face = face_placement(&b.arena, lifted, pad).expect("reachable");
+        let origin = face.apply_point(Vec3::ZERO);
+        assert!(
+            (origin - Vec3::new(0.0, 0.0, 9.0)).length() < 1.0e-4,
+            "the face is at {origin:?}, expected z = 9"
+        );
+    }
+
+    /// Only a feature with a face to sketch on has one. A sphere reports none
+    /// rather than quietly returning its centre.
+    #[test]
+    fn a_node_with_no_face_has_no_face_placement() {
+        let mut b = Builder::new();
+        let s = b.sphere(3.0).unwrap();
+        assert!(face_placement(&b.arena, s, s).is_none());
     }
 
     #[test]

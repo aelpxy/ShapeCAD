@@ -74,8 +74,13 @@ impl Arena {
             .filter_map(|(i, s)| s.as_ref().map(|_| NodeId(i as u32)))
     }
 
-    /// Validate a node's parameters and that all of its children are live.
-    fn check(&self, node: &Node) -> Result<()> {
+    /// Validate a node's parameters, that all of its children are live, and
+    /// that any node it derives its placement from is live and outside its own
+    /// subtree.
+    ///
+    /// `id` is the id the node will occupy, which the derivation check needs:
+    /// a placement built on itself would be defined in terms of its own result.
+    fn check(&self, id: NodeId, node: &Node) -> Result<()> {
         if !node.is_valid() {
             return Err(GeomError::InvalidNode {
                 kind: node.kind(),
@@ -84,6 +89,16 @@ impl Arena {
         }
         for c in node.children() {
             self.try_get(c)?;
+        }
+        // A derivation is not a child, so it is checked here rather than by the
+        // loop above. Both halves matter: the base has to exist, and it has to
+        // sit outside the subtree this node places, or regenerating the
+        // placement would chase its own tail.
+        if let Some(on) = node.derived_from() {
+            self.try_get(on)?;
+            if on == id || node.children().any(|c| self.reaches(c, on)) {
+                return Err(GeomError::Cycle { at: id, via: on });
+            }
         }
         Ok(())
     }
@@ -103,10 +118,12 @@ impl Arena {
     ///
     /// # Errors
     /// [`GeomError::SlotOccupied`] if the id is currently live,
-    /// [`GeomError::InvalidNode`] if parameters are out of range, or
-    /// [`GeomError::UnknownNode`] / [`GeomError::DeadNode`] if a child is gone.
+    /// [`GeomError::InvalidNode`] if parameters are out of range,
+    /// [`GeomError::UnknownNode`] / [`GeomError::DeadNode`] if a child or the
+    /// node it is derived from is gone, or [`GeomError::Cycle`] for a
+    /// derivation that points into the node's own subtree.
     pub fn create_at(&mut self, id: NodeId, node: Node) -> Result<()> {
-        self.check(&node)?;
+        self.check(id, &node)?;
         let idx = id.0 as usize;
         if idx < self.slots.len() && self.slots[idx].is_some() {
             return Err(GeomError::SlotOccupied(id));
@@ -121,11 +138,13 @@ impl Arena {
     /// Adds a node and returns its freshly issued id.
     ///
     /// # Errors
-    /// [`GeomError::InvalidNode`] if parameters are out of range, or
-    /// [`GeomError::UnknownNode`] / [`GeomError::DeadNode`] if a child is gone.
+    /// [`GeomError::InvalidNode`] if parameters are out of range,
+    /// [`GeomError::UnknownNode`] / [`GeomError::DeadNode`] if a child or the
+    /// node it is derived from is gone, or [`GeomError::Cycle`] for a
+    /// derivation that points into the node's own subtree.
     pub fn insert(&mut self, node: Node) -> Result<NodeId> {
-        self.check(&node)?;
-        let id = NodeId(self.slots.len() as u32);
+        let id = self.next_id();
+        self.check(id, &node)?;
         self.slots.push(Some(node));
         Ok(id)
     }
@@ -136,14 +155,15 @@ impl Arena {
     /// parameter change, which is the whole point of stable ids.
     ///
     /// # Errors
-    /// [`GeomError::Cycle`] if the new children would close a loop, plus the
-    /// same validation errors as [`Arena::insert`].
+    /// [`GeomError::Cycle`] if the new children would close a loop, or if the
+    /// new derivation points inside this node's own subtree, plus the same
+    /// validation errors as [`Arena::insert`].
     ///
     /// # Panics
     /// Never in practice; the liveness of the slot is checked first.
     pub fn replace(&mut self, id: NodeId, node: Node) -> Result<Node> {
         self.try_get(id)?;
-        self.check(&node)?;
+        self.check(id, &node)?;
         for c in node.children() {
             if c == id || self.reaches(c, id) {
                 return Err(GeomError::Cycle { at: id, via: c });
@@ -157,8 +177,9 @@ impl Arena {
     /// Deletes a node.
     ///
     /// # Errors
-    /// [`GeomError::StillReferenced`] if any live node points at it, so the DAG
-    /// can never contain a dangling child pointer.
+    /// [`GeomError::StillReferenced`] if any live node points at it, as a child
+    /// or as the feature its placement is derived from, so the DAG can never
+    /// contain a dangling pointer of either kind.
     ///
     /// # Panics
     /// Never in practice; the liveness of the slot is checked first.
@@ -186,8 +207,16 @@ impl Arena {
             .collect()
     }
 
+    /// Anything that would dangle if `id` went away: a parent, or a placement
+    /// derived from it. Deletion consults this, so both kinds of reference keep
+    /// a node alive.
     fn referrer_of(&self, id: NodeId) -> Option<NodeId> {
-        self.live_ids().find(|&other| self.is_parent(other, id))
+        self.live_ids()
+            .find(|&other| self.is_parent(other, id) || self.is_derived_from(other, id))
+    }
+
+    fn is_derived_from(&self, node: NodeId, base: NodeId) -> bool {
+        node != base && self.get(node).and_then(Node::derived_from) == Some(base)
     }
 
     fn is_parent(&self, parent: NodeId, child: NodeId) -> bool {
@@ -306,6 +335,94 @@ mod tests {
             .expect("valid union");
 
         assert_eq!(arena.parents_of(a), vec![twice]);
+    }
+
+    /// A feature built on another names it, and that reference has to keep the
+    /// base alive just as a child reference does. Deleting it would leave a
+    /// placement derived from a node that no longer exists.
+    #[test]
+    fn a_node_a_derived_placement_is_built_on_cannot_be_deleted() {
+        let mut arena = Arena::new();
+        let base = sphere(&mut arena, 1.0);
+        let boss = sphere(&mut arena, 2.0);
+        let placed = arena
+            .insert(Node::Transform {
+                child: boss,
+                xform: crate::Transform::from_translation(glam::Vec3::Z),
+                on: Some(base),
+            })
+            .expect("valid placement");
+
+        assert!(
+            matches!(
+                arena.remove(base),
+                Err(GeomError::StillReferenced { node, by }) if node == base && by == placed
+            ),
+            "the base a feature is built on was deleted out from under it"
+        );
+        assert!(arena.is_alive(base));
+    }
+
+    /// A placement derived from something inside its own subtree would be
+    /// defined in terms of itself, and regenerating it would never settle.
+    #[test]
+    fn a_circular_derivation_is_rejected() {
+        let mut arena = Arena::new();
+        let child = sphere(&mut arena, 1.0);
+
+        // Built on the very node it places.
+        assert!(
+            matches!(
+                arena.insert(Node::Transform {
+                    child,
+                    xform: crate::Transform::IDENTITY,
+                    on: Some(child),
+                }),
+                Err(GeomError::Cycle { .. })
+            ),
+            "a placement was allowed to derive from its own child"
+        );
+
+        // And on itself, reached by replacing an existing placement.
+        let placed = arena
+            .insert(Node::Transform {
+                child,
+                xform: crate::Transform::IDENTITY,
+                on: None,
+            })
+            .expect("valid placement");
+        assert!(
+            matches!(
+                arena.replace(
+                    placed,
+                    Node::Transform {
+                        child,
+                        xform: crate::Transform::IDENTITY,
+                        on: Some(placed),
+                    }
+                ),
+                Err(GeomError::Cycle { .. })
+            ),
+            "a placement was allowed to derive from itself"
+        );
+    }
+
+    /// A derivation must be a live node, even though it is not a child.
+    #[test]
+    fn a_derivation_naming_a_dead_node_is_refused() {
+        let mut arena = Arena::new();
+        let child = sphere(&mut arena, 1.0);
+        let gone = sphere(&mut arena, 2.0);
+        arena.remove(gone).expect("nothing points at it");
+
+        assert!(matches!(
+            arena.insert(Node::Transform {
+                child,
+                xform: crate::Transform::IDENTITY,
+                on: Some(gone),
+            }),
+            Err(GeomError::DeadNode(_))
+        ));
     }
 
     #[test]

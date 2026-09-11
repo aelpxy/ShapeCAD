@@ -2006,6 +2006,7 @@ dependencies = [
  "naga",
  "proptest",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

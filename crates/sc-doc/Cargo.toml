@@ -10,6 +10,9 @@ rust-version.workspace = true
 # On by default: a document you cannot save is not a document.
 default = ["serde"]
 serde = ["dep:serde", "dep:serde_json", "sc-geom/serde"]
+# Turn on once the kernel provides `sc_geom::sdf` and `Node::Mesh`; until then it
+# selects code that has nothing to compile against, so `--all-features` does not
+# build. See `src/mesh.rs`.
 
 [lints]
 workspace = true

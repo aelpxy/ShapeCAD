@@ -8,6 +8,7 @@
 use crate::dialog::{Outcome, Purpose};
 use crate::icon::Icon;
 use crate::plane::SketchPlane;
+use crate::settings::Appearance;
 use crate::state::{AppState, MenuTarget, TOOL_SELECT, TOOL_SKETCH};
 use crate::theme;
 use egui::{Align, Layout, Margin, RichText, Vec2};
@@ -112,7 +113,13 @@ const MENU_WIDTH: f32 = 218.0;
 /// Every item closes the menu, including the ones that do nothing, so there is
 /// no way to leave it hanging over the model.
 fn context_menu(ctx: &egui::Context, state: &mut AppState) -> Option<egui::Rect> {
-    let open = state.menu?;
+    let grow = egui::Id::new("context-menu-grow");
+    let Some(open) = state.menu else {
+        // Forgotten on close, so the next menu grows again rather than appearing
+        // already finished.
+        crate::motion::forget(ctx, grow);
+        return None;
+    };
     let screen = ctx.viewport_rect();
 
     // Flip the menu back inside the window rather than letting it run off the
@@ -130,6 +137,18 @@ fn context_menu(ctx: &egui::Context, state: &mut AppState) -> Option<egui::Rect>
         .order(egui::Order::Foreground)
         .fixed_pos(at)
         .show(ctx, |ui| {
+            // Grows out of the corner it was summoned from rather than simply
+            // being there. The corner matters: a menu that expands from the
+            // pointer reads as a consequence of the click, where one that fades
+            // in centred reads as a separate window that happened to appear.
+            let t = crate::motion::animate_from(ui, grow, 0.0, 1.0, crate::motion::Tuning::BOUNCY);
+            ui.set_opacity(t.clamp(0.0, 1.0));
+            ui.ctx().set_transform_layer(
+                ui.layer_id(),
+                egui::emath::TSTransform::from_translation(at.to_vec2())
+                    * egui::emath::TSTransform::from_scaling(0.90 + 0.10 * t)
+                    * egui::emath::TSTransform::from_translation(-at.to_vec2()),
+            );
             ui.set_width(MENU_WIDTH);
             theme::menu().show(ui, |ui| {
                 ui.set_width(MENU_WIDTH);
@@ -290,13 +309,13 @@ fn node_menu(ui: &mut egui::Ui, state: &mut AppState, id: NodeId) {
         state.close_menu();
     }
     if theme::menu_item(ui, Icon::Move, "Move", None, true, false).clicked() {
-        state.wrap_selection(
-            |child| Node::Transform {
-                child,
-                xform: sc_geom::Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
-            },
-            "Move",
-        );
+        state.move_selection(Vec3::new(10.0, 0.0, 0.0));
+        state.close_menu();
+    }
+    if state.selection_is_attached()
+        && theme::menu_item(ui, Icon::Plane, "Detach from face", None, true, false).clicked()
+    {
+        state.detach_selection();
         state.close_menu();
     }
 
@@ -459,7 +478,7 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
                     ui.label(
                         RichText::new(state.title())
                             .size(10.5)
-                            .color(theme::TEXT_DIM),
+                            .color(theme::palette().text_dim),
                     );
                 });
 
@@ -526,6 +545,9 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
                     }
                     ui.add_space(6.0);
 
+                    appearance_switch(ui, state);
+                    ui.add_space(10.0);
+
                     let redo = theme::icon_button(ui, Icon::Redo, state.doc.can_redo());
                     if theme::hint(redo, "Redo", "Replays the last undone operation.", Some("Ctrl+Shift+Z")).clicked() {
                         state.redo();
@@ -555,7 +577,7 @@ fn status_bar(ui: &mut egui::Ui, state: &AppState) {
                 let status = ui.label(
                     RichText::new(&state.status)
                         .size(11.5)
-                        .color(theme::TEXT_DIM),
+                        .color(theme::palette().text_dim),
                 );
                 theme::hint(
                     status,
@@ -564,7 +586,7 @@ fn status_bar(ui: &mut egui::Ui, state: &AppState) {
                     None,
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let unit = ui.label(RichText::new("mm").size(11.5).color(theme::TEXT_DIM));
+                    let unit = ui.label(RichText::new("mm").size(11.5).color(theme::palette().text_dim));
                     theme::hint(
                         unit,
                         "Millimetres",
@@ -577,7 +599,7 @@ fn status_bar(ui: &mut egui::Ui, state: &AppState) {
                         let size = ui.label(
                             RichText::new(format!("{:.1} x {:.1} x {:.1}", s.x, s.y, s.z))
                                 .size(11.5)
-                                .color(theme::TEXT_DIM),
+                                .color(theme::palette().text_dim),
                         );
                         theme::hint(
                             size,
@@ -601,7 +623,7 @@ fn status_bar(ui: &mut egui::Ui, state: &AppState) {
                     let timing = ui.label(
                         RichText::new(format!("{how} {:.1} ms", state.last_edit_ms))
                             .size(11.5)
-                            .color(theme::TEXT_DIM),
+                            .color(theme::palette().text_dim),
                     );
                     theme::hint(timing, "Last edit", why, None);
                 });
@@ -611,7 +633,7 @@ fn status_bar(ui: &mut egui::Ui, state: &AppState) {
 
 fn panel_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(theme::CANVAS)
+        .fill(theme::palette().canvas)
         .inner_margin(Margin::same(12))
 }
 
@@ -629,7 +651,7 @@ fn left_panel(ui: &mut egui::Ui, state: &mut AppState) {
             theme::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    let title = ui.label(RichText::new("Design").heading());
+                    let title = theme::large_title(ui, "Design");
                     theme::hint(
                         title,
                         "Design tree",
@@ -640,7 +662,7 @@ fn left_panel(ui: &mut egui::Ui, state: &mut AppState) {
                         let count = ui.label(
                             RichText::new(format!("{} nodes", state.doc.arena().len()))
                                 .size(11.0)
-                                .color(theme::TEXT_DIM),
+                                .color(theme::palette().text_dim),
                         );
                         theme::hint(
                             count,
@@ -662,7 +684,7 @@ fn left_panel(ui: &mut egui::Ui, state: &mut AppState) {
                             tree_node(ui, state, root, 0, &mut seen);
                         } else {
                             let empty = ui.label(
-                                RichText::new("Empty document").color(theme::TEXT_DIM),
+                                RichText::new("Empty document").color(theme::palette().text_dim),
                             );
                             theme::hint(
                                 empty,
@@ -676,10 +698,11 @@ fn left_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
             ui.add_space(12.0);
 
-            theme::card().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                tools(ui, state);
-            });
+            // Deliberately not in a card. Each section below is its own raised
+            // group, and a group only reads as raised against the canvas. Nested
+            // inside a card they would be surface on surface and the separators
+            // would be doing all the work on their own.
+            tools(ui, state);
             ui.add_space(4.0);
                 });
         });
@@ -726,7 +749,11 @@ fn tree_node(
     if seen.contains(&id) {
         ui.horizontal(|ui| {
             ui.add_space((depth + 1) as f32 * 14.0 + 8.0);
-            ui.label(RichText::new("shared").size(10.0).color(theme::TEXT_DIM));
+            ui.label(
+                RichText::new("shared")
+                    .size(10.0)
+                    .color(theme::palette().text_dim),
+            );
         });
         return;
     }
@@ -746,7 +773,7 @@ fn plane_row(ui: &mut egui::Ui, state: &mut AppState) {
             ui.painter(),
             egui::Rect::from_center_size(glyph.center(), Vec2::splat(15.0)),
             Icon::Plane,
-            theme::TEXT_DIM,
+            theme::palette().text_dim,
         );
         for plane in SketchPlane::ALL {
             let active = state.plane == plane && state.attached_to.is_none();
@@ -767,14 +794,13 @@ fn plane_row(ui: &mut egui::Ui, state: &mut AppState) {
         // where does the next sketch go.
         let can_attach = state
             .selected
-            .and_then(|id| state.doc.arena().get(id))
-            .is_some_and(|n| n.kind() == "extrude");
+            .is_some_and(|id| state.attachable_face(id).is_some());
         let attached = state.attached_to.is_some();
         let response = ui.add(chip("Face", attached, can_attach || attached));
         let help = if can_attach || attached {
             "Puts the next sketch on the far face of the selected pad, so a hole lands on the surface you can see rather than at the origin."
         } else {
-            "Select a padded body first. Faces come from the pad that made them, so there is nothing to attach to yet."
+            "Select a padded body first. A face comes from the pad that made it, and the selection has to lead down to a single pad, not to both sides of a boolean."
         };
         if theme::hint(response, "Sketch on a face", help, None).clicked() {
             if attached {
@@ -786,18 +812,40 @@ fn plane_row(ui: &mut egui::Ui, state: &mut AppState) {
     });
 }
 
+/// Light, dark, or follow the desktop.
+fn appearance_switch(ui: &mut egui::Ui, state: &mut AppState) {
+    const OPTIONS: [(Icon, &str, &str); 3] = [
+        (
+            Icon::Monitor,
+            "System",
+            "Follows the desktop's own light or dark setting, and changes with it. Some Wayland compositors do not report one, in which case this is light.",
+        ),
+        (Icon::Sun, "Light", "The light palette, whatever the desktop is set to."),
+        (Icon::Moon, "Dark", "The dark palette, whatever the desktop is set to."),
+    ];
+
+    let current = Appearance::ALL
+        .iter()
+        .position(|a| *a == state.settings.appearance)
+        .unwrap_or(0);
+    if let Some(picked) = theme::icon_segmented(ui, current, &OPTIONS) {
+        state.set_appearance(Appearance::ALL[picked]);
+        theme::apply(ui.ctx());
+    }
+}
+
 /// A small toggle used for the plane picker and the workspace tabs.
 fn chip(label: &str, active: bool, enabled: bool) -> egui::Button<'static> {
     let colour = if !enabled {
-        theme::TEXT_DIM.gamma_multiply(0.45)
+        theme::palette().text_dim.gamma_multiply(0.45)
     } else if active {
-        theme::TEXT
+        theme::palette().text
     } else {
-        theme::TEXT_DIM
+        theme::palette().text_dim
     };
     egui::Button::new(RichText::new(label.to_owned()).size(11.5).color(colour))
         .fill(if active {
-            theme::SURFACE_ALT
+            theme::palette().surface_alt
         } else {
             egui::Color32::TRANSPARENT
         })
@@ -817,18 +865,20 @@ fn tools(ui: &mut egui::Ui, state: &mut AppState) {
 fn sketch_tools(ui: &mut egui::Ui, state: &mut AppState) {
     theme::section(ui, "SKETCH");
     let drawing = state.sketch.is_some();
-    let row = theme::row(ui, Icon::Pen, "Sketch a profile", drawing, true);
-    if theme::hint(
-        row,
-        "Sketch a profile",
-        "Click points on the active plane to draw a closed outline. Enter pads it into a solid, Backspace removes the last point, Escape cancels.",
-        Some("S"),
-    )
-    .clicked()
-    {
-        state.start_sketch();
-    }
-    plane_row(ui, state);
+    theme::grouped(ui, |rows| {
+        let row = rows.row(Icon::Pen, "Sketch a profile", drawing, true);
+        if theme::hint(
+            row,
+            "Sketch a profile",
+            "Click points on the active plane to draw a closed outline. Enter pads it into a solid, Backspace removes the last point, Escape cancels.",
+            Some("S"),
+        )
+        .clicked()
+        {
+            state.start_sketch();
+        }
+        rows.custom(|ui| plane_row(ui, state));
+    });
 }
 
 /// Material added to the model: padded profiles and primitive bodies.
@@ -860,12 +910,15 @@ fn add_tools(ui: &mut egui::Ui, state: &mut AppState) {
             },
         ),
     ];
-    for (glyph, label, help, profile) in pads {
-        let row = theme::row(ui, glyph, label, false, true);
-        if theme::hint(row, label, help, None).clicked() {
-            state.add_pad(profile, label);
+    theme::grouped(ui, |rows| {
+        for (glyph, label, help, profile) in pads {
+            let row = rows.row(glyph, label, false, true);
+            if theme::hint(row, label, help, None).clicked() {
+                state.add_pad(profile, label);
+            }
         }
-    }
+    });
+    ui.add_space(8.0);
 
     let bodies: [(Icon, &str, &str, Node); 3] = [
         (
@@ -894,12 +947,14 @@ fn add_tools(ui: &mut egui::Ui, state: &mut AppState) {
             },
         ),
     ];
-    for (glyph, label, help, node) in bodies {
-        let row = theme::row(ui, glyph, label, false, true);
-        if theme::hint(row, label, help, None).clicked() {
-            state.add_body(node, label);
+    theme::grouped(ui, |rows| {
+        for (glyph, label, help, node) in bodies {
+            let row = rows.row(glyph, label, false, true);
+            if theme::hint(row, label, help, None).clicked() {
+                state.add_body(node, label);
+            }
         }
-    }
+    });
 }
 
 /// Material removed from the model. Nothing to cut from an empty document.
@@ -932,17 +987,19 @@ fn cut_tools(ui: &mut egui::Ui, state: &mut AppState) {
             },
         ),
     ];
-    for (glyph, label, help, profile) in cuts {
-        let row = theme::row(ui, glyph, label, false, can_cut);
-        let help = if can_cut {
-            help
-        } else {
-            "There is nothing to cut into yet. Add a body first."
-        };
-        if theme::hint(row, label, help, None).clicked() {
-            state.add_pocket(profile, label);
+    theme::grouped(ui, |rows| {
+        for (glyph, label, help, profile) in cuts {
+            let row = rows.row(glyph, label, false, can_cut);
+            let help = if can_cut {
+                help
+            } else {
+                "There is nothing to cut into yet. Add a body first."
+            };
+            if theme::hint(row, label, help, None).clicked() {
+                state.add_pocket(profile, label);
+            }
         }
-    }
+    });
 }
 
 /// Shown by every modify tool when there is nothing to apply it to.
@@ -952,54 +1009,67 @@ const NO_SELECTION: &str = "Select a node in the design tree or the viewport fir
 fn modify_tools(ui: &mut egui::Ui, state: &mut AppState) {
     theme::section(ui, "MODIFY");
     let has_selection = state.selected.is_some();
+    let attached = state.selection_is_attached();
 
-    let row = theme::row(ui, Icon::Shell, "Shell", false, has_selection);
-    let help = if has_selection {
-        "Hollows the selection out, leaving a 2 mm wall. Useful for making a printed part lighter."
-    } else {
-        NO_SELECTION
-    };
-    if theme::hint(row, "Shell", help, None).clicked() {
-        state.wrap_selection(
-            |child| Node::Shell {
-                child,
-                thickness: 2.0,
-            },
-            "Shell",
-        );
-    }
+    theme::grouped(ui, |rows| {
+        let row = rows.row(Icon::Shell, "Shell", false, has_selection);
+        let help = if has_selection {
+            "Hollows the selection out, leaving a 2 mm wall. Useful for making a printed part lighter."
+        } else {
+            NO_SELECTION
+        };
+        if theme::hint(row, "Shell", help, None).clicked() {
+            state.wrap_selection(
+                |child| Node::Shell {
+                    child,
+                    thickness: 2.0,
+                },
+                "Shell",
+            );
+        }
 
-    let row = theme::row(ui, Icon::Offset, "Offset", false, has_selection);
-    let help = if has_selection {
-        "Grows the selection outwards by 1 mm, or shrinks it with a negative distance. Rounds convex corners as it goes."
-    } else {
-        NO_SELECTION
-    };
-    if theme::hint(row, "Offset", help, None).clicked() {
-        state.wrap_selection(
-            |child| Node::Offset {
-                child,
-                distance: 1.0,
-            },
-            "Offset",
-        );
-    }
+        let row = rows.row(Icon::Offset, "Offset", false, has_selection);
+        let help = if has_selection {
+            "Grows the selection outwards by 1 mm, or shrinks it with a negative distance. Rounds convex corners as it goes."
+        } else {
+            NO_SELECTION
+        };
+        if theme::hint(row, "Offset", help, None).clicked() {
+            state.wrap_selection(
+                |child| Node::Offset {
+                    child,
+                    distance: 1.0,
+                },
+                "Offset",
+            );
+        }
 
-    let row = theme::row(ui, Icon::Move, "Move", false, has_selection);
-    let help = if has_selection {
-        "Wraps the selection in a transform so it can be translated. Edit the offset in the property panel."
-    } else {
-        NO_SELECTION
-    };
-    if theme::hint(row, "Move", help, None).clicked() {
-        state.wrap_selection(
-            |child| Node::Transform {
-                child,
-                xform: sc_geom::Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
-            },
-            "Move",
-        );
-    }
+        let row = rows.row(Icon::Move, "Move", false, has_selection);
+        let help = if !has_selection {
+            NO_SELECTION
+        } else if attached {
+            "Slides the selection across the face it is attached to. It keeps following that face; use Detach from face to stop it."
+        } else {
+            "Wraps the selection in a transform so it can be translated. Edit the offset in the property panel."
+        };
+        if theme::hint(row, "Move", help, None).clicked() {
+            state.move_selection(Vec3::new(10.0, 0.0, 0.0));
+        }
+
+        if attached {
+            let row = rows.row(Icon::Plane, "Detach from face", false, true);
+            if theme::hint(
+                row,
+                "Detach from face",
+                "Stops this following the face it was built on. It stays exactly where it is now; only the link is cut.",
+                None,
+            )
+            .clicked()
+            {
+                state.detach_selection();
+            }
+        }
+    });
 }
 
 fn right_panel(ui: &mut egui::Ui, state: &mut AppState) {
@@ -1035,31 +1105,59 @@ fn right_panel(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// The body of the property panel for one selected node.
-fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) {
+/// Shown instead of coordinates on a placement that follows a face.
+fn derived_note(ui: &mut egui::Ui) {
+    theme::hint(
+        ui.label(
+            RichText::new("Positioned by the face it is attached to.")
+                .size(12.0)
+                .color(theme::palette().text_dim),
+        ),
+        "Derived placement",
+        "This follows the face it was built on, so its position is recomputed whenever that face moves. Use Move to slide it across the face, or Detach from face to fix it in place.",
+        None,
+    );
+}
+
+/// The selected node's icon, name and id, across the top of the panel.
+fn properties_header(ui: &mut egui::Ui, state: &AppState, id: NodeId, node: &Node) {
     ui.horizontal(|ui| {
         let (glyph, _) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
         crate::icon::draw(
             ui.painter(),
             glyph,
             crate::icon::for_kind(node.kind()),
-            theme::TEXT,
+            theme::palette().text,
         );
         ui.add_space(2.0);
         let title = state
             .doc
             .name(id)
             .map_or_else(|| capitalise(node.kind()), ToString::to_string);
-        ui.label(RichText::new(title).heading());
+        theme::large_title(ui, &title);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
                 RichText::new(format!("{id}"))
                     .size(11.0)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::palette().text_dim),
             );
         });
     });
+}
+
+fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) {
+    properties_header(ui, state, id, node);
 
     theme::section(ui, "DIMENSIONS");
+
+    // A derived placement is recomputed from the face it sits on, so its
+    // coordinates are an output rather than an input. They are still the node's
+    // data and still hashed; they are simply not something to type into, and
+    // offering a box that snaps back is worse than offering none.
+    if node.derived_from().is_some() {
+        derived_note(ui);
+        return;
+    }
 
     // Driven entirely by `Node::params`, so a new node kind gets a property
     // panel without any UI code being written for it.
@@ -1072,7 +1170,7 @@ fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) 
             ui.label(
                 RichText::new(pretty(name))
                     .size(12.5)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::palette().text_dim),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let mut v = value;
@@ -1092,7 +1190,7 @@ fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) 
         ui.label(
             RichText::new("This node has no editable dimensions.")
                 .size(11.5)
-                .color(theme::TEXT_DIM),
+                .color(theme::palette().text_dim),
         );
     }
     if let Some((name, value)) = edit {
@@ -1107,11 +1205,24 @@ fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) 
         ui.label(
             RichText::new("Smooth is the fillet radius of this joint. It applies wherever the two shapes meet.")
                 .size(11.5)
-                .color(theme::TEXT_DIM),
+                .color(theme::palette().text_dim),
         );
     }
 
     theme::section(ui, "NODE");
+    if state.selection_is_attached() {
+        let row = theme::row(ui, Icon::Plane, "Detach from face", false, true);
+        if theme::hint(
+            row,
+            "Detach from face",
+            "Stops this following the face it was built on. It stays exactly where it is now; only the link is cut.",
+            None,
+        )
+        .clicked()
+        {
+            state.detach_selection();
+        }
+    }
     if state.doc.root() != Some(id) {
         let row = theme::row(ui, Icon::Layers, "Make root", false, true);
         if theme::hint(
@@ -1181,7 +1292,7 @@ fn overlays(
                 "Drag to orbit · Right-drag to pan · Scroll to zoom · Right-click for actions",
             )
             .size(10.5)
-            .color(theme::TEXT_DIM),
+            .color(theme::palette().text_dim),
         );
     });
 
@@ -1309,16 +1420,16 @@ fn datum_planes(
             .is_some_and(|p| viewport.contains(p) && contains(&corners, p));
 
         let fill = if active {
-            theme::ACCENT.gamma_multiply(0.16)
+            theme::palette().accent.gamma_multiply(0.16)
         } else if hovered {
-            theme::ACCENT.gamma_multiply(0.10)
+            theme::palette().accent.gamma_multiply(0.10)
         } else {
-            theme::TEXT_DIM.gamma_multiply(0.05)
+            theme::palette().text_dim.gamma_multiply(0.05)
         };
         let edge = if active || hovered {
-            theme::ACCENT
+            theme::palette().accent
         } else {
-            theme::BORDER
+            theme::palette().border
         };
         painter.add(egui::Shape::convex_polygon(
             corners.clone(),
@@ -1378,17 +1489,21 @@ fn label(painter: &egui::Painter, at: egui::Pos2, text: &str) {
     let galley = painter.layout_no_wrap(
         text.to_owned(),
         egui::FontId::proportional(11.0),
-        theme::TEXT,
+        theme::palette().text,
     );
     let rect = egui::Rect::from_center_size(at, galley.size() + Vec2::new(10.0, 6.0));
-    painter.rect_filled(rect, egui::CornerRadius::same(5), theme::SURFACE);
+    painter.rect_filled(rect, egui::CornerRadius::same(5), theme::palette().surface);
     painter.rect_stroke(
         rect,
         egui::CornerRadius::same(5),
-        egui::Stroke::new(1.0, theme::BORDER),
+        egui::Stroke::new(1.0, theme::palette().border),
         egui::StrokeKind::Inside,
     );
-    painter.galley(rect.center() - galley.size() * 0.5, galley, theme::TEXT);
+    painter.galley(
+        rect.center() - galley.size() * 0.5,
+        galley,
+        theme::palette().text,
+    );
 }
 
 /// Maps a point in the viewport to normalised device coordinates.
@@ -1400,6 +1515,62 @@ pub(crate) fn ndc_of(pos: egui::Pos2, viewport: egui::Rect) -> GVec2 {
 }
 
 /// Draws the profile being sketched, and the hint telling you how to finish.
+/// The line from the last placed point to the pointer, with the length it would
+/// add and the coordinate it would land on.
+///
+/// A profile is only dimensioned if the dimension is visible while it is being
+/// placed. Reading it off afterwards is measuring, not drawing.
+fn rubber_band(
+    ui: &egui::Ui,
+    state: &AppState,
+    viewport: egui::Rect,
+    painter: &egui::Painter,
+    screen: &[egui::Pos2],
+    points: &[GVec2],
+    to_screen: &impl Fn(Vec3) -> Option<egui::Pos2>,
+) {
+    let aspect = viewport.width() / viewport.height().max(1.0);
+    let Some(cursor) = ui.ctx().pointer_latest_pos() else {
+        return;
+    };
+    if !viewport.contains(cursor) {
+        return;
+    }
+    let Some(hit) = state.camera().plane_hit(
+        ndc_of(cursor, viewport),
+        aspect,
+        state.plane_origin(),
+        state.plane_normal(),
+    ) else {
+        return;
+    };
+    let snapped = state.snap(state.to_plane(hit));
+    let Some(preview) = to_screen(state.to_world(snapped)) else {
+        return;
+    };
+
+    if let (Some(&last), Some(prev)) = (screen.last(), points.last()) {
+        painter.line_segment(
+            [last, preview],
+            egui::Stroke::new(1.5, theme::palette().accent.gamma_multiply(0.45)),
+        );
+        let length = (snapped - *prev).length();
+        label(painter, last.lerp(preview, 0.5), &format!("{length:.1} mm"));
+    }
+    // The snapped position itself, so a point can be placed at a known
+    // coordinate rather than wherever the pixel happened to land.
+    painter.circle_stroke(
+        preview,
+        3.5,
+        egui::Stroke::new(1.5, theme::palette().accent.gamma_multiply(0.7)),
+    );
+    label(
+        painter,
+        preview + Vec2::new(12.0, 14.0),
+        &format!("{:.0}, {:.0}", snapped.x, snapped.y),
+    );
+}
+
 fn sketch_overlay(
     ui: &mut egui::Ui,
     state: &AppState,
@@ -1420,7 +1591,7 @@ fn sketch_overlay(
     };
 
     let painter = ui.painter_at(viewport);
-    let stroke = egui::Stroke::new(2.0, theme::ACCENT);
+    let stroke = egui::Stroke::new(2.0, theme::palette().accent);
     // Sketch coordinates are in the plane's own frame, not always on XY. Lifting
     // them with `Vec3::new(p.x, p.y, 0.0)` draws a profile on XZ or YZ in
     // entirely the wrong place.
@@ -1436,60 +1607,22 @@ fn sketch_overlay(
     if screen.len() >= 3 {
         painter.line_segment(
             [screen[screen.len() - 1], screen[0]],
-            egui::Stroke::new(1.5, theme::ACCENT.gamma_multiply(0.5)),
+            egui::Stroke::new(1.5, theme::palette().accent.gamma_multiply(0.5)),
         );
     }
 
-    // Rubber band to wherever the pointer is on the plate, labelled with the
-    // length it would add. A profile is only dimensioned if you can see the
-    // dimension while you place it.
-    if let Some(cursor) = ui.ctx().pointer_latest_pos() {
-        if viewport.contains(cursor) {
-            if let Some(hit) = state.camera().plane_hit(
-                ndc_of(cursor, viewport),
-                aspect,
-                state.plane_origin(),
-                state.plane_normal(),
-            ) {
-                let snapped = state.snap(state.to_plane(hit));
-                let world = state.to_world(snapped);
-                if let Some(preview) = to_screen(world) {
-                    if let Some(&last) = screen.last() {
-                        painter.line_segment(
-                            [last, preview],
-                            egui::Stroke::new(1.5, theme::ACCENT.gamma_multiply(0.45)),
-                        );
-                        let length =
-                            (snapped - *points.last().expect("screen is non-empty")).length();
-                        label(
-                            &painter,
-                            last.lerp(preview, 0.5),
-                            &format!("{length:.1} mm"),
-                        );
-                    }
-                    // The snapped position itself, so a point can be placed at a
-                    // known coordinate rather than wherever the pixel landed.
-                    painter.circle_stroke(
-                        preview,
-                        3.5,
-                        egui::Stroke::new(1.5, theme::ACCENT.gamma_multiply(0.7)),
-                    );
-                    label(
-                        &painter,
-                        preview + Vec2::new(12.0, 14.0),
-                        &format!("{:.0}, {:.0}", snapped.x, snapped.y),
-                    );
-                }
-            }
-        }
-    }
+    rubber_band(ui, state, viewport, &painter, &screen, points, &to_screen);
 
     for (i, point) in screen.iter().enumerate() {
         let first = i == 0;
         painter.circle(
             *point,
             if first { 5.0 } else { 4.0 },
-            if first { theme::ACCENT } else { theme::SURFACE },
+            if first {
+                theme::palette().accent
+            } else {
+                theme::palette().surface
+            },
             stroke,
         );
     }
@@ -1514,7 +1647,7 @@ fn sketch_overlay(
                         state.grid
                     ))
                     .size(11.5)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::palette().text_dim),
                 );
             });
         });
@@ -1531,6 +1664,14 @@ fn describe_node(node: &Node) -> &'static str {
             "A ring. The major radius is the circle it follows, the minor radius its thickness."
         }
         Node::Plane { .. } => "A half space. Everything on one side of a plane is solid.",
+        Node::Prism { .. } => {
+            "A profile swept without end, used to cut all the way through. It has no depth to \
+             go stale, so the hole stays open however the part around it changes."
+        }
+        Node::Mesh { .. } => {
+            "An imported mesh, resampled onto a voxel grid so it can be cut and joined like \
+             anything else."
+        }
         Node::Union { .. } => "Both children, joined. Smooth fillets the joint between them.",
         Node::Difference { .. } => {
             "The first child with the second cut out of it. Smooth fillets the cut."
@@ -1644,6 +1785,7 @@ mod tests {
             Node::Transform {
                 child,
                 xform: Transform::IDENTITY,
+                on: None,
             },
             Node::Offset {
                 child,

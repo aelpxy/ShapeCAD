@@ -99,6 +99,21 @@ impl Transform {
         }
     }
 
+    /// The transform that undoes this one.
+    ///
+    /// Needed to express a placement in its parent's frame when what is known is
+    /// where it must end up in the world: divide out everything above it.
+    #[must_use]
+    pub fn inverse(&self) -> Self {
+        let rotation = self.rotation.inverse();
+        let scale = 1.0 / self.scale;
+        Self {
+            translation: (rotation * -self.translation) * scale,
+            rotation,
+            scale,
+        }
+    }
+
     /// Converts a distance measured in the child's frame into parent units.
     ///
     /// Forgetting this is the classic way to turn a valid distance field into
@@ -141,6 +156,31 @@ mod tests {
                 "{p:?}: {stepwise:?} vs {composed:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_inverse_undoes_the_transform() {
+        let t = Transform {
+            translation: Vec3::new(3.0, -1.0, 2.0),
+            rotation: Quat::from_rotation_z(0.7),
+            scale: 2.0,
+        };
+        let back = t.inverse();
+        for p in [
+            Vec3::ZERO,
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(-7.0, 0.5, 9.0),
+        ] {
+            let round_trip = back.apply_point(t.apply_point(p));
+            assert!(
+                (round_trip - p).length() < 1.0e-4,
+                "{p:?} came back as {round_trip:?}"
+            );
+            assert!((back.apply_point(p) - t.inverse_point(p)).length() < 1.0e-4);
+        }
+        let identity = t.then(&back);
+        assert!(identity.translation.length() < 1.0e-4, "{identity:?}");
+        assert!((identity.scale - 1.0).abs() < 1.0e-4, "{identity:?}");
     }
 
     #[test]

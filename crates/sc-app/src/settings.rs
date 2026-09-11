@@ -1,11 +1,42 @@
 //! Persisted user preferences.
 //!
-//! Interface scale and which display to open on. Kept deliberately separate
-//! from the document: how big you like the text, and which screen you work on,
-//! are properties of your machine rather than of the part.
+//! Interface scale, appearance, and which display to open on. Kept deliberately
+//! separate from the document: how big you like the text, whether you work in
+//! the dark, and which screen you use are properties of your machine rather than
+//! of the part.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// Which appearance the user asked for.
+///
+/// A request, not a result. `System` becomes one of the other two once the
+/// window system has been asked, which is the only place that answer exists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Appearance {
+    /// Follow the desktop's own light or dark setting.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub(crate) const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    /// Resolves to an actual palette.
+    ///
+    /// `system` is what the window system reports, which is `None` wherever it
+    /// declines to say. Light is the fallback: it is the scheme the application
+    /// was designed in, so it is the one guaranteed to be legible.
+    pub(crate) fn resolve(self, system: Option<crate::theme::Scheme>) -> crate::theme::Scheme {
+        match self {
+            Self::Light => crate::theme::Scheme::Light,
+            Self::Dark => crate::theme::Scheme::Dark,
+            Self::System => system.unwrap_or(crate::theme::Scheme::Light),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Settings {
@@ -24,6 +55,10 @@ pub(crate) struct Settings {
     /// application has no say.
     #[serde(default)]
     pub(crate) display: Option<String>,
+
+    /// Light, dark, or whatever the desktop is set to.
+    #[serde(default)]
+    pub(crate) appearance: Appearance,
 }
 
 fn path() -> Option<PathBuf> {
@@ -106,5 +141,53 @@ mod tests {
     #[test]
     fn an_unknown_display_falls_back_to_no_scaling() {
         assert!((auto_scale(0, 1.0) - 1.0).abs() < f32::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::Appearance;
+    use crate::theme::Scheme;
+
+    /// An explicit choice wins over whatever the desktop is doing. That is the
+    /// whole point of offering one.
+    #[test]
+    fn an_explicit_choice_ignores_the_desktop() {
+        for system in [None, Some(Scheme::Light), Some(Scheme::Dark)] {
+            assert_eq!(Appearance::Light.resolve(system), Scheme::Light);
+            assert_eq!(Appearance::Dark.resolve(system), Scheme::Dark);
+        }
+    }
+
+    #[test]
+    fn following_the_system_follows_the_system() {
+        assert_eq!(Appearance::System.resolve(Some(Scheme::Dark)), Scheme::Dark);
+        assert_eq!(
+            Appearance::System.resolve(Some(Scheme::Light)),
+            Scheme::Light
+        );
+    }
+
+    /// Several Wayland compositors never report a colour scheme. Having nothing
+    /// to follow is not an error, and it must not leave the interface unstyled.
+    #[test]
+    fn an_unanswered_system_falls_back_to_light() {
+        assert_eq!(Appearance::System.resolve(None), Scheme::Light);
+    }
+
+    /// A settings file written before this preference existed must load, and
+    /// must not silently pin the user to one scheme.
+    #[test]
+    fn an_older_settings_file_defaults_to_following_the_system() {
+        let older = r#"{ "ui_scale": 1.5 }"#;
+        let loaded: super::Settings = serde_json::from_str(older).expect("older settings load");
+        assert_eq!(loaded.appearance, Appearance::System);
+        assert_eq!(loaded.ui_scale, Some(1.5));
+    }
+
+    #[test]
+    fn every_appearance_is_offered() {
+        assert_eq!(Appearance::ALL.len(), 3);
+        assert!(Appearance::ALL.contains(&Appearance::default()));
     }
 }

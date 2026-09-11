@@ -6,7 +6,7 @@ points here so the two cannot drift apart.
 ShapeCAD is a CAD program for 3D printing. Geometry is a DAG of signed distance
 functions, not a boundary representation. Read [docs/architecture.md](docs/architecture.md)
 before your first change, and [docs/kernel.md](docs/kernel.md) before touching
-geometry. The four decision records in [docs/adr/](docs/adr/) explain why the
+geometry. The five decision records in [docs/adr/](docs/adr/) explain why the
 design is what it is.
 
 ## Non-negotiables
@@ -32,7 +32,7 @@ These are load-bearing. Breaking one is a bug even if the tests pass.
 | ------------------ | ------------------------------------------------------------------ |
 | `crates/sc-geom`   | The kernel: node DAG, evaluation, bounds, hashing, WGSL generation |
 | `crates/sc-doc`    | Documents: command log, undo, `.shapecad` format, sample parts     |
-| `crates/sc-mesh`   | Dual contouring to printable triangles, STL output                 |
+| `crates/sc-mesh`   | Dual contouring out, STL and OBJ import in, voxelization to a grid  |
 | `crates/sc-render` | Viewport, camera, GPU selection, offscreen capture                 |
 | `crates/sc-app`    | The desktop application                                            |
 | `crates/sc-cli`    | Headless runner                                                    |
@@ -45,7 +45,7 @@ edge that points back up.
 ## Commands
 
 ```sh
-cargo test --workspace                  # 90 tests
+cargo test --workspace                  # 179 tests
 cargo clippy --workspace --all-targets --all-features
 cargo fmt --all
 cargo run --release -p sc-app           # the application
@@ -131,11 +131,31 @@ an editor for free.
   every frame.
 - **Under WSL the only hardware GPU path reports itself as non-conformant** and
   crashes if driven off the main thread. See [docs/building.md](docs/building.md).
+- **Animate with `motion::animate`, and integrate in fixed slices.** One spring
+  step per frame makes the motion run at different speeds on different displays:
+  measured 0.68 at 60Hz against 0.63 at 144Hz for the same tuning. The
+  substepping in `Spring::step` is not an optimisation to remove.
+- **Viewport colours are linear; interface colours are sRGB.** The shader writes
+  into a linear target and the swapchain encodes on the way out, so a hex colour
+  dropped into the scene palette comes out about two and a half times too light.
+  `#1F1F23` is `0.0137`, not `0.12`. Capture with `--dark` and look at it.
 - **Putting a new node where an old one sat means rewiring every parent.** The
   arena is a DAG, so `Arena::parents_of` can return more than one, and read it
   before creating the new node or the new node rewires itself into a loop. Miss
   this and the edit fails silently: the node exists, the tree shows it, and the
   model hashes exactly as it did before.
+- **A placement resolved from a face goes stale unless it says so.** The
+  transform that puts a pad on another pad's face is a number computed once. If
+  it does not carry `on`, the feature freezes where it was created and the model
+  quietly comes apart the first time the base is re-dimensioned: two
+  disconnected pieces, still watertight, still hashing, with nothing on screen to
+  say anything is wrong. Anything that composes a frame from `sketch_frame` and
+  writes it into the tree has to record where the frame came from. See
+  [ADR 0005](docs/adr/0005-derived-placements.md).
+- **A local offset folded into a derived placement is erased by the next
+  regeneration.** Regeneration rewrites a derived `xform` wholesale, so a
+  pocket's overshoot (or any other feature-local nudge) belongs in a placement of
+  its own underneath it, not composed into the frame.
 - **A user action is usually several commands.** Bracket it with
   `Document::begin_step` and `end_step`, or `AppState::as_one_step`, so one press
   of undo takes back the whole thing. A hash check alone will not catch a missing

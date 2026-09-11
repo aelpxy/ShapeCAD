@@ -6,6 +6,7 @@
 
 mod dialog;
 mod icon;
+mod motion;
 mod plane;
 mod settings;
 mod snapshot;
@@ -41,6 +42,11 @@ fn main() {
         } else {
             snapshot::Scene::Empty
         };
+        // Both palettes have to be capturable, or the dark one can only be
+        // checked by running the application and looking at it.
+        if args.iter().any(|a| a == "--dark") {
+            crate::theme::set_scheme(crate::theme::Scheme::Dark);
+        }
         let value = |flag: &str| -> Option<f32> {
             let i = args.iter().position(|a| a == flag)?;
             args.get(i + 1)?.parse().ok()
@@ -130,6 +136,23 @@ struct Gpu {
     field: Renderer,
     egui_renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
+}
+
+/// Translates winit's report of the desktop appearance into ours.
+fn scheme_of(theme: winit::window::Theme) -> crate::theme::Scheme {
+    match theme {
+        winit::window::Theme::Dark => crate::theme::Scheme::Dark,
+        winit::window::Theme::Light => crate::theme::Scheme::Light,
+    }
+}
+
+/// What the desktop says its colour scheme is, if it says anything.
+///
+/// `None` is a normal answer, not a failure. Several Wayland compositors do not
+/// expose the setting at all, in which case "follow the system" has nothing to
+/// follow and resolves to light.
+fn window_scheme(window: &Window) -> Option<crate::theme::Scheme> {
+    window.theme().map(scheme_of)
 }
 
 /// Width of the display in physical pixels, or zero if it cannot be determined.
@@ -518,6 +541,9 @@ impl App {
             self.viewport[2].min(gpu.config.width as f32 - self.viewport[0]),
             self.viewport[3].min(gpu.config.height as f32 - self.viewport[1]),
         ];
+        // Cheap enough to restate every frame, and it means the viewport can
+        // never be a frame behind the chrome when the palette changes.
+        gpu.field.set_scene(crate::theme::scene());
         gpu.field.draw_in(
             &gpu.queue,
             &mut encoder,
@@ -872,6 +898,10 @@ impl ApplicationHandler for App {
         );
 
         let ctx = egui::Context::default();
+        // Asked before the first frame, so the window does not flash light and
+        // then correct itself.
+        self.state.set_system_scheme(window_scheme(&window));
+        self.state.apply_appearance();
         crate::theme::apply(&ctx);
         // Many Linux compositors report 1.0 on a 4K panel. Measure the display
         // and pick a sensible zoom rather than rendering everything half-size.
@@ -972,6 +1002,17 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 self.handle_mouse_button(state, button);
+            }
+
+            // The desktop switched between light and dark while we were running.
+            // Only matters when the user asked to follow it, which
+            // `set_system_scheme` decides.
+            WindowEvent::ThemeChanged(theme) => {
+                self.state.set_system_scheme(Some(scheme_of(theme)));
+                if let Some(gpu) = self.gpu.as_ref() {
+                    crate::theme::apply(gpu.egui_state.egui_ctx());
+                }
+                self.request_redraw();
             }
 
             WindowEvent::CursorMoved { position, .. } => {

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc de8817755db42eafb8572864bd871afc9f34bc206e5bcbc3ed15ea69be48b30f # shrinks to s = Rotate(Difference(Sphere(0.5), On(Sphere(0.5), Mesh(1.0, 9, false), [0.0, 0.0, 0.0]), 0.0), [0.0, 0.0, 0.0])

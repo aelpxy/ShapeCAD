@@ -24,10 +24,48 @@ struct CameraUniform {
     up: [f32; 4],
     /// xyz = forward vector, w = angular size of one pixel
     forward: [f32; 4],
+    /// Scene colours, xyz each. Padded to `vec4` because a uniform buffer aligns
+    /// three-component vectors to sixteen bytes anyway.
+    sky: [f32; 4],
+    haze: [f32; 4],
+    plate: [f32; 4],
+    grid: [f32; 4],
+}
+
+/// The viewport's share of the interface palette.
+///
+/// Held by the renderer rather than passed per draw, because it changes when the
+/// user switches appearance and not otherwise. Defaults to the light scheme, so
+/// a caller that never sets one gets what the viewport has always looked like.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScenePalette {
+    /// Top of the background sweep.
+    pub sky: [f32; 3],
+    /// The background at the horizon.
+    pub haze: [f32; 3],
+    /// The build plate.
+    pub plate: [f32; 3],
+    /// Grid lines on the plate.
+    pub grid: [f32; 3],
+}
+
+impl Default for ScenePalette {
+    fn default() -> Self {
+        Self {
+            sky: [0.700, 0.735, 0.790],
+            haze: [0.930, 0.943, 0.962],
+            plate: [0.895, 0.910, 0.930],
+            grid: [0.66, 0.69, 0.73],
+        }
+    }
+}
+
+fn rgb4(c: [f32; 3]) -> [f32; 4] {
+    [c[0], c[1], c[2], 0.0]
 }
 
 impl CameraUniform {
-    fn new(cam: &OrbitCamera, width: u32, height: u32) -> Self {
+    fn new(cam: &OrbitCamera, width: u32, height: u32, scene: ScenePalette) -> Self {
         let (right, up, forward) = cam.basis();
         let eye = cam.eye();
         let aspect = width.max(1) as f32 / height.max(1) as f32;
@@ -37,6 +75,10 @@ impl CameraUniform {
             right: [right.x, right.y, right.z, aspect],
             up: [up.x, up.y, up.z, cam.far()],
             forward: [forward.x, forward.y, forward.z, cam.pixel_angle(height)],
+            sky: rgb4(scene.sky),
+            haze: rgb4(scene.haze),
+            plate: rgb4(scene.plate),
+            grid: rgb4(scene.grid),
         }
     }
 }
@@ -50,6 +92,8 @@ pub struct Renderer {
     params: wgpu::Buffer,
     /// Floats the parameter buffer can hold before it must be reallocated.
     params_capacity: usize,
+    /// Scene colours, following the interface palette.
+    scene: ScenePalette,
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     pipeline_layout: wgpu::PipelineLayout,
@@ -134,7 +178,17 @@ impl Renderer {
             pipeline_layout,
             pipeline,
             source: field.source.clone(),
+            scene: ScenePalette::default(),
         }
+    }
+
+    /// Sets the viewport's colours. Takes effect on the next draw.
+    ///
+    /// Only the uniform changes, so switching appearance does not rebuild the
+    /// pipeline: the scene palette is data the shader reads, not part of its
+    /// source.
+    pub fn set_scene(&mut self, scene: ScenePalette) {
+        self.scene = scene;
     }
 
     /// Applies a newly generated field.
@@ -209,7 +263,7 @@ impl Renderer {
         queue.write_buffer(
             &self.uniform,
             0,
-            bytemuck::bytes_of(&CameraUniform::new(camera, w as u32, h as u32)),
+            bytemuck::bytes_of(&CameraUniform::new(camera, w as u32, h as u32, self.scene)),
         );
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

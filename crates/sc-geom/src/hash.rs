@@ -190,6 +190,12 @@ fn structure_of(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, u64>) -> u
                     h.write_f32(c);
                 }
             }
+            // Nor is a voxel grid: a mesh has no parameters at all, so without
+            // this every import would hash the same as every other one.
+            if let crate::node::Node::Mesh { asset, grid } = node {
+                h.write_u64(u64::from(asset.0));
+                h.write_u64(grid.digest());
+            }
             let child_hashes: Vec<u64> = node
                 .children()
                 .collect::<Vec<_>>()

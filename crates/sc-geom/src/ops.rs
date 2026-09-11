@@ -108,7 +108,11 @@ impl Builder {
     /// # Errors
     /// Propagates validation failures from [`Arena::insert`].
     pub fn transform(&mut self, child: NodeId, xform: Transform) -> Result<NodeId> {
-        self.arena.insert(Node::Transform { child, xform })
+        self.arena.insert(Node::Transform {
+            child,
+            xform,
+            on: None,
+        })
     }
 
     /// # Errors

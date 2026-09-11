@@ -6,34 +6,207 @@
 
 use egui::{Color32, CornerRadius, FontFamily, FontId, Margin, Shadow, Stroke, TextStyle, Vec2};
 
-// A neutral scale, kept deliberately colourless so the only saturated thing on
-// screen is the selected geometry. Values follow the zinc ramp that shadcn/ui
-// defaults to.
+/// Which of the two palettes is in use.
+///
+/// Resolved, not requested: "follow the system" is a preference, and by the time
+/// anything is painted it has become one of these.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Scheme {
+    #[default]
+    Light,
+    Dark,
+}
 
-/// Application background, behind the cards.
-pub(crate) const CANVAS: Color32 = Color32::from_rgb(0xFA, 0xFA, 0xFA);
-/// Card and panel fill.
-pub(crate) const SURFACE: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-/// Inset and hover fill.
-pub(crate) const SURFACE_ALT: Color32 = Color32::from_rgb(0xF4, 0xF4, 0xF5);
-/// Hairline borders.
-pub(crate) const BORDER: Color32 = Color32::from_rgb(0xE4, 0xE4, 0xE7);
-/// Primary text.
-pub(crate) const TEXT: Color32 = Color32::from_rgb(0x09, 0x09, 0x0B);
-/// Secondary text: units, hints, metadata.
-pub(crate) const TEXT_DIM: Color32 = Color32::from_rgb(0x71, 0x71, 0x7A);
-/// Reserved for selected geometry, in the viewport and in the tree.
-pub(crate) const ACCENT: Color32 = Color32::from_rgb(0x25, 0x63, 0xEB);
-/// Selection background.
-pub(crate) const ACCENT_SOFT: Color32 = Color32::from_rgb(0xEF, 0xF6, 0xFF);
-/// Near-black, for the single primary action.
-/// Destructive actions. The only other hue in the interface.
-pub(crate) const DANGER: Color32 = Color32::from_rgb(0xDC, 0x26, 0x26);
-/// Near-black, used for the single primary button and the application mark.
-pub(crate) const INK: Color32 = Color32::from_rgb(0x18, 0x18, 0x1B);
+/// Every colour the interface uses, so a scheme is one value rather than a
+/// scattering of `if dark` branches at the call sites.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Palette {
+    /// Application background, behind the cards.
+    pub canvas: Color32,
+    /// Card and panel fill.
+    pub surface: Color32,
+    /// Inset and hover fill.
+    pub surface_alt: Color32,
+    /// Hairline borders.
+    pub border: Color32,
+    /// Primary text.
+    pub text: Color32,
+    /// Secondary text: units, hints, metadata.
+    pub text_dim: Color32,
+    /// Reserved for selected geometry, in the viewport and in the tree.
+    pub accent: Color32,
+    /// Selection background.
+    pub accent_soft: Color32,
+    /// Destructive actions. The only other hue in the interface.
+    pub danger: Color32,
+    /// The single primary button and the application mark.
+    pub ink: Color32,
+    /// Text on top of `ink`.
+    pub on_ink: Color32,
+    /// Viewport sky, at the top of the sweep.
+    pub sky: [f32; 3],
+    /// Viewport sky, at the horizon.
+    pub haze: [f32; 3],
+    /// The build plate.
+    pub plate: [f32; 3],
+    /// Grid lines on the plate.
+    pub grid: [f32; 3],
+}
 
-const CARD_RADIUS: u8 = 8;
-const WIDGET_RADIUS: u8 = 6;
+// Apple's system colours, which is what makes an interface read as native on a
+// platform that has them and as deliberate on one that does not. A grouped
+// background behind raised content, one system blue, one system red, and labels
+// at two levels of emphasis.
+
+const LIGHT: Palette = Palette {
+    // systemGroupedBackground: the interface sits *in* something, rather than
+    // floating on white. This is what gives grouped lists their edges without
+    // needing a border around each one.
+    canvas: Color32::from_rgb(0xF2, 0xF2, 0xF7),
+    surface: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    // tertiarySystemFill, the pressed and selected state of a control.
+    surface_alt: Color32::from_rgb(0xE7, 0xE7, 0xEC),
+    // separator, opaque. Hairlines are the only structure between list rows.
+    border: Color32::from_rgb(0xD8, 0xD8, 0xDD),
+    // label and secondaryLabel.
+    text: Color32::from_rgb(0x1C, 0x1C, 0x1E),
+    text_dim: Color32::from_rgb(0x8A, 0x8A, 0x8E),
+    // systemBlue.
+    accent: Color32::from_rgb(0x00, 0x7A, 0xFF),
+    accent_soft: Color32::from_rgb(0xE4, 0xEF, 0xFF),
+    // systemRed.
+    danger: Color32::from_rgb(0xFF, 0x3B, 0x30),
+    // A filled primary button is tinted, not black: on this platform the single
+    // most important action is the accent colour, and everything else is plain.
+    ink: Color32::from_rgb(0x00, 0x7A, 0xFF),
+    on_ink: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    sky: [0.700, 0.735, 0.790],
+    haze: [0.930, 0.943, 0.962],
+    plate: [0.895, 0.910, 0.930],
+    grid: [0.66, 0.69, 0.73],
+};
+
+// The dark system palette. Surfaces lift as they come forward, which is the
+// reverse of the light scheme, because on a dark background a raised card reads
+// by being lighter than what is behind it.
+//
+// The canvas is pure black on purpose: that is what the platform does, and it is
+// what lets the raised surfaces read as raised at all.
+const DARK: Palette = Palette {
+    canvas: Color32::from_rgb(0x00, 0x00, 0x00),
+    // secondarySystemGroupedBackground and tertiary, the two raised levels.
+    surface: Color32::from_rgb(0x1C, 0x1C, 0x1E),
+    surface_alt: Color32::from_rgb(0x2C, 0x2C, 0x2E),
+    border: Color32::from_rgb(0x38, 0x38, 0x3A),
+    text: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    text_dim: Color32::from_rgb(0x98, 0x98, 0x9F),
+    // systemBlue and systemRed, dark variants: both are lifted, because the
+    // light ones do not carry against a dark surface.
+    accent: Color32::from_rgb(0x0A, 0x84, 0xFF),
+    accent_soft: Color32::from_rgb(0x0A, 0x25, 0x40),
+    danger: Color32::from_rgb(0xFF, 0x45, 0x3A),
+    ink: Color32::from_rgb(0x0A, 0x84, 0xFF),
+    on_ink: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    // Linear, not sRGB: the shader writes into a linear target and the swapchain
+    // encodes on the way out, so a value picked to look right as a hex colour
+    // comes out roughly two and a half times too light. These are the zinc ramp
+    // converted, and they match the chrome beside them:
+    // #0B0B0E, #18181B, #1F1F23, #3F3F46.
+    sky: [0.0033, 0.0033, 0.0044],
+    haze: [0.0091, 0.0091, 0.0110],
+    plate: [0.0137, 0.0137, 0.0168],
+    grid: [0.0497, 0.0497, 0.0612],
+};
+
+/// The active scheme, as a `u8` so the palette can be read from anywhere that
+/// paints without threading it through every function that draws a label.
+///
+/// A desktop application has exactly one appearance at a time, so this is a
+/// property of the process rather than of any one widget tree.
+static ACTIVE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Switches the palette. Takes effect on the next frame.
+pub(crate) fn set_scheme(scheme: Scheme) {
+    ACTIVE.store(scheme as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[must_use]
+pub(crate) fn scheme() -> Scheme {
+    if ACTIVE.load(std::sync::atomic::Ordering::Relaxed) == Scheme::Dark as u8 {
+        Scheme::Dark
+    } else {
+        Scheme::Light
+    }
+}
+
+/// The viewport's share of the palette, in the form the renderer wants.
+#[must_use]
+pub(crate) fn scene() -> sc_render::ScenePalette {
+    let p = palette();
+    sc_render::ScenePalette {
+        sky: p.sky,
+        haze: p.haze,
+        plate: p.plate,
+        grid: p.grid,
+    }
+}
+
+/// The colours in force right now.
+#[must_use]
+pub(crate) fn palette() -> Palette {
+    match scheme() {
+        Scheme::Light => LIGHT,
+        Scheme::Dark => DARK,
+    }
+}
+
+/// Corner radii, on the platform's scale rather than the web's.
+///
+/// A grouped list is 10, a card or sheet is larger, and a control inside one is
+/// smaller than the thing containing it or the two corners fight.
+const CARD_RADIUS: u8 = 14;
+const WIDGET_RADIUS: u8 = 9;
+/// A pill: a segmented control's track and the indicator that slides along it.
+const PILL_RADIUS: u8 = 8;
+/// A grouped list. Smaller than a card, because a group sits inside one.
+const GROUP_RADIUS: u8 = 10;
+/// Where a grouped row's label starts, measured from the group's edge.
+const GROUP_INSET: f32 = 6.0;
+
+/// How far a control shrinks while it is held down.
+///
+/// Pressing something should move it. A tint alone reads as a state change,
+/// which is a different message from "this is responding to you".
+const PRESS_SHRINK: f32 = 0.045;
+
+/// Shrinks a rect about its centre.
+fn scaled(rect: egui::Rect, factor: f32) -> egui::Rect {
+    egui::Rect::from_center_size(rect.center(), rect.size() * factor)
+}
+
+/// The factor to draw a control at, given whether it is currently held.
+///
+/// Springs, so releasing rebounds rather than snapping back.
+fn press_scale(ui: &egui::Ui, response: &egui::Response) -> f32 {
+    let held = response.is_pointer_button_down_on();
+    let t = crate::motion::animate_bool(
+        ui,
+        response.id.with("press"),
+        held,
+        crate::motion::Tuning::SNAPPY,
+    );
+    1.0 - PRESS_SHRINK * t
+}
+
+/// How far into its hover state a widget is, from 0 to 1.
+fn hover_fade(ui: &egui::Ui, response: &egui::Response) -> f32 {
+    crate::motion::animate_bool(
+        ui,
+        response.id.with("hover"),
+        response.hovered(),
+        crate::motion::Tuning::SMOOTH,
+    )
+}
 
 /// Family used for headings and emphasis.
 ///
@@ -82,9 +255,11 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
 /// Installs the palette and metrics.
 pub(crate) fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
-    // The application is light-themed by design, so the light style is both
-    // themes: egui would otherwise swap palettes with the desktop preference and
-    // undo everything below.
+    // Pinned to egui's light style regardless of the palette in force. Every
+    // colour that shows is set from `palette()` below, and letting egui swap its
+    // own base underneath would change the handful this does not name, giving a
+    // scheme assembled from two sources instead of one. Idempotent, so it can be
+    // called again whenever the palette changes.
     ctx.set_theme(egui::ThemePreference::Light);
     let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
 
@@ -128,17 +303,17 @@ pub(crate) fn apply(ctx: &egui::Context) {
 
     let v = &mut style.visuals;
     v.dark_mode = false;
-    v.panel_fill = CANVAS;
-    v.window_fill = SURFACE;
-    v.window_stroke = Stroke::new(1.0, BORDER);
+    v.panel_fill = palette().canvas;
+    v.window_fill = palette().surface;
+    v.window_stroke = Stroke::new(1.0, palette().border);
     v.window_corner_radius = CornerRadius::same(CARD_RADIUS);
-    v.extreme_bg_color = SURFACE_ALT;
-    v.faint_bg_color = SURFACE_ALT;
-    v.override_text_color = Some(TEXT);
-    v.weak_text_color = Some(TEXT_DIM);
-    v.selection.bg_fill = ACCENT_SOFT;
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
-    v.hyperlink_color = ACCENT;
+    v.extreme_bg_color = palette().surface_alt;
+    v.faint_bg_color = palette().surface_alt;
+    v.override_text_color = Some(palette().text);
+    v.weak_text_color = Some(palette().text_dim);
+    v.selection.bg_fill = palette().accent_soft;
+    v.selection.stroke = Stroke::new(1.0, palette().accent);
+    v.hyperlink_color = palette().accent;
     // Barely there. A card is separated by its border, not by a drop shadow.
     v.window_shadow = Shadow {
         offset: [0, 1],
@@ -165,31 +340,31 @@ pub(crate) fn apply(ctx: &egui::Context) {
         &mut w.open,
     ] {
         s.corner_radius = CornerRadius::same(WIDGET_RADIUS);
-        s.fg_stroke = Stroke::new(1.0, TEXT);
+        s.fg_stroke = Stroke::new(1.0, palette().text);
         s.expansion = 0.0;
     }
-    w.noninteractive.bg_fill = SURFACE;
-    w.noninteractive.weak_bg_fill = SURFACE;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    w.noninteractive.bg_fill = palette().surface;
+    w.noninteractive.weak_bg_fill = palette().surface;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, palette().border);
 
-    w.inactive.bg_fill = SURFACE_ALT;
-    w.inactive.weak_bg_fill = SURFACE_ALT;
-    w.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+    w.inactive.bg_fill = palette().surface_alt;
+    w.inactive.weak_bg_fill = palette().surface_alt;
+    w.inactive.bg_stroke = Stroke::new(1.0, palette().border);
 
-    w.hovered.bg_fill = SURFACE_ALT;
-    w.hovered.weak_bg_fill = SURFACE_ALT;
+    w.hovered.bg_fill = palette().surface_alt;
+    w.hovered.weak_bg_fill = palette().surface_alt;
     w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xD4, 0xD4, 0xD8));
 
-    w.active.bg_fill = SURFACE_ALT;
-    w.active.weak_bg_fill = SURFACE_ALT;
+    w.active.bg_fill = palette().surface_alt;
+    w.active.weak_bg_fill = palette().surface_alt;
     w.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xA1, 0xA1, 0xAA));
     // Not the accent: `Visuals::strong_text_color` reads this, so tinting it
     // would turn every bold label in the application blue.
-    w.active.fg_stroke = Stroke::new(1.0, TEXT);
+    w.active.fg_stroke = Stroke::new(1.0, palette().text);
 
-    w.open.bg_fill = SURFACE_ALT;
-    w.open.weak_bg_fill = SURFACE_ALT;
-    w.open.bg_stroke = Stroke::new(1.0, BORDER);
+    w.open.bg_fill = palette().surface_alt;
+    w.open.weak_bg_fill = palette().surface_alt;
+    w.open.bg_stroke = Stroke::new(1.0, palette().border);
 
     ctx.set_style_of(egui::Theme::Light, style.clone());
     ctx.set_style_of(egui::Theme::Dark, style);
@@ -198,8 +373,8 @@ pub(crate) fn apply(ctx: &egui::Context) {
 /// A white card: the unit the whole layout is built from.
 pub(crate) fn card() -> egui::Frame {
     egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0, BORDER))
+        .fill(palette().surface)
+        .stroke(Stroke::new(1.0, palette().border))
         .corner_radius(CornerRadius::same(CARD_RADIUS))
         .inner_margin(Margin::symmetric(14, 12))
 }
@@ -218,7 +393,7 @@ pub(crate) fn floating() -> egui::Frame {
 pub(crate) fn bar(bottom_border: bool) -> egui::Frame {
     let _ = bottom_border;
     egui::Frame::new()
-        .fill(SURFACE)
+        .fill(palette().surface)
         .inner_margin(Margin::symmetric(14, 0))
 }
 
@@ -232,14 +407,104 @@ pub(crate) fn section(ui: &mut egui::Ui, text: &str) {
         .collect::<String>()
         .trim_end()
         .to_owned();
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new(spaced)
-            .size(10.5)
-            .color(TEXT_DIM)
-            .family(semibold()),
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        // Indented to the same place a row's label starts, so the header reads
+        // as belonging to the group under it rather than to the panel.
+        ui.add_space(GROUP_INSET);
+        ui.label(
+            egui::RichText::new(spaced)
+                .size(10.5)
+                .color(palette().text_dim)
+                .family(semibold()),
+        );
+    });
+    ui.add_space(5.0);
+}
+
+/// A grouped list: a run of rows on one rounded surface.
+///
+/// This is the shape a settings or tool list takes on the platform. Rows do not
+/// carry their own chrome; the group does, and the rows inside it are separated
+/// by hairlines rather than by gaps. Read as one object with parts, instead of
+/// as a column of independent buttons.
+pub(crate) fn group() -> egui::Frame {
+    egui::Frame::new()
+        .fill(palette().surface)
+        .corner_radius(CornerRadius::same(GROUP_RADIUS))
+        .inner_margin(Margin::symmetric(6, 4))
+}
+
+/// Builds the rows of a grouped list, putting the hairlines in for you.
+///
+/// The separator belongs between rows and nowhere else, which is fiddly to get
+/// right by hand in a list whose length depends on what is selected. Asking for
+/// rows and inserting them here means it cannot be got wrong.
+pub(crate) struct Rows<'a> {
+    ui: &'a mut egui::Ui,
+    placed: bool,
+}
+
+impl Rows<'_> {
+    pub(crate) fn row(
+        &mut self,
+        icon: crate::icon::Icon,
+        label: &str,
+        active: bool,
+        enabled: bool,
+    ) -> egui::Response {
+        self.divide();
+        row(self.ui, icon, label, active, enabled)
+    }
+
+    /// A row that is not one of ours, drawn with the separator still handled.
+    pub(crate) fn custom<T>(&mut self, add: impl FnOnce(&mut egui::Ui) -> T) -> T {
+        self.divide();
+        add(self.ui)
+    }
+
+    fn divide(&mut self) {
+        if self.placed {
+            group_separator(self.ui);
+        }
+        self.placed = true;
+    }
+}
+
+/// A grouped list of rows on one rounded surface.
+pub(crate) fn grouped(ui: &mut egui::Ui, add: impl FnOnce(&mut Rows<'_>)) {
+    group().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        add(&mut Rows { ui, placed: false });
+    });
+}
+
+/// The hairline between two rows of a group.
+///
+/// Inset from the left so it starts under the label rather than under the icon,
+/// which is what stops a list of rows looking like a table.
+pub(crate) fn group_separator(ui: &mut egui::Ui) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        (rect.left() + 33.0)..=rect.right(),
+        rect.center().y,
+        Stroke::new(1.0, palette().border),
     );
-    ui.add_space(2.0);
+}
+
+/// A large navigation title.
+///
+/// Sits above its content at a size nothing else in the panel comes near, which
+/// is what makes a panel read as a place rather than as a region.
+pub(crate) fn large_title(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.label(
+        egui::RichText::new(text)
+            .size(21.0)
+            .family(semibold())
+            .color(palette().text),
+    )
 }
 
 /// A sidebar row: icon, label, full width, no chrome until hovered.
@@ -262,24 +527,35 @@ pub(crate) fn row(
         },
     );
 
+    // Selected sits at full strength, hover at a little over half, so the two
+    // are distinguishable while the pointer is on the selected row.
     let hovered = enabled && response.hovered();
-    let fill = if active || hovered {
-        SURFACE_ALT
+    let target = if active {
+        1.0
+    } else if hovered {
+        0.6
     } else {
-        Color32::TRANSPARENT
+        0.0
     };
+    let fade = crate::motion::animate(
+        ui,
+        response.id.with("fill"),
+        target,
+        crate::motion::Tuning::SMOOTH,
+    );
+    let fill = palette().surface_alt.gamma_multiply(fade);
     let tint = if enabled {
         if active {
-            TEXT
+            palette().text
         } else {
-            TEXT_DIM
+            palette().text_dim
         }
     } else {
-        TEXT_DIM.gamma_multiply(0.45)
+        palette().text_dim.gamma_multiply(0.45)
     };
 
     let painter = ui.painter();
-    if fill != Color32::TRANSPARENT {
+    if fade > 0.0 {
         painter.rect_filled(rect, CornerRadius::same(WIDGET_RADIUS), fill);
     }
 
@@ -295,9 +571,9 @@ pub(crate) fn row(
         label,
         egui::FontId::proportional(12.5),
         if enabled {
-            TEXT
+            palette().text
         } else {
-            TEXT_DIM.gamma_multiply(0.6)
+            palette().text_dim.gamma_multiply(0.6)
         },
     );
 
@@ -370,32 +646,43 @@ fn paint_button(
     active: bool,
     enabled: bool,
 ) {
-    let hovered = enabled && response.hovered();
     let painter = ui.painter();
-    let fill = if active {
-        ACCENT_SOFT
-    } else if hovered {
-        SURFACE_ALT
+    // The fill fades and the whole control shrinks under the pointer. Both are
+    // springs, so an interrupted press rebounds from wherever it had got to
+    // rather than restarting.
+    let hover = if enabled {
+        hover_fade(ui, response)
     } else {
-        Color32::TRANSPARENT
+        0.0
     };
-    if fill != Color32::TRANSPARENT {
+    let held = if enabled {
+        press_scale(ui, response)
+    } else {
+        1.0
+    };
+    let rect = scaled(rect, held);
+    let fill = if active {
+        palette().accent_soft
+    } else {
+        palette().surface_alt.gamma_multiply(hover)
+    };
+    if active || hover > 0.0 {
         painter.rect_filled(rect, CornerRadius::same(WIDGET_RADIUS), fill);
     }
 
     let tint = if !enabled {
-        TEXT_DIM.gamma_multiply(0.45)
+        palette().text_dim.gamma_multiply(0.45)
     } else if active {
-        ACCENT
+        palette().accent
     } else {
-        TEXT_DIM
+        palette().text_dim
     };
     let text = if !enabled {
-        TEXT_DIM.gamma_multiply(0.6)
+        palette().text_dim.gamma_multiply(0.6)
     } else if active {
-        ACCENT
+        palette().accent
     } else {
-        TEXT
+        palette().text
     };
 
     match galley {
@@ -437,9 +724,17 @@ pub(crate) fn tree_row(
     let painter = ui.painter();
 
     if selected {
-        painter.rect_filled(rect, CornerRadius::same(WIDGET_RADIUS), ACCENT_SOFT);
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(WIDGET_RADIUS),
+            palette().accent_soft,
+        );
     } else if response.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(WIDGET_RADIUS), SURFACE_ALT);
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(WIDGET_RADIUS),
+            palette().surface_alt,
+        );
     }
 
     // One hairline per level of nesting, so parentage is visible without
@@ -451,11 +746,15 @@ pub(crate) fn tree_row(
                 egui::pos2(x, rect.top() + 1.0),
                 egui::pos2(x, rect.bottom() - 1.0),
             ],
-            Stroke::new(1.0, BORDER),
+            Stroke::new(1.0, palette().border),
         );
     }
 
-    let tint = if selected { ACCENT } else { TEXT_DIM };
+    let tint = if selected {
+        palette().accent
+    } else {
+        palette().text_dim
+    };
     let glyph = egui::Rect::from_center_size(
         egui::pos2(rect.left() + indent + 16.0, rect.center().y),
         Vec2::splat(14.0),
@@ -472,7 +771,11 @@ pub(crate) fn tree_row(
     painter.galley(
         egui::pos2(x, rect.center().y - text.size().y * 0.5),
         text,
-        if selected { ACCENT } else { TEXT },
+        if selected {
+            palette().accent
+        } else {
+            palette().text
+        },
     );
     x += width + 6.0;
 
@@ -482,7 +785,7 @@ pub(crate) fn tree_row(
             egui::Align2::LEFT_CENTER,
             note,
             egui::FontId::proportional(10.5),
-            TEXT_DIM,
+            palette().text_dim,
         );
     }
 
@@ -510,13 +813,17 @@ pub(crate) fn hint(
                 ui.label(
                     egui::RichText::new(shortcut)
                         .size(11.0)
-                        .color(TEXT_DIM)
-                        .background_color(SURFACE_ALT),
+                        .color(palette().text_dim)
+                        .background_color(palette().surface_alt),
                 );
             }
         });
         if !body.is_empty() {
-            ui.label(egui::RichText::new(body).size(11.5).color(TEXT_DIM));
+            ui.label(
+                egui::RichText::new(body)
+                    .size(11.5)
+                    .color(palette().text_dim),
+            );
         }
     })
 }
@@ -524,8 +831,8 @@ pub(crate) fn hint(
 /// The frame a context menu is drawn in.
 pub(crate) fn menu() -> egui::Frame {
     egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0, BORDER))
+        .fill(palette().surface)
+        .stroke(Stroke::new(1.0, palette().border))
         .corner_radius(CornerRadius::same(CARD_RADIUS))
         .shadow(Shadow {
             offset: [0, 6],
@@ -561,17 +868,20 @@ pub(crate) fn menu_item(
     let painter = ui.painter();
     if hovered {
         let tint = if destructive {
-            DANGER.gamma_multiply(0.08)
+            palette().danger.gamma_multiply(0.08)
         } else {
-            SURFACE_ALT
+            palette().surface_alt
         };
         painter.rect_filled(rect, CornerRadius::same(WIDGET_RADIUS - 2), tint);
     }
 
     let (glyph_tint, text_tint) = match (enabled, destructive) {
-        (false, _) => (TEXT_DIM.gamma_multiply(0.45), TEXT_DIM.gamma_multiply(0.6)),
-        (true, true) => (DANGER, DANGER),
-        (true, false) => (TEXT_DIM, TEXT),
+        (false, _) => (
+            palette().text_dim.gamma_multiply(0.45),
+            palette().text_dim.gamma_multiply(0.6),
+        ),
+        (true, true) => (palette().danger, palette().danger),
+        (true, false) => (palette().text_dim, palette().text),
     };
 
     let glyph = egui::Rect::from_center_size(
@@ -592,7 +902,9 @@ pub(crate) fn menu_item(
             egui::Align2::RIGHT_CENTER,
             shortcut,
             egui::FontId::proportional(11.0),
-            TEXT_DIM.gamma_multiply(if enabled { 1.0 } else { 0.5 }),
+            palette()
+                .text_dim
+                .gamma_multiply(if enabled { 1.0 } else { 0.5 }),
         );
     }
 
@@ -613,7 +925,7 @@ pub(crate) fn menu_title(ui: &mut egui::Ui, title: &str, note: &str) {
     painter.galley(
         egui::pos2(rect.left() + 9.0, rect.center().y - galley.size().y * 0.5),
         galley,
-        TEXT,
+        palette().text,
     );
     if !note.is_empty() {
         painter.text(
@@ -621,7 +933,7 @@ pub(crate) fn menu_title(ui: &mut egui::Ui, title: &str, note: &str) {
             egui::Align2::LEFT_CENTER,
             note,
             egui::FontId::proportional(10.5),
-            TEXT_DIM,
+            palette().text_dim,
         );
     }
 }
@@ -635,7 +947,7 @@ pub(crate) fn menu_separator(ui: &mut egui::Ui) {
             egui::pos2(rect.left() + 5.0, rect.center().y),
             egui::pos2(rect.right() - 5.0, rect.center().y),
         ],
-        Stroke::new(1.0, BORDER),
+        Stroke::new(1.0, palette().border),
     );
 }
 
@@ -652,20 +964,20 @@ pub(crate) fn danger_row(
         painter.rect_filled(
             rect,
             CornerRadius::same(WIDGET_RADIUS),
-            DANGER.gamma_multiply(0.08),
+            palette().danger.gamma_multiply(0.08),
         );
     }
     let glyph = egui::Rect::from_center_size(
         egui::pos2(rect.left() + 17.0, rect.center().y),
         Vec2::splat(15.0),
     );
-    crate::icon::draw(painter, glyph, icon, DANGER);
+    crate::icon::draw(painter, glyph, icon, palette().danger);
     painter.text(
         egui::pos2(rect.left() + 33.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(12.5),
-        DANGER,
+        palette().danger,
     );
     response
 }
@@ -678,21 +990,30 @@ pub(crate) fn empty_state(ui: &mut egui::Ui, icon: crate::icon::Icon, title: &st
     ui.vertical_centered(|ui| {
         ui.add_space(28.0);
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::hover());
-        crate::icon::draw(ui.painter(), rect, icon, TEXT_DIM.gamma_multiply(0.55));
+        crate::icon::draw(
+            ui.painter(),
+            rect,
+            icon,
+            palette().text_dim.gamma_multiply(0.55),
+        );
         ui.add_space(10.0);
         ui.label(egui::RichText::new(title).size(13.0).family(semibold()));
         ui.add_space(4.0);
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         ui.set_max_width(220.0);
-        ui.label(egui::RichText::new(hint).size(11.5).color(TEXT_DIM));
+        ui.label(
+            egui::RichText::new(hint)
+                .size(11.5)
+                .color(palette().text_dim),
+        );
         ui.add_space(28.0);
     });
 }
 
 /// The single dark call-to-action.
 pub(crate) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let button = egui::Button::new(egui::RichText::new(text).color(SURFACE).size(13.0))
-        .fill(INK)
+    let button = egui::Button::new(egui::RichText::new(text).color(palette().on_ink).size(13.0))
+        .fill(palette().ink)
         .stroke(Stroke::NONE)
         .corner_radius(CornerRadius::same(WIDGET_RADIUS));
     ui.add(button)
@@ -704,66 +1025,192 @@ pub(crate) fn primary_button_with_icon(
     icon: crate::icon::Icon,
     text: &str,
 ) -> egui::Response {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(13.0), SURFACE);
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(13.0),
+        palette().on_ink,
+    );
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(galley.size().x + 38.0, 32.0),
         egui::Sense::click(),
     );
+    let hover = hover_fade(ui, &response);
+    let rect = scaled(rect, press_scale(ui, &response));
     let painter = ui.painter();
-    let fill = if response.hovered() {
-        INK.gamma_multiply(0.88)
-    } else {
-        INK
-    };
+    // Brightening on hover and shrinking on press, rather than a border or a
+    // shadow. The fill is the accent colour, so it is already the loudest thing
+    // in the bar and does not need more emphasis.
+    let fill = palette().ink.lerp_to_gamma(palette().text, hover * 0.12);
     painter.rect_filled(rect, CornerRadius::same(WIDGET_RADIUS), fill);
     let glyph = egui::Rect::from_center_size(
         egui::pos2(rect.left() + 17.0, rect.center().y),
         Vec2::splat(15.0),
     );
-    crate::icon::draw(painter, glyph, icon, SURFACE);
+    crate::icon::draw(painter, glyph, icon, palette().on_ink);
     let at = egui::pos2(rect.left() + 29.0, rect.center().y - galley.size().y * 0.5);
-    painter.galley(at, galley, SURFACE);
+    painter.galley(at, galley, palette().on_ink);
     response
 }
 
 /// A segmented control. Returns true if the choice changed.
 ///
 /// Each entry is a label and the tooltip that explains it.
+/// Space between a segmented control's track and the segments inside it.
+const SEGMENT_INSET: f32 = 3.0;
+
+/// The size of a track holding `count` segments.
+fn track_size(segment: Vec2, count: usize) -> Vec2 {
+    Vec2::new(
+        segment.x * count as f32 + SEGMENT_INSET * 2.0,
+        segment.y + SEGMENT_INSET * 2.0,
+    )
+}
+
+/// Where segment `i` sits inside a track.
+///
+/// Separated out because it is the only part of a segmented control with an
+/// answer that can be checked: the segments have to tile the track exactly, and
+/// the indicator has to land on one of them.
+fn segment_slot(track: egui::Rect, segment: Vec2, i: usize) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            track.left() + SEGMENT_INSET + segment.x * i as f32,
+            track.top() + SEGMENT_INSET,
+        ),
+        segment,
+    )
+}
+
+/// One choice in a segmented control.
+///
+/// A glyph, a label, or both. The label is always present even when it is not
+/// drawn, because it is what the tooltip says and what a reader of this code
+/// needs to know which segment is which.
+pub(crate) struct Segment<'a> {
+    pub glyph: Option<crate::icon::Icon>,
+    pub label: &'a str,
+    pub help: &'a str,
+}
+
+/// A segmented control whose selection slides between segments.
+///
+/// The sliding indicator is the point. Swapping a fill from one segment to
+/// another is a state change; moving it is the same information plus where it
+/// came from, which is what makes the control feel like an object rather than a
+/// set of independent buttons.
+///
+/// The whole strip is allocated as one rect and the segments are measured inside
+/// it. Laying each segment out as its own widget would work, but then their
+/// positions are only known after the fact and there is nothing to animate
+/// between. It also sidesteps layout direction entirely: the top bar lays its
+/// right-hand group out right to left, and a nested horizontal inherits that,
+/// which silently reverses a row of independently placed widgets.
+fn segmented_core(
+    ui: &mut egui::Ui,
+    id_source: &str,
+    current: usize,
+    segments: &[Segment<'_>],
+    segment_size: Vec2,
+) -> Option<usize> {
+    let count = segments.len();
+    if count == 0 {
+        return None;
+    }
+    let (track, _) = ui.allocate_exact_size(track_size(segment_size, count), egui::Sense::hover());
+    let id = ui.id().with(id_source);
+
+    let painter = ui.painter();
+    painter.rect_filled(
+        track,
+        CornerRadius::same(PILL_RADIUS + SEGMENT_INSET as u8),
+        palette().surface_alt,
+    );
+
+    let slot = |i: usize| segment_slot(track, segment_size, i);
+
+    // The indicator is animated by its left edge rather than by an index, so
+    // that a click three segments away travels the whole distance instead of
+    // jumping two and animating one.
+    let settled = slot(current.min(count - 1));
+    let x = crate::motion::animate(
+        ui,
+        id.with("slide"),
+        settled.left(),
+        crate::motion::Tuning::BOUNCY,
+    );
+    let indicator = egui::Rect::from_min_size(egui::pos2(x, settled.top()), segment_size);
+    ui.painter().rect_filled(
+        indicator,
+        CornerRadius::same(PILL_RADIUS),
+        palette().surface,
+    );
+
+    let mut picked = None;
+    for (i, segment) in segments.iter().enumerate() {
+        let rect = slot(i);
+        let response = ui.interact(rect, id.with(i), egui::Sense::click());
+        let active = i == current;
+        // Measured from the indicator, not from the index, so a segment lights
+        // up as the indicator arrives rather than the instant it is clicked.
+        let nearness = 1.0 - ((indicator.left() - rect.left()).abs() / segment_size.x).min(1.0);
+        let tint = palette().text_dim.lerp_to_gamma(
+            palette().text,
+            nearness.max(hover_fade(ui, &response) * 0.4),
+        );
+
+        if let Some(glyph) = segment.glyph {
+            let box_ = egui::Rect::from_center_size(rect.center(), Vec2::splat(16.0));
+            crate::icon::draw(ui.painter(), box_, glyph, tint);
+        } else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                segment.label,
+                egui::FontId::new(13.0, FontFamily::Proportional),
+                tint,
+            );
+        }
+        if hint(response, segment.label, segment.help, None).clicked() && !active {
+            picked = Some(i);
+        }
+    }
+    picked
+}
+
+/// A segmented control of icons, for a setting that has to share the top bar.
+pub(crate) fn icon_segmented(
+    ui: &mut egui::Ui,
+    current: usize,
+    options: &[(crate::icon::Icon, &str, &str)],
+) -> Option<usize> {
+    let segments: Vec<Segment<'_>> = options
+        .iter()
+        .map(|(glyph, label, help)| Segment {
+            glyph: Some(*glyph),
+            label,
+            help,
+        })
+        .collect();
+    segmented_core(ui, "icons", current, &segments, Vec2::new(30.0, 26.0))
+}
+
+/// A segmented control of words, for the workspace tabs.
 pub(crate) fn segmented(ui: &mut egui::Ui, current: &mut usize, labels: &[(&str, &str)]) -> bool {
-    let mut changed = false;
-    egui::Frame::new()
-        .fill(SURFACE_ALT)
-        .corner_radius(CornerRadius::same(WIDGET_RADIUS + 2))
-        .inner_margin(Margin::same(3))
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.horizontal(|ui| {
-                for (i, (label, help)) in labels.iter().enumerate() {
-                    let active = *current == i;
-                    let text = egui::RichText::new(*label).size(13.0).color(if active {
-                        TEXT
-                    } else {
-                        TEXT_DIM
-                    });
-                    let button = egui::Button::new(text)
-                        .fill(if active {
-                            SURFACE
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .stroke(Stroke::NONE)
-                        .corner_radius(CornerRadius::same(WIDGET_RADIUS))
-                        .min_size(Vec2::new(84.0, 26.0));
-                    if hint(ui.add(button), label, help, None).clicked() && !active {
-                        *current = i;
-                        changed = true;
-                    }
-                }
-            });
-        });
-    changed
+    let segments: Vec<Segment<'_>> = labels
+        .iter()
+        .map(|(label, help)| Segment {
+            glyph: None,
+            label,
+            help,
+        })
+        .collect();
+    match segmented_core(ui, "words", *current, &segments, Vec2::new(84.0, 26.0)) {
+        Some(picked) => {
+            *current = picked;
+            true
+        }
+        None => false,
+    }
 }
 
 /// Face tints for the mark, lightest first.
@@ -866,4 +1313,129 @@ pub(crate) fn logo(ui: &mut egui::Ui, size: f32) {
         MARK_RIGHT,
         no_edge,
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        palette, scene, scheme, segment_slot, set_scheme, track_size, Scheme, DARK, LIGHT,
+        SEGMENT_INSET,
+    };
+    use egui::Vec2;
+
+    /// The segments have to tile the track exactly. A gap between two of them is
+    /// a dead strip that swallows clicks, and an overlap gives two segments the
+    /// same pixel.
+    #[test]
+    fn segments_tile_their_track_without_gaps_or_overlap() {
+        let segment = Vec2::new(30.0, 26.0);
+        for count in 1..=5 {
+            let track =
+                egui::Rect::from_min_size(egui::pos2(10.0, 4.0), track_size(segment, count));
+            let slots: Vec<egui::Rect> = (0..count)
+                .map(|i| segment_slot(track, segment, i))
+                .collect();
+
+            for pair in slots.windows(2) {
+                assert!(
+                    (pair[1].left() - pair[0].right()).abs() < 1.0e-4,
+                    "gap or overlap between segments: {pair:?}"
+                );
+            }
+            let first = slots.first().expect("at least one segment");
+            let last = slots.last().expect("at least one segment");
+            assert!((first.left() - track.left() - SEGMENT_INSET).abs() < 1.0e-4);
+            assert!((track.right() - last.right() - SEGMENT_INSET).abs() < 1.0e-4);
+            assert!(
+                track.contains_rect(*first) && track.contains_rect(*last),
+                "a segment escaped its track"
+            );
+        }
+    }
+
+    /// The sliding indicator is animated toward a segment's left edge, so those
+    /// edges have to be ordered and evenly spaced or it would move unevenly.
+    #[test]
+    fn segment_edges_are_evenly_spaced() {
+        let segment = Vec2::new(84.0, 26.0);
+        let track = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), track_size(segment, 3));
+        let lefts: Vec<f32> = (0..3)
+            .map(|i| segment_slot(track, segment, i).left())
+            .collect();
+        assert!((lefts[1] - lefts[0] - segment.x).abs() < 1.0e-4);
+        assert!((lefts[2] - lefts[1] - segment.x).abs() < 1.0e-4);
+    }
+
+    /// Rough perceptual weight, enough to tell one end of a ramp from the other.
+    fn luma(c: egui::Color32) -> f32 {
+        0.2126 * f32::from(c.r()) + 0.7152 * f32::from(c.g()) + 0.0722 * f32::from(c.b())
+    }
+
+    #[test]
+    fn the_dark_scheme_inverts_the_light_one() {
+        assert!(
+            luma(DARK.canvas) < luma(LIGHT.canvas),
+            "the dark canvas is not darker"
+        );
+        assert!(
+            luma(DARK.text) > luma(LIGHT.text),
+            "dark text is not lighter"
+        );
+        // A raised surface reads by contrast with what is behind it, which runs
+        // the opposite way in each scheme.
+        assert!(luma(LIGHT.surface) > luma(LIGHT.canvas));
+        assert!(luma(DARK.surface) > luma(DARK.canvas));
+    }
+
+    /// The primary button fills with `ink` and writes on it with `on_ink`. If
+    /// those ever land on the same side of the ramp the label disappears, which
+    /// is exactly what happened the first time the dark palette was added.
+    #[test]
+    fn the_primary_button_label_contrasts_with_its_fill() {
+        for p in [LIGHT, DARK] {
+            assert!(
+                (luma(p.ink) - luma(p.on_ink)).abs() > 120.0,
+                "ink and on_ink are too close: {:?} on {:?}",
+                p.on_ink,
+                p.ink
+            );
+        }
+    }
+
+    /// The viewport is drawn into a linear target, so these are linear values
+    /// and are much smaller than the hex colours they correspond to. A dark
+    /// plate written as if it were sRGB comes out mid grey.
+    #[test]
+    fn the_dark_scene_is_actually_dark() {
+        // Const blocks, so getting this wrong fails the build rather than
+        // waiting for someone to run the tests. The values are literals in this
+        // file; there is nothing to evaluate at run time.
+        const {
+            assert!(
+                DARK.plate[0] < 0.05,
+                "the dark plate is an sRGB value in a linear slot, and will \
+                 render as mid grey"
+            );
+        }
+        const { assert!(LIGHT.plate[0] > 0.5) }
+        // The grid has to be visible against the plate it sits on, which runs
+        // the opposite way in each scheme.
+        const { assert!(DARK.grid[0] > DARK.plate[0]) }
+        const { assert!(LIGHT.grid[0] < LIGHT.plate[0]) }
+    }
+
+    #[test]
+    fn switching_scheme_switches_the_palette() {
+        set_scheme(Scheme::Dark);
+        assert_eq!(scheme(), Scheme::Dark);
+        assert_eq!(palette().canvas, DARK.canvas);
+        // A copy, not a computation: comparing the floats exactly is the point,
+        // since a mismatch would mean the wrong palette rather than rounding.
+        assert!(scene().plate.iter().eq(DARK.plate.iter()));
+
+        set_scheme(Scheme::Light);
+        assert_eq!(scheme(), Scheme::Light);
+        assert_eq!(palette().canvas, LIGHT.canvas);
+        assert!(scene().plate.iter().eq(LIGHT.plate.iter()));
+    }
 }
