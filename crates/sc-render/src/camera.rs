@@ -33,10 +33,47 @@ impl Default for OrbitCamera {
     }
 }
 
-/// How close to straight up or down the camera may tilt. Stopping short avoids
-/// the degenerate case where the view direction is parallel to world up and the
-/// right vector is undefined.
+/// How close to straight up or down the camera may tilt. Stopping short keeps
+/// the view direction away from world up, where the pitch stops distinguishing
+/// one orientation from another.
 const PITCH_LIMIT: f32 = 1.553; // ~89 degrees
+
+/// Closest the eye may sit to the target.
+///
+/// Zero is the value that has to be excluded: [`OrbitCamera::zoom_towards`]
+/// divides by the distance it started from, and a zero there makes the applied
+/// ratio infinite and leaves the target `NaN`, which nothing downstream
+/// recovers from.
+const MIN_DISTANCE: f32 = 0.01;
+
+/// Furthest the eye may sit from the target.
+const MAX_DISTANCE: f32 = 1.0e6;
+
+/// Smallest aspect ratio the projection will work with.
+///
+/// A viewport squeezed to nothing reports width / height as zero, and dividing
+/// by that in [`OrbitCamera::project`] gives infinity, or `NaN` for a point on
+/// the view axis. Callers read `Some` as "on screen" and place a handle at the
+/// result, so a `NaN` there is drawn rather than discarded.
+const MIN_ASPECT: f32 = 1.0e-6;
+
+/// Brings a distance back into range, `NaN` included.
+fn sane_distance(distance: f32) -> f32 {
+    if distance.is_nan() {
+        MIN_DISTANCE
+    } else {
+        distance.clamp(MIN_DISTANCE, MAX_DISTANCE)
+    }
+}
+
+/// Floors an aspect ratio away from zero.
+///
+/// [`OrbitCamera::ray`] and [`OrbitCamera::project`] must apply this identically
+/// or they stop being exact inverses of one another. `f32::max` yields the other
+/// operand for `NaN`, so this also floors a `NaN` aspect.
+fn sane_aspect(aspect: f32) -> f32 {
+    aspect.max(MIN_ASPECT)
+}
 
 impl OrbitCamera {
     /// Frames a model so it comfortably fills the view.
@@ -73,10 +110,18 @@ impl OrbitCamera {
     }
 
     /// Orthonormal view basis as `(right, up, forward)`.
+    ///
+    /// `right` comes from the yaw alone, which is what it reduces to: the
+    /// normalised `forward × Z` is exactly `(-sin yaw, cos yaw, 0)` for any
+    /// pitch short of vertical. Taking the cross product instead shrinks toward
+    /// the zero vector as the pitch approaches the pole and then normalises
+    /// float noise, which flips the whole frame through 180 degrees within a
+    /// hair of the limit instead of degrading smoothly.
     #[must_use]
     pub fn basis(&self) -> (Vec3, Vec3, Vec3) {
         let forward = -self.direction();
-        let right = forward.cross(Vec3::Z).normalize();
+        let (sy, cy) = self.yaw.sin_cos();
+        let right = Vec3::new(-sy, cy, 0.0);
         let up = right.cross(forward).normalize();
         (right, up, forward)
     }
@@ -105,7 +150,7 @@ impl OrbitCamera {
     /// Moves the eye toward or away from the target. `factor` is multiplicative,
     /// so zooming feels the same at every scale.
     pub fn zoom(&mut self, factor: f32) {
-        self.distance = (self.distance * factor).clamp(0.01, 1.0e6);
+        self.distance = sane_distance(self.distance * factor);
     }
 
     /// Zooms while keeping `anchor` fixed on screen.
@@ -116,6 +161,10 @@ impl OrbitCamera {
     /// wheel feel like it is pulling you toward what you are looking at rather
     /// than toward wherever the camera happens to be aimed.
     pub fn zoom_towards(&mut self, factor: f32, anchor: Vec3) {
+        // Bring the distance into range before reading it. Dividing by a
+        // distance of zero further down makes `applied` infinite, and the
+        // target comes out `NaN` with no way back.
+        self.distance = sane_distance(self.distance);
         let before = self.distance;
         self.zoom(factor);
         // Use the factor actually applied, in case the distance clamped.
@@ -149,6 +198,7 @@ impl OrbitCamera {
     pub fn ray(&self, ndc: Vec2, aspect: f32) -> (Vec3, Vec3) {
         let (right, up, forward) = self.basis();
         let tan_half = (self.fov_y * 0.5).tan();
+        let aspect = sane_aspect(aspect);
         let dir = (forward + right * ndc.x * tan_half * aspect + up * ndc.y * tan_half).normalize();
         (self.eye(), dir)
     }
@@ -157,6 +207,9 @@ impl OrbitCamera {
     ///
     /// `None` when the point is behind the camera, where a projection would
     /// otherwise fold it back into view.
+    ///
+    /// The exact inverse of [`OrbitCamera::ray`] for the same aspect, which is
+    /// what lets a handle be drawn and hit-tested through one projection.
     #[must_use]
     pub fn project(&self, world: Vec3, aspect: f32) -> Option<Vec2> {
         let (right, up, forward) = self.basis();
@@ -166,6 +219,7 @@ impl OrbitCamera {
             return None;
         }
         let tan_half = (self.fov_y * 0.5).tan();
+        let aspect = sane_aspect(aspect);
         Some(Vec2::new(
             v.dot(right) / (depth * tan_half * aspect),
             v.dot(up) / (depth * tan_half),
@@ -188,6 +242,13 @@ impl OrbitCamera {
     #[must_use]
     pub fn plane_hit(&self, ndc: Vec2, aspect: f32, origin: Vec3, normal: Vec3) -> Option<Vec3> {
         let (eye, dir) = self.ray(ndc, aspect);
+        // Normalised so the parallel test is about the geometry rather than
+        // about how long the caller's normal happens to be: scaling a normal
+        // scales `denom` without changing the answer, so an unnormalised one
+        // reads as parallel when it is nothing of the kind. A zero normal
+        // normalises to zero and is rejected, which is right for a plane that
+        // does not have one.
+        let normal = normal.normalize_or_zero();
         let denom = dir.dot(normal);
         if denom.abs() < 1.0e-6 {
             return None;
@@ -229,8 +290,8 @@ impl OrbitCamera {
     /// distance. A surface is "hit" once the ray is within about half a pixel of
     /// it, which is the point past which more precision cannot change the image.
     /// Scaling a tolerance by ray distance *as well* over-blurs badly: at a
-    /// hundred millimetres out it turns a 0.1mm threshold into several
-    /// millimetres, which rounds off every edge in the scene.
+    /// hundred millimetres out it turns a 0.02mm threshold into millimetres,
+    /// which rounds off every edge in the scene.
     #[must_use]
     pub fn pixel_angle(&self, height: u32) -> f32 {
         2.0 * (self.fov_y * 0.5).tan() / height.max(1) as f32
@@ -286,8 +347,13 @@ impl CameraRig {
         c.pitch += (g.pitch - c.pitch) * t;
         c.fov_y = g.fov_y;
 
-        let moving = (c.target - g.target).length() > g.distance * 1.0e-4
-            || (c.distance - g.distance).abs() > g.distance * 1.0e-4
+        // Positional thresholds scale with the distance, because that is the
+        // size the camera is working at. The floor matters: a goal distance of
+        // zero would make both of them zero, nothing would ever be close
+        // enough, and the rig would ask for another frame for ever.
+        let scale = sane_distance(g.distance) * 1.0e-4;
+        let moving = (c.target - g.target).length() > scale
+            || (c.distance - g.distance).abs() > scale
             || (c.yaw - g.yaw).abs() > 1.0e-4
             || (c.pitch - g.pitch).abs() > 1.0e-4;
         if !moving {
@@ -324,6 +390,211 @@ mod tests {
                 "{ndc:?} projected back as {back:?}"
             );
         }
+    }
+
+    /// Cameras worth putting through the projection, each awkward in its own
+    /// way: at the pitch limit either side, wound round past a full turn, at
+    /// both ends of the distance clamp, and with a field of view narrow enough
+    /// and wide enough to strain the tangent.
+    fn awkward_cameras() -> Vec<(&'static str, OrbitCamera)> {
+        vec![
+            ("default", OrbitCamera::default()),
+            (
+                "at the pitch limit",
+                OrbitCamera {
+                    pitch: PITCH_LIMIT,
+                    ..OrbitCamera::default()
+                },
+            ),
+            (
+                "at the lower pitch limit",
+                OrbitCamera {
+                    pitch: -PITCH_LIMIT,
+                    ..OrbitCamera::default()
+                },
+            ),
+            (
+                "wound past a full turn",
+                OrbitCamera {
+                    yaw: 13.7,
+                    pitch: -1.2,
+                    ..OrbitCamera::default()
+                },
+            ),
+            (
+                "as close as it goes",
+                OrbitCamera {
+                    distance: MIN_DISTANCE,
+                    ..OrbitCamera::default()
+                },
+            ),
+            (
+                "as far as it goes",
+                OrbitCamera {
+                    distance: MAX_DISTANCE,
+                    ..OrbitCamera::default()
+                },
+            ),
+            (
+                "a narrow field of view",
+                OrbitCamera {
+                    fov_y: 0.02,
+                    ..OrbitCamera::default()
+                },
+            ),
+            (
+                "a wide field of view",
+                OrbitCamera {
+                    fov_y: 2.8,
+                    ..OrbitCamera::default()
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn projection_inverts_the_ray_construction_in_the_awkward_cases() {
+        // Portrait through to letterbox, at the corners where the error is
+        // largest, on every camera that is awkward for a different reason.
+        for (name, cam) in awkward_cameras() {
+            for aspect in [0.05f32, 0.2, 1.0, 4.0, 40.0] {
+                for ndc in [
+                    Vec2::ZERO,
+                    Vec2::new(1.0, 1.0),
+                    Vec2::new(-1.0, -1.0),
+                    Vec2::new(0.73, -0.91),
+                ] {
+                    let (origin, dir) = cam.ray(ndc, aspect);
+                    let point = origin + dir * cam.distance;
+                    let back = cam
+                        .project(point, aspect)
+                        .expect("a point at the target's depth is in front");
+                    assert!(
+                        (back - ndc).length() < 1.0e-3,
+                        "{name} at aspect {aspect}: {ndc:?} projected back as {back:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_collapsed_viewport_does_not_project_to_nan() {
+        // A viewport with no width reports an aspect of zero, and the division
+        // in `project` then returns infinity, or NaN for a point sitting on the
+        // view axis. Callers read `Some` as "this is on screen" and draw a
+        // handle at the result, so a NaN there is painted rather than skipped.
+        let cam = OrbitCamera::default();
+        for aspect in [0.0f32, -2.0, f32::NAN] {
+            for world in [
+                cam.target,
+                cam.target + Vec3::new(1.0, 2.0, 3.0),
+                cam.target + Vec3::new(-7.0, 0.5, -2.0),
+            ] {
+                let ndc = cam.project(world, aspect).expect("in front of the camera");
+                assert!(
+                    ndc.is_finite(),
+                    "aspect {aspect} projected {world:?} to {ndc:?}"
+                );
+                let (_, dir) = cam.ray(ndc.clamp(Vec2::splat(-1.0), Vec2::ONE), aspect);
+                assert!(dir.is_finite(), "aspect {aspect} gave the ray {dir:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_basis_does_not_flip_at_the_pole() {
+        // `forward.cross(Z)` collapses here, and normalising what is left of it
+        // turns the view upside down within a thousandth of a radian of the
+        // limit the orbit already allows.
+        let at_limit = OrbitCamera {
+            pitch: PITCH_LIMIT,
+            ..OrbitCamera::default()
+        };
+        let at_pole = OrbitCamera {
+            pitch: std::f32::consts::FRAC_PI_2,
+            ..OrbitCamera::default()
+        };
+        let (r0, u0, _) = at_limit.basis();
+        let (r1, u1, _) = at_pole.basis();
+        assert!(
+            r0.dot(r1) > 0.999,
+            "right flipped from {r0:?} to {r1:?} across the pole"
+        );
+        assert!(
+            u0.dot(u1) > 0.999,
+            "up flipped from {u0:?} to {u1:?} across the pole"
+        );
+    }
+
+    #[test]
+    fn the_basis_stays_orthonormal_everywhere() {
+        for (name, cam) in awkward_cameras() {
+            for pitch in [
+                -std::f32::consts::FRAC_PI_2,
+                0.0,
+                std::f32::consts::FRAC_PI_2,
+            ] {
+                let cam = OrbitCamera { pitch, ..cam };
+                let (r, u, f) = cam.basis();
+                for (label, v) in [("right", r), ("up", u), ("forward", f)] {
+                    assert!(
+                        (v.length() - 1.0).abs() < 1.0e-4,
+                        "{name} at pitch {pitch}: {label} is {v:?}"
+                    );
+                }
+                assert!(r.dot(u).abs() < 1.0e-4, "{name} at pitch {pitch}: r.u");
+                assert!(r.dot(f).abs() < 1.0e-4, "{name} at pitch {pitch}: r.f");
+                assert!(u.dot(f).abs() < 1.0e-4, "{name} at pitch {pitch}: u.f");
+            }
+        }
+    }
+
+    #[test]
+    fn zooming_from_a_zero_distance_leaves_a_usable_camera() {
+        // The distance is a public field, so nothing stops a caller arriving
+        // here with a zero in it. Dividing by it used to leave the target NaN,
+        // which then spreads to the eye, the basis and every projection.
+        let mut cam = OrbitCamera {
+            distance: 0.0,
+            ..OrbitCamera::default()
+        };
+        cam.zoom_towards(2.0, Vec3::new(5.0, -3.0, 1.0));
+        assert!(
+            cam.target.is_finite() && cam.distance.is_finite(),
+            "target {:?} distance {}",
+            cam.target,
+            cam.distance
+        );
+        assert!(cam.distance >= MIN_DISTANCE);
+        assert!(cam.eye().is_finite());
+    }
+
+    #[test]
+    fn a_plane_hit_does_not_depend_on_the_normal_s_length() {
+        let cam = OrbitCamera {
+            target: Vec3::ZERO,
+            ..OrbitCamera::default()
+        };
+        let ndc = Vec2::new(0.2, -0.4);
+        let reference = cam
+            .plane_hit(ndc, 1.5, Vec3::ZERO, Vec3::Z)
+            .expect("the plate is in view");
+        for scale in [1.0e-7f32, 1.0e-3, 1.0, 1.0e3] {
+            let hit = cam
+                .plane_hit(ndc, 1.5, Vec3::ZERO, Vec3::Z * scale)
+                .unwrap_or_else(|| {
+                    panic!("a normal scaled by {scale} is not parallel to anything")
+                });
+            assert!(
+                (hit - reference).length() < 1.0e-2,
+                "normal scaled by {scale} hit {hit:?} rather than {reference:?}"
+            );
+        }
+        assert!(
+            cam.plane_hit(ndc, 1.5, Vec3::ZERO, Vec3::ZERO).is_none(),
+            "a plane with no normal has no intersection"
+        );
     }
 
     #[test]
@@ -417,6 +688,21 @@ mod tests {
         }
         assert!((rig.current.distance - 250.0).abs() < f32::EPSILON);
         assert!((rig.current.yaw - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_rig_settles_on_a_goal_at_zero_distance() {
+        // Every positional threshold is a fraction of the goal distance, so a
+        // zero there made nothing ever close enough and the rig asked for
+        // another frame for ever.
+        let mut rig = CameraRig::new(OrbitCamera::default());
+        rig.goal.distance = 0.0;
+        let mut frames = 0;
+        while rig.advance(1.0 / 60.0) {
+            frames += 1;
+            assert!(frames < 600, "the rig never settled");
+        }
+        assert!(rig.current.distance.abs() < f32::EPSILON);
     }
 
     #[test]

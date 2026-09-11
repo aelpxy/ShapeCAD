@@ -10,8 +10,15 @@ use crate::ui;
 use sc_render::{gpu, snapshot as capture, Renderer};
 
 /// Where the pointer sits for [`Scene::Hover`]: the Rectangle tool row, in
-/// points. Chosen by eye from a capture at the default size.
-const HOVER_POINT: egui::Pos2 = egui::pos2(100.0, 315.0);
+/// points.
+///
+/// The panel is laid out from the top down, so this does not depend on the size
+/// of the window, only on what is above the row. That changes: it was on the row
+/// until a card was added above it, after which the capture rested the pointer
+/// on the ADD heading and no tooltip appeared, which looks exactly like a
+/// tooltip that stopped working. `the_hover_scene_shows_a_tooltip` is what
+/// notices next time.
+const HOVER_POINT: egui::Pos2 = egui::pos2(100.0, 358.0);
 
 /// How [`Scene::Showcase`] poses the camera: a three quarter view from the open
 /// side, so the filleted joint, both drilled holes and the upright face are all
@@ -19,12 +26,6 @@ const HOVER_POINT: egui::Pos2 = egui::pos2(100.0, 315.0);
 const SHOWCASE_YAW: f32 = -1.05;
 const SHOWCASE_PITCH: f32 = 0.55;
 const SHOWCASE_ZOOM: f32 = 1.02;
-
-/// Where [`Scene::Grips`] rests the pointer: on the block's `half_x` grip, so
-/// the capture shows what a grip looks like when it is ready to be grabbed
-/// rather than only what it looks like at rest. Read off a capture, like
-/// [`HOVER_POINT`], because the position depends on the camera pose above.
-const GRIP_POINT: egui::Pos2 = egui::pos2(968.0, 574.0);
 
 /// Where [`Scene::Menu`] opens the context menu, in points. Over the middle of
 /// the 3D view, which is where a right click on the model would land.
@@ -146,6 +147,100 @@ fn pose(scene: Scene) -> AppState {
     state
 }
 
+/// How many passes a capture runs before the frame it keeps.
+///
+/// Several are needed whatever the scene: egui gives a newly created Area a
+/// sizing pass before it can place itself, so anything that has just appeared,
+/// the file browser say, is still invisible after one.
+///
+/// The number is set by the animation. The interface moves on springs, and the
+/// integrator clamps a pass to a thirtieth of a second however much virtual time
+/// it claims, so the slowest tuning needs fifteen passes to come to rest and the
+/// margin above that covers a tooltip, which spends its first passes waiting for
+/// the pointer to be still. Three passes caught the context menu a third of the
+/// way through growing: half transparent and slightly small.
+/// `there_are_enough_passes_for_the_slowest_animation` keeps this honest.
+const PASSES: u32 = 24;
+
+/// The pass the pointer is moved on.
+///
+/// Not the first, because where a grip is depends on the viewport rect, and the
+/// rect the first pass reports is not the real one: `set_zoom_factor` is applied
+/// on the next pass to run, and applying it replaces `screen_rect` with the
+/// previous one scaled by the change in zoom. At a zoom of 1.5 over a default
+/// rect that came out as a 6346 by 6636 viewport, four times the window, and a
+/// grip projected through it lands far from where it is drawn. The second pass
+/// has the rect that was actually passed in.
+const POINTER_PASS: u32 = 2;
+
+/// Virtual seconds between passes.
+///
+/// Longer than the tooltip delay divided by the passes it can afford to spend
+/// waiting, and longer than the integrator's own clamp, so each pass advances
+/// every animation by as much as it ever will.
+const PASS_SECONDS: f64 = 0.25;
+
+/// Runs the interface for [`PASSES`] passes and reports the last one.
+///
+/// Shared with the tests, which drive the same passes without a GPU: a scene is
+/// only worth capturing if it poses what its name says, and that is a question
+/// about the frame rather than about the picture.
+fn run(
+    ctx: &egui::Context,
+    state: &mut AppState,
+    input: &egui::RawInput,
+    scene: Scene,
+    mut on_pass: impl FnMut(&mut egui::FullOutput),
+) -> (egui::FullOutput, ui::Chrome) {
+    let mut chrome = ui::Chrome::default();
+    let mut output = None;
+    for pass in 0..PASSES {
+        // Time has to advance between passes or egui's animations never run:
+        // a modal would be captured mid fade-in, half transparent.
+        let mut frame_input = input.clone();
+        frame_input.time = Some(f64::from(pass) * PASS_SECONDS);
+        // The pointer is moved once and then left alone: egui measures the
+        // tooltip delay from the last movement, so repeating the event on every
+        // pass would keep resetting it and no tooltip would ever appear.
+        if pass == POINTER_PASS {
+            if let Some(at) = pointer_for(scene, state, chrome.viewport) {
+                frame_input.events.push(egui::Event::PointerMoved(at));
+            }
+        }
+        let mut frame = ctx.run_ui(frame_input, |ui| {
+            chrome = ui::draw(ui, state);
+        });
+        on_pass(&mut frame);
+        output = Some(frame);
+    }
+    (output.expect("frames were run"), chrome)
+}
+
+/// Where a scene rests the pointer, in points.
+///
+/// `Scene::Grips` works its answer out from the pose rather than having it
+/// written down. A grip's place on screen follows the camera, the viewport rect
+/// and the size of the window, so a position read off one capture is wrong in
+/// the next one, and the failure is silent: the grips are all still there, just
+/// none of them hovered, which is exactly what the scene exists to show.
+fn pointer_for(scene: Scene, state: &AppState, viewport: egui::Rect) -> Option<egui::Pos2> {
+    match scene {
+        Scene::Hover => Some(HOVER_POINT),
+        Scene::Grips => {
+            let rect = [
+                viewport.min.x,
+                viewport.min.y,
+                viewport.width(),
+                viewport.height(),
+            ];
+            let grip = state.grips().into_iter().find(|g| g.param == "half_x")?;
+            let (at, _, _) = state.grip_on_screen(&grip, rect)?;
+            Some(egui::pos2(at.x, at.y))
+        }
+        _ => None,
+    }
+}
+
 /// Renders one frame of the application to a PNG.
 ///
 /// # Panics
@@ -188,46 +283,13 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scen
     // created during the first, and every egui primitive samples it. Dropping
     // that delta leaves the renderer with no atlas, and it silently skips the
     // entire UI.
-    let mut chrome = crate::ui::Chrome::default();
-    let mut output = None;
-    // Enough passes for every spring to come to rest. The interface animates
-    // with springs, and the integrator clamps a frame to a thirtieth of a second
-    // however much virtual time a pass claims to cover, so settling the slowest
-    // tuning takes roughly twenty passes. Three of them caught the context menu
-    // a third of the way through growing: half transparent and slightly small.
-    //
-    // A tooltip needs a few of these anyway, to rest on the widget and then have
-    // its own Area sized.
-    let passes = 24;
-    for pass in 0..passes {
-        // Time has to advance between passes or egui's animations never run:
-        // a modal would be captured mid fade-in, half transparent.
-        let mut frame_input = input.clone();
-        frame_input.time = Some(f64::from(pass) * 0.25);
-        // The pointer is moved once and then left alone: egui measures the
-        // tooltip delay from the last movement, so repeating the event on every
-        // pass would keep resetting it and no tooltip would ever appear.
-        if scene == Scene::Grips && pass == 0 {
-            frame_input
-                .events
-                .push(egui::Event::PointerMoved(GRIP_POINT));
-        }
-        if scene == Scene::Hover && pass == 0 {
-            frame_input
-                .events
-                .push(egui::Event::PointerMoved(HOVER_POINT));
-        }
-        let frame = ctx.run_ui(frame_input, |ui| {
-            chrome = ui::draw(ui, &mut state);
-        });
+    let (output, chrome) = run(&ctx, &mut state, &input, scene, |frame| {
         for (id, deltas) in &frame.textures_delta.set {
             for delta in deltas {
                 egui_renderer.update_texture(&device, &queue, *id, delta);
             }
         }
-        output = Some(frame);
-    }
-    let output = output.expect("frames were run");
+    });
 
     let jobs = ctx.tessellate(output.shapes, output.pixels_per_point);
     let descriptor = egui_wgpu::ScreenDescriptor {
@@ -271,4 +333,151 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, scene: Scen
 
     capture::write_png(&image, path).expect("could not write the image");
     println!("wrote {} ({width}x{height})", path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pointer_for, pose, run, Scene, PASSES, PASS_SECONDS};
+    use crate::motion::{Spring, Tuning};
+
+    /// The size the documented capture command lays the interface out at:
+    /// 2400 by 1500 pixels at a scale of 1.5.
+    const POINTS: egui::Vec2 = egui::vec2(1600.0, 1000.0);
+
+    /// Drives the passes a capture drives, without a GPU.
+    fn capture(scene: Scene) -> (egui::Context, crate::state::AppState, crate::ui::Chrome) {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut state = pose(scene);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, POINTS)),
+            ..Default::default()
+        };
+        let (mut output, chrome) = run(&ctx, &mut state, &input, scene, |frame| {
+            // Nothing here uploads textures, and epaint refuses to let a delta
+            // be dropped unhandled.
+            frame.textures_delta.clear();
+        });
+        output.textures_delta.clear();
+        (ctx, state, chrome)
+    }
+
+    /// The scene exists to put a tooltip in the frame. Resting the pointer a few
+    /// points off the row shows no tooltip at all, and the capture still looks
+    /// like a perfectly good picture of the application, so nothing says the
+    /// flag has stopped doing what it is for.
+    #[test]
+    fn the_hover_scene_shows_a_tooltip() {
+        let (ctx, _, _) = capture(Scene::Hover);
+        let tooltip = ctx.memory(|m| {
+            m.areas()
+                .visible_layer_ids()
+                .iter()
+                .any(|layer| layer.order == egui::Order::Tooltip)
+        });
+        assert!(
+            tooltip,
+            "the pointer rested where the scene puts it and nothing explained itself"
+        );
+    }
+
+    /// And this one exists to show a grip ready to be grabbed. A pointer that
+    /// lands anywhere else captures three grips at rest, which is what the
+    /// picture would look like anyway.
+    #[test]
+    fn the_grips_scene_rests_the_pointer_on_a_grip() {
+        let (_, state, chrome) = capture(Scene::Grips);
+        let at = pointer_for(Scene::Grips, &state, chrome.viewport)
+            .expect("the block's half_x grip is on screen");
+        assert!(
+            chrome.viewport.contains(at),
+            "the pointer landed at {at:?}, outside the viewport {:?}",
+            chrome.viewport
+        );
+
+        let rect = [
+            chrome.viewport.min.x,
+            chrome.viewport.min.y,
+            chrome.viewport.width(),
+            chrome.viewport.height(),
+        ];
+        let near = state.grips().iter().any(|grip| {
+            state.grip_on_screen(grip, rect).is_some_and(|(p, _, _)| {
+                (egui::pos2(p.x, p.y) - at).length() < crate::ui::GRIP_REACH
+            })
+        });
+        assert!(near, "the pointer at {at:?} is not within reach of a grip");
+        let (ctx2, _, _) = capture(Scene::Grips);
+        println!("pointer after the passes: {:?}", ctx2.pointer_latest_pos());
+        println!("wanted: {at:?} viewport {:?}", chrome.viewport);
+    }
+
+    /// A capture is one frame, so every animation in it has to have finished.
+    /// The integrator clamps a pass to a thirtieth of a second however much
+    /// virtual time it claims, which is what makes this a fixed number of passes
+    /// rather than a duration.
+    #[test]
+    fn there_are_enough_passes_for_the_slowest_animation() {
+        for tuning in [Tuning::SMOOTH, Tuning::BOUNCY, Tuning::SNAPPY] {
+            let mut spring = Spring::at(0.0);
+            let mut passes = 0;
+            while !spring.settled(1.0) {
+                spring = spring.step(1.0, PASS_SECONDS as f32, tuning);
+                passes += 1;
+                assert!(passes < 1000, "{tuning:?} never settled at all");
+            }
+            assert!(
+                passes < PASSES,
+                "{tuning:?} needs {passes} passes and a capture runs {PASSES}"
+            );
+        }
+    }
+
+    /// Every scene has to hold up what its name promises, and most of that is
+    /// in the document it poses.
+    #[test]
+    fn every_scene_poses_what_it_is_called() {
+        assert!(pose(Scene::Empty).doc.arena().is_empty());
+        assert!(pose(Scene::Hover).doc.arena().is_empty());
+
+        let sample = pose(Scene::Sample);
+        assert_eq!(sample.selected, sample.doc.root(), "the root is selected");
+        assert!(!sample.doc.arena().is_empty());
+
+        let engine = pose(Scene::Engine);
+        assert!(
+            engine.doc.arena().len() > sample.doc.arena().len() * 3,
+            "the engine scene is not posing the engine"
+        );
+
+        assert!(
+            pose(Scene::Dialog).browser.is_some(),
+            "the dialog scene has no file browser open"
+        );
+        assert!(
+            pose(Scene::Menu).menu.is_some(),
+            "the menu scene has no menu open"
+        );
+        assert_eq!(
+            pose(Scene::Tutorial).tutorial.map(|t| t.at),
+            Some(0),
+            "the tutorial scene is not on the first card"
+        );
+
+        let grips = pose(Scene::Grips);
+        assert_eq!(grips.grips().len(), 3, "a rounded block has three grips");
+
+        // The showcase selects the transform that stands the wall up, not the
+        // wall, so the highlight is where the wall is rather than at the origin.
+        let showcase = pose(Scene::Showcase);
+        let selected = showcase.selected.expect("something is selected");
+        assert!(
+            matches!(
+                showcase.doc.arena().get(selected),
+                Some(sc_geom::Node::Transform { .. })
+            ),
+            "the showcase selected {:?}",
+            showcase.doc.arena().get(selected)
+        );
+    }
 }

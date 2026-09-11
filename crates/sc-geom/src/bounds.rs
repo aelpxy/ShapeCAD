@@ -95,10 +95,16 @@ impl Aabb {
 
     /// The axis-aligned box enclosing this box after `t` is applied, computed
     /// from its eight corners.
+    ///
+    /// An unbounded box has no corners to enumerate and goes through
+    /// [`Aabb::swept`] instead.
     #[must_use]
     pub fn transformed(self, t: &Transform) -> Self {
-        if !self.is_finite() {
+        if self.is_empty() {
             return self;
+        }
+        if !self.is_finite() {
+            return self.swept(t);
         }
         let mut out = Self::EMPTY;
         for i in 0..8u32 {
@@ -113,8 +119,40 @@ impl Aabb {
         out
     }
 
-    /// Clamps to a finite box so unbounded nodes, such as a bare half-space,
-    /// still give the camera and the geometry hash something to work with.
+    /// The image of an unbounded box, accumulated axis by axis.
+    ///
+    /// A rotation leans an unbounded axis into every world axis it has a
+    /// component on, so the infinity has to move with it. Carrying it on the
+    /// axis it started on is an under-report of everything the rotation turned
+    /// into that direction: a through cut laid on its side is then bounded
+    /// along the very axis it sweeps.
+    fn swept(self, t: &Transform) -> Self {
+        let mut min = t.translation;
+        let mut max = t.translation;
+        for (j, unit) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+            let axis = (t.rotation * unit) * t.scale;
+            for k in 0..3 {
+                // A zero component contributes nothing, and has to be skipped
+                // rather than multiplied: `0 * infinity` is NaN, not the
+                // absence it stands for here.
+                if axis[k] == 0.0 {
+                    continue;
+                }
+                let (lo, hi) = (axis[k] * self.min[j], axis[k] * self.max[j]);
+                min[k] += lo.min(hi);
+                max[k] += lo.max(hi);
+            }
+        }
+        Self { min, max }
+    }
+
+    /// Fills in the unbounded sides with a finite fallback, so unbounded nodes
+    /// such as a bare half-space still give the camera, the mesher and the
+    /// geometry hash something to work with.
+    ///
+    /// Only the infinite sides are substituted. Clamping the finite ones to the
+    /// fallback as well would silently crop any part larger than it out of the
+    /// mesh and out of the framing, which is the one thing bounds must never do.
     #[must_use]
     pub fn finite_or(self, fallback_half: f32) -> Self {
         if self.is_empty() {
@@ -122,8 +160,8 @@ impl Aabb {
         }
         let f = Vec3::splat(fallback_half);
         Self {
-            min: self.min.max(-f),
-            max: self.max.min(f),
+            min: Vec3::select(self.min.is_finite_mask(), self.min, -f),
+            max: Vec3::select(self.max.is_finite_mask(), self.max, f),
         }
     }
 }
@@ -158,33 +196,9 @@ fn bounds_memo(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, Aabb>) -> A
         // The voxel footprint, which is half a voxel wider than the outermost
         // sample centres and at least two voxels wider than the surface.
         Node::Mesh { ref grid, .. } => grid.bounds(),
-        // Bounded across the profile, unbounded along the sweep. A prism only
-        // ever appears as the tool of a difference or an intersection, and both
-        // take their bounds from the other operand, so the infinity is contained
-        // in every position the node is meant to occupy.
-        Node::Prism { .. } => {
-            let Some(Node::Prism { profile }) = arena.get(id) else {
-                return Aabb::EMPTY;
-            };
-            let (lo, hi) = profile.bounds();
-            Aabb {
-                min: Vec3::new(lo.x, lo.y, f32::NEG_INFINITY),
-                max: Vec3::new(hi.x, hi.y, f32::INFINITY),
-            }
-        }
-
-        Node::Extrude { .. } => {
-            // Re-fetched by reference: a profile is not `Copy`, so it cannot be
-            // bound by the surrounding match on `*node`.
-            let Some(Node::Extrude { profile, depth }) = arena.get(id) else {
-                return Aabb::EMPTY;
-            };
-            let (lo, hi) = profile.bounds();
-            Aabb {
-                min: Vec3::new(lo.x, lo.y, 0.0),
-                max: Vec3::new(hi.x, hi.y, *depth),
-            }
-        }
+        // Matched by reference, because a profile is not `Copy` and so cannot
+        // be bound by the surrounding match on `*node`.
+        Node::Prism { .. } | Node::Extrude { .. } => sweep_bounds(node),
 
         // A smooth blend bulges outward near the seam. Expanding by the full
         // blend radius over-estimates (the true bulge is at most a quarter of
@@ -206,4 +220,180 @@ fn bounds_memo(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, Aabb>) -> A
     };
     memo.insert(id, b);
     b
+}
+
+/// Bounds of the two profile sweeps.
+///
+/// [`Node::Extrude`] is bounded by its own depth. [`Node::Prism`] is bounded
+/// across the profile and unbounded along the sweep: it only ever appears as
+/// the tool of a difference or an intersection, and both take their bounds from
+/// the other operand, so the infinity is contained in every position the node is
+/// meant to occupy.
+fn sweep_bounds(node: &Node) -> Aabb {
+    let (profile, depth) = match node {
+        Node::Prism { profile } => (profile, None),
+        Node::Extrude { profile, depth } => (profile, Some(*depth)),
+        _ => return Aabb::EMPTY,
+    };
+    let (lo, hi) = profile.bounds();
+    let (near, far) = match depth {
+        // An extrusion runs from z = 0 to z = depth, and `Node::is_valid`
+        // insists the depth is positive.
+        Some(d) => (0.0, d),
+        None => (f32::NEG_INFINITY, f32::INFINITY),
+    };
+    Aabb {
+        min: Vec3::new(lo.x, lo.y, near),
+        max: Vec3::new(hi.x, hi.y, far),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounds, Aabb};
+    use crate::eval::eval;
+    use crate::math::Transform;
+    use crate::node::Node;
+    use crate::ops::Builder;
+    use crate::profile::Profile;
+    use glam::{Quat, Vec3};
+
+    const QUARTER_TURN: f32 = std::f32::consts::FRAC_PI_2;
+
+    /// `finite_or` feeds the mesher's octree and the camera's framing, so
+    /// shrinking a finite bound to the fallback would crop a three metre part
+    /// down to one and call the result an export.
+    #[test]
+    fn a_part_larger_than_the_fallback_keeps_its_own_bounds() {
+        let big = Aabb::from_half(Vec3::splat(2000.0));
+        assert_eq!(big.finite_or(1000.0), big);
+    }
+
+    #[test]
+    fn the_fallback_fills_in_only_the_unbounded_sides() {
+        let bar = Aabb {
+            min: Vec3::new(-1500.0, -2.0, f32::NEG_INFINITY),
+            max: Vec3::new(1500.0, 2.0, f32::INFINITY),
+        };
+        let filled = bar.finite_or(1000.0);
+        assert_eq!(filled.min, Vec3::new(-1500.0, -2.0, -1000.0));
+        assert_eq!(filled.max, Vec3::new(1500.0, 2.0, 1000.0));
+    }
+
+    #[test]
+    fn an_empty_box_falls_back_to_the_whole_fallback() {
+        assert_eq!(
+            Aabb::EMPTY.finite_or(10.0),
+            Aabb::from_half(Vec3::splat(10.0))
+        );
+        assert!(Aabb::EMPTY
+            .transformed(&Transform::from_scale(3.0))
+            .is_empty());
+    }
+
+    /// The usual case for a through cut: moved, not turned. The unbounded axis
+    /// stays where it was and the other two stay as tight as they started, since
+    /// a loose bound on a cut is a coarser octree for whatever it cuts.
+    #[test]
+    fn a_sweep_that_is_only_moved_keeps_its_cross_section() {
+        let sweep = Aabb {
+            min: Vec3::new(-2.0, -1.0, f32::NEG_INFINITY),
+            max: Vec3::new(2.0, 1.0, f32::INFINITY),
+        };
+        let moved = sweep.transformed(&Transform::from_translation(Vec3::new(10.0, 20.0, 30.0)));
+        assert_eq!(moved.min, Vec3::new(8.0, 19.0, f32::NEG_INFINITY));
+        assert_eq!(moved.max, Vec3::new(12.0, 21.0, f32::INFINITY));
+    }
+
+    /// A sweep that is unbounded along z is unbounded along y once it is turned
+    /// on its side, and bounded along z. Carrying the infinity on the axis it
+    /// started on under-reports everything the rotation moved into it.
+    #[test]
+    fn an_unbounded_axis_follows_the_rotation() {
+        let sweep = Aabb {
+            min: Vec3::new(-2.0, -1.0, f32::NEG_INFINITY),
+            max: Vec3::new(2.0, 1.0, f32::INFINITY),
+        };
+        let turned = sweep.transformed(&Transform::from_rotation(Quat::from_rotation_x(
+            QUARTER_TURN,
+        )));
+        assert!(
+            turned.min.y == f32::NEG_INFINITY && turned.max.y == f32::INFINITY,
+            "the sweep now runs along y: {turned:?}"
+        );
+        assert!((turned.min.z + 1.0).abs() < 1e-4, "{turned:?}");
+        assert!((turned.max.z - 1.0).abs() < 1e-4, "{turned:?}");
+        assert!((turned.min.x + 2.0).abs() < 1e-4, "{turned:?}");
+        assert!((turned.max.x - 2.0).abs() < 1e-4, "{turned:?}");
+    }
+
+    #[test]
+    fn a_translated_half_space_stays_unbounded() {
+        let moved = Aabb::INFINITE.transformed(&Transform::from_translation(Vec3::splat(5.0)));
+        assert_eq!(moved, Aabb::INFINITE);
+    }
+
+    /// The real cost of the one above: a through cut placed on its side, whose
+    /// other operand is the only thing bounding it.
+    #[test]
+    fn a_through_cut_on_its_side_does_not_crop_what_it_cuts() {
+        let mut b = Builder::new();
+        let ball = b.sphere(10.0).unwrap();
+        let bar = b
+            .arena
+            .insert(Node::Prism {
+                profile: Profile::Rect {
+                    width: 4.0,
+                    height: 2.0,
+                },
+            })
+            .unwrap();
+        let bar = b.rotate(bar, Quat::from_rotation_x(QUARTER_TURN)).unwrap();
+        let part = b.intersection(ball, bar).unwrap();
+
+        let bb = bounds(&b.arena, part);
+        let p = Vec3::new(0.0, 9.0, 0.0);
+        assert!(eval(&b.arena, part, p) < 0.0, "the sample point is solid");
+        assert!(
+            p.cmpge(bb.min).all() && p.cmple(bb.max).all(),
+            "solid point {p:?} outside reported bounds {bb:?}"
+        );
+    }
+
+    #[test]
+    fn a_sweep_reports_the_axis_it_is_unbounded_on() {
+        let mut b = Builder::new();
+        let bar = b
+            .arena
+            .insert(Node::Prism {
+                profile: Profile::Circle { radius: 3.0 },
+            })
+            .unwrap();
+        let bb = bounds(&b.arena, bar);
+        assert_eq!(bb.min, Vec3::new(-3.0, -3.0, f32::NEG_INFINITY));
+        assert_eq!(bb.max, Vec3::new(3.0, 3.0, f32::INFINITY));
+    }
+
+    #[test]
+    fn an_extrusion_runs_from_its_own_plane() {
+        let mut b = Builder::new();
+        let pad = b
+            .extrude(
+                Profile::Rect {
+                    width: 10.0,
+                    height: 4.0,
+                },
+                7.0,
+            )
+            .unwrap();
+        let bb = bounds(&b.arena, pad);
+        assert_eq!(bb.min, Vec3::new(-5.0, -2.0, 0.0));
+        assert_eq!(bb.max, Vec3::new(5.0, 2.0, 7.0));
+    }
+
+    #[test]
+    fn a_missing_node_has_no_bounds() {
+        let b = Builder::new();
+        assert!(bounds(&b.arena, crate::NodeId(7)).is_empty());
+    }
 }

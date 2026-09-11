@@ -5,14 +5,8 @@
 //! for persistence: the node's `Deserialize` cannot conjure several megabytes
 //! of samples out of the JSON, so it produces an empty placeholder that
 //! `is_valid` rejects, and loading has to fill the placeholder in from the
-//! sidecar directory. The four functions here are the whole of that knowledge,
-//! kept in one module so the rest of the crate never matches on the variant.
-//!
-//! # Temporary
-//!
-//! `Node::Mesh` is landing in the kernel separately. Until it does, the
-//! `pending` module below stands in: it answers "not a mesh" for every node, so
-//! Kept in one module so that the question "what counts as a mesh node" has a
+//! sidecar directory. The five functions here are the whole of that knowledge,
+//! kept in one module so that the question "what counts as a mesh node" has a
 //! single answer, rather than the same match arm appearing in the asset store,
 //! the loader and the saver.
 
@@ -20,38 +14,37 @@ use crate::asset::{AssetId, Grid};
 use sc_geom::Node;
 use std::sync::Arc;
 
-pub(crate) use real::*;
-
-mod real {
-    use super::{Arc, AssetId, Grid, Node};
-
-    pub(crate) fn asset_of(node: &Node) -> Option<AssetId> {
-        match node {
-            Node::Mesh { asset, .. } => Some(*asset),
-            _ => None,
-        }
+/// The asset a node names, if it is a mesh.
+pub(crate) fn asset_of(node: &Node) -> Option<AssetId> {
+    match node {
+        Node::Mesh { asset, .. } => Some(*asset),
+        _ => None,
     }
+}
 
-    pub(crate) fn grid_of(node: &Node) -> Option<&Arc<Grid>> {
-        match node {
-            Node::Mesh { grid, .. } => Some(grid),
-            _ => None,
-        }
+/// The grid a node carries, if it is a mesh.
+pub(crate) fn grid_of(node: &Node) -> Option<&Arc<Grid>> {
+    match node {
+        Node::Mesh { grid, .. } => Some(grid),
+        _ => None,
     }
+}
 
-    pub(crate) fn with_grid(node: &Node, grid: Arc<Grid>) -> Option<Node> {
-        match node {
-            Node::Mesh { asset, .. } => Some(Node::Mesh {
-                asset: *asset,
-                grid,
-            }),
-            _ => None,
-        }
+/// The same mesh node with its grid replaced, which is how loading fills in a
+/// placeholder. `None` for anything that is not a mesh.
+pub(crate) fn with_grid(node: &Node, grid: Arc<Grid>) -> Option<Node> {
+    match node {
+        Node::Mesh { asset, .. } => Some(Node::Mesh {
+            asset: *asset,
+            grid,
+        }),
+        _ => None,
     }
+}
 
-    pub(crate) fn mesh_node(asset: AssetId, grid: Arc<Grid>) -> Node {
-        Node::Mesh { asset, grid }
-    }
+/// A mesh node referring to an already-registered grid.
+pub(crate) fn mesh_node(asset: AssetId, grid: Arc<Grid>) -> Node {
+    Node::Mesh { asset, grid }
 }
 
 /// Whether a node is a mesh still holding the empty grid its `Deserialize`

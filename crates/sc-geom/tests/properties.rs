@@ -15,7 +15,7 @@
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
 use sc_geom::glam::{Quat, Vec3};
-use sc_geom::{bounds, eval, Arena, AssetId, Builder, Grid, NodeId, Transform};
+use sc_geom::{bounds, eval, Arena, AssetId, Builder, Grid, Node, NodeId, Profile, Transform};
 use std::sync::Arc;
 
 /// A symbolic shape, generated first and then materialised into an [`Arena`].
@@ -29,7 +29,15 @@ enum Shape {
     Cuboid([f32; 3], f32),
     Cylinder(f32, f32, f32),
     Torus(f32, f32),
-    Extrude(usize, f32, f32),
+    /// A closed profile swept a given depth along +Z.
+    Extrude(Profile, f32),
+    /// A half-space taken out of a shape.
+    ///
+    /// Only ever generated in this position, for the reason [`Shape::ThroughCut`]
+    /// gives: a bare plane is unbounded, so the bounds properties would have
+    /// nothing finite to check. Cutting with one is what the node is for, and
+    /// the bounds then come from the solid being cut.
+    SliceOff(Box<Shape>, [f32; 3], f32),
     /// An imported mesh: a radius, a voxel count per axis, and whether the
     /// voxelized shape is a cube rather than a sphere.
     Mesh(f32, u32, bool),
@@ -52,7 +60,7 @@ enum Shape {
     /// and the mesher no region to work in. As the tool of a difference it is
     /// doing exactly the job it exists for, and the bounds come from the solid
     /// being cut.
-    ThroughCut(Box<Shape>, f32),
+    ThroughCut(Box<Shape>, Profile),
 }
 
 fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
@@ -71,13 +79,12 @@ fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
             b.arena.insert(node)
         }
         Shape::Torus(major, minor) => b.torus(*major, minor.min(major * 0.9)),
-        Shape::Extrude(sides, radius, height) => b.extrude(
-            sc_geom::Profile::RegularPolygon {
-                sides: *sides as u32,
-                radius: *radius,
-            },
-            *height,
-        ),
+        Shape::Extrude(profile, depth) => b.extrude(profile.clone(), *depth),
+        Shape::SliceOff(x, normal, offset) => {
+            let solid = materialize(x, b)?;
+            let tool = b.plane(Vec3::from_array(*normal), *offset)?;
+            b.smooth_difference(solid, tool, 0.0)
+        }
         Shape::Mesh(radius, dims, boxy) => {
             let (radius, dims) = (*radius, *dims);
             // Spacing is derived from the radius so that every generated grid
@@ -140,10 +147,10 @@ fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
             let a = materialize(x, b)?;
             b.shell(a, *t)
         }
-        Shape::ThroughCut(x, radius) => {
+        Shape::ThroughCut(x, profile) => {
             let solid = materialize(x, b)?;
-            let tool = b.arena.insert(sc_geom::Node::Prism {
-                profile: sc_geom::Profile::Circle { radius: *radius },
+            let tool = b.arena.insert(Node::Prism {
+                profile: profile.clone(),
             })?;
             b.smooth_difference(solid, tool, 0.0)
         }
@@ -173,6 +180,7 @@ fn contains_mesh(s: &Shape) -> bool {
         | Shape::Scale(a, _)
         | Shape::Offset(a, _)
         | Shape::Shell(a, _)
+        | Shape::SliceOff(a, ..)
         // The cutting prism is generated here, never from a mesh.
         | Shape::ThroughCut(a, _) => contains_mesh(a),
         // Matched out rather than caught by a wildcard. This function exists so
@@ -193,6 +201,47 @@ fn build(s: &Shape) -> (Arena, NodeId) {
     (b.arena, id)
 }
 
+/// Every kind of closed region a swept feature can be built from.
+///
+/// All four, because the emitter has three different forms for them: a closed
+/// rectangle, a closed circle, and a loop over a vertex buffer. Generating only
+/// the regular polygon, as this did, left the two closed forms and the general
+/// path unexercised by every property below.
+///
+/// A path is drawn as a star: one vertex per evenly spaced angle, at a radius
+/// that varies. That keeps it simple and non-degenerate however it is shrunk,
+/// while giving it the unequal edge lengths and reflex corners a regular polygon
+/// never has.
+fn arb_profile() -> impl Strategy<Value = Profile> {
+    prop_oneof![
+        (1.0f32..12.0, 1.0f32..12.0).prop_map(|(width, height)| Profile::Rect { width, height }),
+        (0.5f32..6.0).prop_map(|radius| Profile::Circle { radius }),
+        (3u32..10, 1.0f32..6.0)
+            .prop_map(|(sides, radius)| Profile::RegularPolygon { sides, radius }),
+        proptest::collection::vec(1.0f32..5.0, 3..12).prop_map(|radii| {
+            let n = radii.len();
+            let points = radii
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                    sc_geom::glam::Vec2::new(r * a.cos(), r * a.sin())
+                })
+                .collect();
+            Profile::Path { points }
+        }),
+    ]
+}
+
+/// A unit normal, built from a direction rather than from three components so
+/// that no draw can produce the near-zero vector a plane is invalid with.
+fn arb_normal() -> impl Strategy<Value = [f32; 3]> {
+    (0.0f32..std::f32::consts::TAU, -1.0f32..1.0).prop_map(|(theta, z)| {
+        let r = (1.0 - z * z).max(0.0).sqrt();
+        [r * theta.cos(), r * theta.sin(), z]
+    })
+}
+
 /// Leaf primitives with parameters kept in a range where a 3D printer could
 /// plausibly reproduce them.
 ///
@@ -206,7 +255,7 @@ fn arb_leaf(inexact: bool) -> impl Strategy<Value = Shape> {
             .prop_map(|((x, y, z), r)| Shape::Cuboid([x, y, z], r)),
         (0.5f32..8.0, 0.5f32..8.0, 0.0f32..1.0).prop_map(|(r, h, o)| Shape::Cylinder(r, h, o)),
         (1.0f32..8.0, 0.2f32..3.0).prop_map(|(a, b)| Shape::Torus(a, b)),
-        ((3usize..10), 1.0f32..6.0, 1.0f32..8.0).prop_map(|(n, r, h)| Shape::Extrude(n, r, h)),
+        (arb_profile(), 1.0f32..8.0).prop_map(|(profile, depth)| Shape::Extrude(profile, depth)),
     ];
     if !inexact {
         return exact.boxed();
@@ -266,9 +315,21 @@ fn arb_shape(inexact: bool) -> impl Strategy<Value = Shape> {
                     Box::new(base),
                     [t.0, t.1, t.2]
                 )),
-            (inner, 0.3f32..2.0).prop_map(|(a, r)| Shape::ThroughCut(Box::new(a), r)),
+            (inner.clone(), arb_normal(), -10.0f32..10.0)
+                .prop_map(|(a, n, offset)| Shape::SliceOff(Box::new(a), n, offset)),
+            (inner, arb_profile()).prop_map(|(a, profile)| Shape::ThroughCut(Box::new(a), profile)),
         ]
     })
+}
+
+/// Whether an edit moves a value onto or off one of the emitter's peepholes.
+///
+/// Only two numbers can: a profile's side count is the shader's loop bound, and
+/// a scale of exactly one is the multiply the emitter drops. Every other
+/// peephole has its threshold at zero, and scaling a zero leaves it a zero.
+fn is_structural(name: &str, before: f32, after: f32) -> bool {
+    name == "sides"
+        || (name == "scale" && ((before - 1.0).abs() < 1e-9 || (after - 1.0).abs() < 1e-9))
 }
 
 fn arb_points() -> impl Strategy<Value = Vec<[f32; 3]>> {
@@ -433,5 +494,56 @@ proptest! {
             naga::valid::Capabilities::all(),
         );
         prop_assert!(v.validate(&module).is_ok(), "WGSL validation failed for {s:?}");
+
+        // Nothing else may have been quietly emitted as empty space. The
+        // emitter names that constant rather than writing a bare literal so
+        // that it can be counted: one occurrence for the always-empty selection
+        // field, and one for each node reported above. A node kind added to the
+        // arena but forgotten in `wgsl.rs` falls through to empty space, and
+        // this is what says so.
+        prop_assert_eq!(
+            src.matches("= SC_EMPTY;").count(),
+            1 + generated.unsupported.len(),
+            "a node went missing from the shader without being reported: {:?}",
+            s
+        );
+    }
+
+    /// Editing a number must be an upload, never a recompile.
+    ///
+    /// The two hand-written examples in `lib.rs` check a radius and a sketch
+    /// point. This checks every parameter of every node of thousands of trees,
+    /// which is the only way to notice that some new node kind bakes one of its
+    /// values into the source and drops a frame every time it is dragged.
+    #[test]
+    fn a_value_edit_never_rebuilds_the_shader(s in arb_shape(true)) {
+        let (mut arena, root) = build(&s);
+        let before = sc_geom::wgsl::generate(&arena, Some(root)).source;
+
+        for id in arena.live_ids().collect::<Vec<_>>() {
+            let original = arena.get(id).expect("live").clone();
+            for (name, value) in original.params() {
+                let edited_value = value * 1.5;
+                if is_structural(name, value, edited_value) {
+                    continue;
+                }
+                let mut edited = original.clone();
+                // A derived placement refuses edits outright, and an edit that
+                // would make the node invalid is not a value edit at all.
+                if !edited.set_param(name, edited_value) || arena.replace(id, edited).is_err() {
+                    continue;
+                }
+                let after = sc_geom::wgsl::generate(&arena, Some(root)).source;
+                arena.replace(id, original.clone()).expect("it was valid a moment ago");
+                prop_assert_eq!(
+                    after,
+                    before.clone(),
+                    "editing {} on {} rebuilt the shader in {:?}",
+                    name,
+                    id,
+                    s
+                );
+            }
+        }
     }
 }

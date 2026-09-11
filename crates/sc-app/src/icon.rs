@@ -155,22 +155,15 @@ fn solid_glyph(pen: &Pen<'_>, icon: Icon) -> bool {
             );
         }
         Icon::Intersect => {
-            pen.arc(
-                9.0,
-                12.0,
-                6.5,
-                6.5,
-                -std::f32::consts::FRAC_PI_3,
-                std::f32::consts::FRAC_PI_3,
-            );
-            pen.arc(
-                15.0,
-                12.0,
-                6.5,
-                6.5,
-                std::f32::consts::PI - std::f32::consts::FRAC_PI_3,
-                std::f32::consts::PI + std::f32::consts::FRAC_PI_3,
-            );
+            // Both bodies outlined and the part they share filled in. Two facing
+            // arcs on their own covered nine grid units of the twenty four and
+            // read at 15px as a nought, next to a Union and a Subtract that are
+            // both twenty one wide: the odd one out in the row it belongs to.
+            // A solid centre survives the size; a detail inside an outline does
+            // not.
+            pen.circle(9.0, 12.0, 6.5);
+            pen.circle(15.0, 12.0, 6.5);
+            pen.lens(9.0, 15.0, 12.0, 6.5);
         }
         Icon::Torus => {
             pen.ellipse(12.0, 12.0, 9.0, 5.5);
@@ -183,14 +176,17 @@ fn solid_glyph(pen: &Pen<'_>, icon: Icon) -> bool {
             pen.line((17.0, 20.0), (21.0, 15.0));
         }
         Icon::Mesh => {
-            // A wireframe: the outline plus the edges across it, which is what
-            // distinguishes an imported mesh from anything modelled here.
-            pen.path(
-                &[(12.0, 3.0), (21.0, 12.0), (12.0, 21.0), (3.0, 12.0)],
-                true,
-            );
-            pen.line((12.0, 3.0), (12.0, 21.0));
-            pen.line((3.0, 12.0), (21.0, 12.0));
+            // A triangle with its vertices marked, which is what an imported
+            // mesh is made of. It was a diamond with both diagonals drawn
+            // across it, and at 15px the diagonals merge with the outline into
+            // the same four way cross that Move is: two glyphs that sit next to
+            // each other in the design tree, one for a placement and one for an
+            // imported body.
+            pen.path(&[(12.0, 4.0), (21.0, 19.5), (3.0, 19.5)], true);
+            pen.line((12.0, 4.0), (12.0, 19.5));
+            for (x, y) in [(12.0, 4.0), (21.0, 19.5), (3.0, 19.5)] {
+                pen.dot(x, y, 1.7);
+            }
         }
         Icon::Move => {
             pen.line((12.0, 3.0), (12.0, 21.0));
@@ -430,6 +426,34 @@ impl Pen<'_> {
             .circle_filled(self.at(cx, cy), self.scale(r), self.stroke.color);
     }
 
+    /// The filled overlap of two circles of the same radius, side by side.
+    ///
+    /// Filled rather than outlined for the reason [`Pen::dot`] is: at interface
+    /// sizes an outline inside another outline merges with it.
+    fn lens(&self, left_cx: f32, right_cx: f32, cy: f32, r: f32) {
+        const STEPS: usize = 14;
+        let half = (right_cx - left_cx) * 0.5;
+        if half >= r {
+            // They do not overlap, so there is nothing to fill.
+            return;
+        }
+        let spread = (half / r).acos();
+        let mut pts = Vec::with_capacity(2 * (STEPS + 1));
+        // Round the right of the left circle, then back round the left of the
+        // right one, which closes on the two crossings.
+        for (cx, from) in [(left_cx, 0.0), (right_cx, std::f32::consts::PI)] {
+            for i in 0..=STEPS {
+                let t = from - spread + 2.0 * spread * i as f32 / STEPS as f32;
+                pts.push(self.at(cx + r * t.cos(), cy + r * t.sin()));
+            }
+        }
+        self.painter.add(egui::Shape::convex_polygon(
+            pts,
+            self.stroke.color,
+            Stroke::NONE,
+        ));
+    }
+
     /// A dashed closed path, for an outline that is implied rather than drawn.
     fn dashed(&self, points: &[(f32, f32)]) {
         let mut pts: Vec<Pos2> = points.iter().map(|(x, y)| self.at(*x, *y)).collect();
@@ -584,6 +608,108 @@ mod tests {
                 Icon::Layers,
                 "{} has no icon of its own",
                 node.kind()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::{draw, Icon};
+
+    /// Every icon in the set, so a new one cannot be added without deciding
+    /// what it looks like at the size it will be drawn at.
+    const EVERY: [(Icon, &str); 34] = [
+        (Icon::Pen, "Pen"),
+        (Icon::Square, "Square"),
+        (Icon::Circle, "Circle"),
+        (Icon::Hexagon, "Hexagon"),
+        (Icon::Cube, "Cube"),
+        (Icon::Sphere, "Sphere"),
+        (Icon::Cylinder, "Cylinder"),
+        (Icon::Slot, "Slot"),
+        (Icon::Hole, "Hole"),
+        (Icon::HexHole, "HexHole"),
+        (Icon::Shell, "Shell"),
+        (Icon::Offset, "Offset"),
+        (Icon::Move, "Move"),
+        (Icon::Undo, "Undo"),
+        (Icon::Redo, "Redo"),
+        (Icon::File, "File"),
+        (Icon::Folder, "Folder"),
+        (Icon::Save, "Save"),
+        (Icon::Download, "Download"),
+        (Icon::Frame, "Frame"),
+        (Icon::Cursor, "Cursor"),
+        (Icon::Help, "Help"),
+        (Icon::Sun, "Sun"),
+        (Icon::Moon, "Moon"),
+        (Icon::Monitor, "Monitor"),
+        (Icon::Layers, "Layers"),
+        (Icon::Plane, "Plane"),
+        (Icon::Union, "Union"),
+        (Icon::Subtract, "Subtract"),
+        (Icon::Intersect, "Intersect"),
+        (Icon::Torus, "Torus"),
+        (Icon::Extrude, "Extrude"),
+        (Icon::Mesh, "Mesh"),
+        (Icon::Trash, "Trash"),
+    ];
+
+    /// What one icon actually covers, drawn into `rect`.
+    fn drawn(icon: Icon, rect: egui::Rect) -> Option<egui::Rect> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(200.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            draw(ui.painter(), rect, icon, egui::Color32::BLACK);
+        });
+        output.textures_delta.clear();
+        output
+            .shapes
+            .iter()
+            .map(|s| s.shape.visual_bounding_rect())
+            .filter(egui::Rect::is_positive)
+            .reduce(egui::Rect::union)
+    }
+
+    #[test]
+    fn no_glyph_escapes_its_box() {
+        let rect = egui::Rect::from_min_size(egui::pos2(40.0, 40.0), egui::Vec2::splat(24.0));
+        for (icon, name) in EVERY {
+            let covered = drawn(icon, rect).unwrap_or_else(|| panic!("{name} drew nothing"));
+            assert!(
+                rect.contains_rect(covered),
+                "{name} covers {covered:?}, outside its {rect:?}"
+            );
+        }
+    }
+
+    /// A glyph has to be worth the space it is given. One drawn much smaller
+    /// than the rest reads as a different size of icon rather than as a
+    /// different icon, and at the 15px these are rendered at it disappears
+    /// beside its neighbours: the tool rows put them in a column, so the odd
+    /// one out is obvious and looks like a mistake.
+    ///
+    /// Not a square: a slot is a flat capsule and drawing it any taller would
+    /// make it a rectangle.
+    #[test]
+    fn every_glyph_is_drawn_at_the_size_of_the_set() {
+        let rect = egui::Rect::from_min_size(egui::pos2(40.0, 40.0), egui::Vec2::splat(24.0));
+        for (icon, name) in EVERY {
+            let covered = drawn(icon, rect).unwrap_or_else(|| panic!("{name} drew nothing"));
+            let long = covered.width().max(covered.height());
+            let short = covered.width().min(covered.height());
+            assert!(
+                long >= 15.0 && short >= 9.0,
+                "{name} covers {:.1} by {:.1} of its 24 by 24 grid",
+                covered.width(),
+                covered.height()
             );
         }
     }

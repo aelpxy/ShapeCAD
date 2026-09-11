@@ -4,7 +4,7 @@
 //! the same choice; a viewer on the GPU and a snapshot on a software rasteriser
 //! would not be comparable.
 
-/// Creates an instance configured for the platforms we care about.
+/// Creates an instance able to reach every backend.
 ///
 /// Enables non-conformant adapters. On WSL the only hardware path is Mesa's
 /// Dozen driver (Vulkan over D3D12), which self-reports as non-conformant, so
@@ -12,7 +12,20 @@
 /// a 100x performance difference for a sphere-traced viewport.
 #[must_use]
 pub fn instance() -> wgpu::Instance {
+    instance_for(Preference::Hardware)
+}
+
+/// Creates an instance that can only reach what `preference` asks for.
+///
+/// The restriction is the point, not an optimisation. `wgpu::Instance::new`
+/// builds a driver instance for every backend it is given, there and then, so
+/// an instance over all backends has already loaded the Vulkan ICD before
+/// anything is enumerated. Filtering adapters afterwards is far too late: see
+/// [`Preference::Software`] for what that costs under WSL.
+#[must_use]
+pub fn instance_for(preference: Preference) -> wgpu::Instance {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = backends(preference);
     descriptor.flags |= wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
     wgpu::Instance::new(descriptor)
 }
@@ -29,12 +42,13 @@ pub enum Preference {
     /// Slower, but identical on every machine, which is what golden-image
     /// comparison needs.
     ///
-    /// This deliberately restricts itself to the GL backend. On WSL, merely
-    /// enumerating Vulkan adapters loads Mesa's Dozen driver, which then
-    /// segfaults when its adapter is dropped from a thread other than main,
-    /// and Rust's test harness runs every test on a spawned thread. Selecting a
-    /// software adapter is not enough; the Vulkan ICD must never be loaded at
-    /// all.
+    /// This deliberately restricts itself to the GL backend, and the
+    /// restriction has to reach the instance rather than only the adapter
+    /// filter: see [`instance_for`]. On WSL, merely creating a Vulkan instance
+    /// loads Mesa's Dozen driver, which then segfaults when its adapter is
+    /// dropped from a thread other than main, and Rust's test harness runs
+    /// every test on a spawned thread. Selecting a software adapter is not
+    /// enough; the Vulkan ICD must never be loaded at all.
     Software,
 }
 
@@ -109,4 +123,57 @@ pub fn device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
         ..Default::default()
     }))
     .expect("could not acquire a device")
+}
+
+/// A device on the software rasteriser for tests, or `None` where the machine
+/// has no GPU at all.
+///
+/// Returning `None` lets a test skip rather than fail on a build machine
+/// without even llvmpipe. The preference is not negotiable here: the harness
+/// runs every test on a spawned thread, which is exactly where a Vulkan driver
+/// must not be.
+#[cfg(test)]
+pub(crate) fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = instance_for(Preference::Software);
+    let adapter = try_adapter(&instance, None, Preference::Software)?;
+    Some(device(&adapter))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{instance_for, rank, Preference};
+
+    #[test]
+    fn the_software_instance_cannot_reach_a_vulkan_driver() {
+        // Filtering adapters is not enough. `Instance::new` builds a driver
+        // instance for every backend it is handed, there and then, so an
+        // instance over all of them has loaded the Vulkan ICD before a single
+        // adapter has been looked at. Under WSL that ICD is Dozen, which
+        // segfaults when its adapter is dropped from a thread other than main,
+        // and this test is running on one.
+        let instance = instance_for(Preference::Software);
+        for adapter in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
+            let info = adapter.get_info();
+            assert_eq!(
+                info.backend,
+                wgpu::Backend::Gl,
+                "the software instance reached {} over {:?}",
+                info.name,
+                info.backend
+            );
+        }
+    }
+
+    #[test]
+    fn the_software_preference_reverses_the_adapter_ranking() {
+        let mut ranked = [
+            wgpu::DeviceType::DiscreteGpu,
+            wgpu::DeviceType::IntegratedGpu,
+            wgpu::DeviceType::Cpu,
+        ];
+        ranked.sort_by_key(|&t| rank(t, Preference::Software));
+        assert_eq!(ranked[0], wgpu::DeviceType::Cpu);
+        ranked.sort_by_key(|&t| rank(t, Preference::Hardware));
+        assert_eq!(ranked[0], wgpu::DeviceType::DiscreteGpu);
+    }
 }

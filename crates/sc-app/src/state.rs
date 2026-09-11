@@ -92,6 +92,25 @@ pub(crate) struct Armed {
     pub label: &'static str,
 }
 
+/// A free drag of the selection in progress.
+///
+/// Kept here rather than in the event loop because it owns an open undo step.
+/// A step left open merges everything the user does afterwards into one entry,
+/// and the winit match has several ways out of a gesture: a release, a release
+/// that never arrives because the window lost focus, and a document replaced
+/// from under it. They can only be made to agree if one place owns the state.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MoveDrag {
+    /// The placement being written into.
+    pub node: NodeId,
+    /// Where the pointer first met the drag plane.
+    pub grabbed: Vec3,
+    /// Where the feature was then. A move is the difference between the two, so
+    /// the feature travels with the pointer rather than jumping its centre to
+    /// it.
+    pub from: Vec3,
+}
+
 /// A push/pull drag in progress.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Drag {
@@ -166,6 +185,8 @@ pub(crate) struct AppState {
     pub system_scheme: Option<crate::theme::Scheme>,
     /// The dimension currently being pushed or pulled, if any.
     pub drag: Option<Drag>,
+    /// The free drag of the selection in progress, if any.
+    pub moving: Option<MoveDrag>,
     /// A feature waiting to be placed by the next click, if any.
     pub armed: Option<Armed>,
     /// The tutorial, while it is running.
@@ -207,6 +228,7 @@ impl AppState {
             menu: None,
             system_scheme: None,
             drag: None,
+            moving: None,
             armed: None,
             tutorial: None,
         }
@@ -299,6 +321,7 @@ impl AppState {
 
     /// Replaces the document with an empty one.
     pub(crate) fn new_document(&mut self) {
+        self.abandon_gestures();
         self.doc = Document::new();
         self.selected = None;
         self.path = None;
@@ -309,6 +332,7 @@ impl AppState {
 
     /// Loads the built-in reference part.
     pub(crate) fn load_sample(&mut self) {
+        self.abandon_gestures();
         self.doc = samples::bracket();
         self.selected = self.doc.root();
         self.frame_camera();
@@ -380,16 +404,51 @@ impl AppState {
     }
 
     /// Starts dragging the selection around, returning the node that will move.
-    pub(crate) fn begin_move(&mut self) -> Option<NodeId> {
+    ///
+    /// `grabbed` is where the pointer met the drag plane, which is what makes
+    /// the feature travel with the pointer instead of jumping its centre there.
+    pub(crate) fn begin_move(&mut self, grabbed: Vec3) -> Option<NodeId> {
+        // One gesture at a time. A second begin would open a second step that
+        // only one release could ever close.
+        if self.moving.is_some() {
+            return None;
+        }
         // Opened before the placement is made, not after. Creating one is part
         // of the same thing the user did, and leaving it outside the step means
         // undo takes back the movement and leaves the placement behind.
         self.doc.begin_step();
-        let Some(id) = self.movable() else {
+        let Some(node) = self.movable() else {
             self.doc.end_step();
             return None;
         };
-        Some(id)
+        let from = match self.doc.arena().get(node) {
+            Some(Node::Transform { xform, .. }) => xform.translation,
+            _ => Vec3::ZERO,
+        };
+        self.moving = Some(MoveDrag {
+            node,
+            grabbed,
+            from,
+        });
+        Some(node)
+    }
+
+    /// Slides the feature to wherever the pointer has reached on the drag plane.
+    pub(crate) fn move_to_plane(&mut self, now: Vec3) {
+        let Some(drag) = self.moving else {
+            return;
+        };
+        // The feature can go out from under the gesture: Delete acts on the
+        // selection, and the selection can change while the button is still
+        // down. Ending the move is the only answer that closes the step;
+        // carrying on would put a rejected command on the status bar on every
+        // frame and never say why the part stopped responding.
+        if !self.doc.arena().is_alive(drag.node) {
+            self.finish_move();
+            self.status = "That feature is gone".to_string();
+            return;
+        }
+        self.move_to(drag.node, drag.from + (now - drag.grabbed));
     }
 
     /// Moves a placement to `to`, snapped, in world coordinates.
@@ -406,10 +465,44 @@ impl AppState {
         self.status = format!("{:.1}, {:.1}, {:.1} mm", snapped.x, snapped.y, snapped.z);
     }
 
-    /// Ends a free drag.
+    /// Ends a free drag, keeping where it got to.
+    ///
+    /// Does nothing if no move is in flight, so a second release, or a release
+    /// arriving after the gesture was abandoned, cannot close a step that
+    /// something else opened.
     pub(crate) fn finish_move(&mut self) {
-        self.doc.end_step();
-        self.status = "Ready".to_string();
+        if self.moving.take().is_some() {
+            self.doc.end_step();
+            self.status = "Ready".to_string();
+        }
+    }
+
+    /// Drops every pointer gesture in flight, closing the undo steps they hold.
+    ///
+    /// Called before the document underneath them is replaced. A drag carries a
+    /// node id and the value that node started at, and an id only means
+    /// something within one document: left in flight across a load, the next
+    /// pointer movement drives whatever node happens to wear that id in the
+    /// part that was just opened, changing a model the user has not touched
+    /// with nothing on screen to say why.
+    ///
+    /// Nothing is put back, because there is nothing left to put it back into.
+    /// The step is closed against the document that opened it, which is still
+    /// this one at the point this runs.
+    fn abandon_gestures(&mut self) {
+        if self.drag.take().is_some() {
+            self.doc.end_step();
+        }
+        if self.moving.take().is_some() {
+            self.doc.end_step();
+        }
+        self.armed = None;
+        // A profile in progress is drawn in the old plane's coordinates, and
+        // `attached_to` is another id belonging to the document being replaced.
+        if self.sketch.take().is_some() {
+            self.tool = TOOL_SELECT;
+        }
+        self.attached_to = None;
     }
 
     /// Starts the tutorial from the beginning.
@@ -625,6 +718,7 @@ impl AppState {
     /// Loads the engine example: a deeper model than the bracket, for seeing how
     /// the tree and the property panel behave on something with real depth.
     pub(crate) fn load_engine(&mut self) {
+        self.abandon_gestures();
         self.doc = samples::engine();
         self.selected = self.doc.root();
         self.frame_camera();
@@ -748,6 +842,7 @@ impl AppState {
     pub(crate) fn open_path(&mut self, path: &Path) {
         match file::open(path) {
             Ok(doc) => {
+                self.abandon_gestures();
                 self.doc = doc;
                 self.selected = self.doc.root();
                 self.frame_camera();
@@ -817,6 +912,12 @@ impl AppState {
             Ok(id) => {
                 self.field_dirty = true;
                 self.dirty = true;
+                // A delete can take the selection with it. A selection on a
+                // dead id is a property panel editing nothing and a grip
+                // hanging in space over the gap where the feature was, so the
+                // check belongs on every applied command rather than only on
+                // undo. Ids are stable, so liveness is the whole of it.
+                self.prune_selection();
                 self.status = "Ready".to_string();
                 id
             }
@@ -878,7 +979,8 @@ impl AppState {
     fn prune_selection(&mut self) {
         if let Some(id) = self.selected {
             if !self.doc.arena().is_alive(id) {
-                self.selected = self.doc.root();
+                let root = self.doc.root();
+                self.select(root);
             }
         }
     }
@@ -1039,6 +1141,11 @@ impl AppState {
     /// Turns the camera to face it: drawing in two dimensions on a plane seen
     /// edge-on is guesswork.
     pub(crate) fn start_sketch(&mut self) {
+        // The opposite of what `arm` does, and for the same reason: two
+        // pending gestures both want the next click, and the armed one is
+        // checked first, so a sketch started with a tool still armed would
+        // spend its first point placing a pad somewhere nobody asked for.
+        self.disarm();
         self.sketch = Some(Vec::new());
         self.tool = TOOL_SKETCH;
         self.rig.goal.look_along(self.plane_normal());
@@ -3145,12 +3252,12 @@ mod tests {
         state.new_document();
         state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
 
-        let id = state.begin_move().expect("something to move");
+        let id = state.begin_move(Vec3::ZERO).expect("something to move");
         state.move_to(id, Vec3::new(10.0, 0.0, 0.0));
         state.finish_move();
         let after_one = state.doc.arena().live_ids().count();
 
-        let id = state.begin_move().expect("still movable");
+        let id = state.begin_move(Vec3::ZERO).expect("still movable");
         state.move_to(id, Vec3::new(20.0, 5.0, 0.0));
         state.finish_move();
 
@@ -3174,7 +3281,7 @@ mod tests {
         state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
         let before = state.doc.hash().expect("rooted");
 
-        let id = state.begin_move().expect("movable");
+        let id = state.begin_move(Vec3::ZERO).expect("movable");
         for step in 1..=20 {
             state.move_to(id, Vec3::new(step as f32, 0.0, 0.0));
         }
@@ -3227,5 +3334,145 @@ mod tests {
         state.frame_node(id);
 
         assert_eq!(state.rig.goal.target, before);
+    }
+
+    /// Two gestures both waiting for the next click means the one checked
+    /// first always wins and the other never fires. `arm` already cancels a
+    /// sketch; the other direction was missing, so a sketch started with a pad
+    /// still armed spent its first point dropping the pad instead.
+    #[test]
+    fn starting_a_sketch_puts_an_armed_tool_away() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.arm(Armed {
+            kind: Placing::Pad,
+            profile: sc_geom::Profile::Circle { radius: 5.0 },
+            label: "Boss",
+        });
+        assert!(state.armed.is_some(), "nothing was armed to begin with");
+
+        state.start_sketch();
+
+        assert!(
+            state.armed.is_none(),
+            "the armed feature is still there to take the sketch's first click"
+        );
+        assert!(state.sketch.is_some(), "the sketch did not start");
+    }
+
+    /// A drag carries a node id and the value that node started at, and an id
+    /// only means something inside the document that issued it. Ctrl+O does not
+    /// ask whether a button is down, so a drag can outlive the document it
+    /// began in, and the next movement of the pointer then drives whatever node
+    /// happens to wear that id in the part that was just opened.
+    #[test]
+    fn a_drag_does_not_follow_the_pointer_into_the_next_document() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(
+            Node::Box {
+                half: Vec3::splat(8.0),
+                round: 0.0,
+            },
+            "Block",
+        );
+        let viewport = [0.0, 0.0, 1200.0, 800.0];
+        let grip = state.grips().into_iter().next().expect("a box has three");
+        let (at, axis, gain) = state.grip_on_screen(&grip, viewport).expect("projects");
+        state.begin_drag(Drag {
+            node: state.selected.expect("the body is selected"),
+            param: grip.param,
+            from: grip.value,
+            value: grip.value,
+            axis,
+            gain,
+            origin: at,
+        });
+
+        // The sample's first node is a box too, so the id the drag is holding
+        // names something that would accept every one of its parameters.
+        state.load_sample();
+        let loaded = state.doc.hash().expect("rooted");
+
+        for step in 1..=30 {
+            state.drag_to(at + axis * step as f32);
+        }
+        state.finish_drag();
+
+        assert_eq!(
+            state.doc.hash().expect("rooted"),
+            loaded,
+            "the drag went on re-dimensioning the document that replaced its own"
+        );
+        assert!(
+            !state.dirty,
+            "a freshly loaded document was edited by a gesture nobody aimed at it"
+        );
+    }
+
+    /// The same for a free drag, which writes three parameters rather than one.
+    #[test]
+    fn a_move_does_not_follow_the_pointer_into_the_next_document() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        state.begin_move(Vec3::ZERO).expect("movable");
+
+        state.load_sample();
+        assert!(
+            state.moving.is_none(),
+            "the move survived into a document that knows nothing about it"
+        );
+
+        let loaded = state.doc.hash().expect("rooted");
+        state.move_to_plane(Vec3::new(25.0, 25.0, 0.0));
+        state.finish_move();
+
+        assert_eq!(
+            state.doc.hash().expect("rooted"),
+            loaded,
+            "the move went on sliding a feature in the document that replaced its own"
+        );
+    }
+
+    /// The feature can go out from under a free drag: Delete acts on the
+    /// selection, and the selection can change while the button is still down.
+    /// Carrying on would put a rejected command on the status bar on every
+    /// frame, and leave the step open until a release that means nothing.
+    #[test]
+    fn a_move_stops_when_its_feature_is_deleted() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        let id = state.begin_move(Vec3::ZERO).expect("movable");
+
+        state.apply(Command::SetRoot { root: None });
+        state.apply(Command::Delete { id });
+        state.move_to_plane(Vec3::new(10.0, 0.0, 0.0));
+
+        assert!(
+            state.moving.is_none(),
+            "the move is still writing into a node that is gone"
+        );
+    }
+
+    /// A selection on a dead id is a property panel editing nothing and a grip
+    /// hanging in space over the gap where the feature was. Undo already pruned
+    /// it; a delete is the other way a node stops existing.
+    #[test]
+    fn deleting_the_selection_lets_go_of_it() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(Node::Sphere { radius: 5.0 }, "Ball");
+        let id = state.selected.expect("the body is selected");
+
+        state.apply(Command::SetRoot { root: None });
+        state.apply(Command::Delete { id });
+
+        assert_ne!(
+            state.selected,
+            Some(id),
+            "the selection still names a node that was deleted"
+        );
     }
 }

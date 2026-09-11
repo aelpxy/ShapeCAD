@@ -477,11 +477,14 @@ impl Document {
         // Walk back over every entry the same action produced. Applied in
         // reverse, because a step builds a node before referring to it.
         let step = self.entries[self.cursor - 1].step;
-        while self.cursor > 0 && self.entries[self.cursor - 1].step == step {
-            let inverse = self.entries[self.cursor - 1].inverse.clone();
-            self.run(inverse)?;
-            self.cursor -= 1;
+        let mut at = self.cursor;
+        let mut effects = Vec::new();
+        while at > 0 && self.entries[at - 1].step == step {
+            effects.push(self.entries[at - 1].inverse.clone());
+            at -= 1;
         }
+        self.run_together(effects)?;
+        self.cursor = at;
         Ok(true)
     }
 
@@ -495,12 +498,57 @@ impl Document {
             return Ok(false);
         }
         let step = self.entries[self.cursor].step;
-        while self.cursor < self.entries.len() && self.entries[self.cursor].step == step {
-            let effect = self.entries[self.cursor].effect.clone();
-            self.run(effect)?;
-            self.cursor += 1;
+        let mut at = self.cursor;
+        let mut effects = Vec::new();
+        while at < self.entries.len() && self.entries[at].step == step {
+            effects.push(self.entries[at].effect.clone());
+            at += 1;
         }
+        self.run_together(effects)?;
+        self.cursor = at;
         Ok(true)
+    }
+
+    /// Runs a whole step's worth of effects as one, putting back whatever
+    /// landed if any of them is refused.
+    ///
+    /// Undo and redo move over a whole step, so a refusal part way through
+    /// would leave the user looking at a state their action never passed
+    /// through, with the cursor claiming the step was consumed. The reversing
+    /// effects are read one at a time, because an inverse can only be built
+    /// from the state the effect is about to overwrite.
+    ///
+    /// Nothing reachable today can make this fail: an effect that ran once ran
+    /// against the same arena it is being replayed against. It exists because
+    /// the alternative to unwinding is a half-applied step, and an all-or-
+    /// nothing guarantee with one path out of it is not a guarantee.
+    fn run_together(&mut self, effects: Vec<Effect>) -> Result<()> {
+        let mut landed = Vec::with_capacity(effects.len());
+        for effect in effects {
+            let back = match self.invert(&effect) {
+                Ok(back) => back,
+                Err(e) => return Err(self.unwind(landed, e)),
+            };
+            if let Err(e) = self.run(effect) {
+                return Err(self.unwind(landed, e));
+            }
+            landed.push(back);
+        }
+        Ok(())
+    }
+
+    /// Reverses effects that have already run, newest first, and hands back the
+    /// error that stopped them.
+    ///
+    /// Failures here are ignored for the same reason [`Document::rewind`]
+    /// ignores them: an inverse built from state that existed a moment ago can
+    /// only be refused by a bug in inverse construction, and there is no better
+    /// recovery than to keep unwinding and report the original cause.
+    fn unwind(&mut self, mut landed: Vec<Effect>, cause: DocError) -> DocError {
+        while let Some(back) = landed.pop() {
+            let _ = self.run(back);
+        }
+        cause
     }
 
     /// Resolves a command into a concrete effect, validating as we go.
@@ -747,6 +795,53 @@ mod tests {
         assert!(
             !doc.can_redo(),
             "an unwound entry stayed behind as a redo candidate"
+        );
+    }
+
+    /// Undo and redo move over a whole step, so a refusal part way through one
+    /// must not leave half of it applied. Tested directly, because no sequence
+    /// of commands can produce an effect the arena would refuse to replay, and
+    /// an untested recovery path is one that stops working without anyone
+    /// noticing.
+    #[test]
+    fn a_refused_effect_leaves_the_rest_of_the_step_unapplied() {
+        let mut doc = Document::new();
+        let a = add(&mut doc, sphere(5.0)).unwrap();
+        doc.apply(Command::SetRoot { root: Some(a) }).unwrap();
+        let before = doc.hash().unwrap();
+
+        // The second create lands on the slot the first one just filled, so it
+        // is refused and the first has to come back out with it.
+        let fresh = doc.arena().next_id();
+        let out = doc.run_together(vec![
+            Effect::SetName {
+                id: a,
+                name: Some("Body".into()),
+            },
+            Effect::Create {
+                id: fresh,
+                node: sphere(1.0),
+            },
+            Effect::Create {
+                id: fresh,
+                node: sphere(2.0),
+            },
+        ]);
+
+        assert!(out.is_err(), "a duplicate create was accepted");
+        assert_eq!(doc.hash().unwrap(), before, "the model was left changed");
+        assert_eq!(doc.name(a), None, "a label from the step survived");
+        assert!(
+            !doc.arena().is_alive(fresh),
+            "a node from the step survived"
+        );
+        // Unwinding leaves a tombstone, as any deletion does. What it must not
+        // do is hand the id out again, or a reference held across the failure
+        // would come to mean something else.
+        assert_ne!(
+            doc.arena().next_id(),
+            fresh,
+            "an unwound id was offered again"
         );
     }
 
@@ -1128,6 +1223,38 @@ mod tests {
         assert!(
             (placement_z(&doc, boss) - 4.0).abs() < 1.0e-4,
             "redo replayed only part of the action"
+        );
+    }
+
+    /// A feature the root cannot reach is not wrong, it is nowhere, and there
+    /// is no face to resolve a placement against. Regeneration has to leave it
+    /// alone rather than guess, or rerooting a document would move every
+    /// detached feature to the origin on the next edit.
+    #[test]
+    fn a_derivation_the_root_cannot_reach_is_left_where_it_is() {
+        let (mut doc, base, boss) = base_and_boss(10.0);
+        let whole = doc.root().expect("rooted");
+
+        // Point the document at the base alone. The boss is still in the arena
+        // but nothing reaches it.
+        doc.apply(Command::SetRoot { root: Some(base) }).unwrap();
+        doc.apply(Command::SetParam {
+            id: base,
+            name: "depth".into(),
+            value: 4.0,
+        })
+        .unwrap();
+        assert!(
+            (placement_z(&doc, boss) - 10.0).abs() < 1.0e-4,
+            "an unreachable placement was moved to {}",
+            placement_z(&doc, boss)
+        );
+
+        // Put it back in the model and it catches up with the next edit.
+        doc.apply(Command::SetRoot { root: Some(whole) }).unwrap();
+        assert!(
+            (placement_z(&doc, boss) - 4.0).abs() < 1.0e-4,
+            "the placement stayed stale once it was reachable again"
         );
     }
 

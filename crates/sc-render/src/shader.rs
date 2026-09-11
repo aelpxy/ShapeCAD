@@ -100,7 +100,10 @@ fn soft_shadow(origin: vec3<f32>, dir: vec3<f32>, far: f32, bias: f32) -> f32 {
             return 0.0;
         }
         shade = min(shade, 10.0 * h / t);
-        t = t + clamp(h, bias, far * 0.05);
+        // The upper bound is held above the lower one. At the closest zoom the
+        // bias floor of 0.02mm exceeds five percent of the far plane, and
+        // `clamp` with low above high is undefined in WGSL.
+        t = t + clamp(h, bias, max(bias, far * 0.05));
         if (t > far * 0.5) {
             break;
         }

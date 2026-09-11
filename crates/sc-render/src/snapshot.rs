@@ -32,7 +32,10 @@ pub fn try_render(
     height: u32,
     preference: crate::gpu::Preference,
 ) -> Option<Image> {
-    let instance = crate::gpu::instance();
+    // Built for the preference, not merely filtered by it: an instance over
+    // every backend has loaded a Vulkan driver before the first adapter is
+    // seen, which is the thing `Preference::Software` exists to avoid.
+    let instance = crate::gpu::instance_for(preference);
     let adapter = crate::gpu::try_adapter(&instance, None, preference)?;
     let (device, queue) = crate::gpu::device(&adapter);
     Some(render_with(&device, &queue, field, camera, width, height))
@@ -193,4 +196,76 @@ pub fn write_png(image: &Image, path: &std::path::Path) -> std::io::Result<()> {
     let mut writer = encoder.write_header()?;
     writer.write_image_data(&image.pixels)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capture, Renderer, COPY_ALIGNMENT, FORMAT};
+    use crate::camera::OrbitCamera;
+    use sc_geom::glam::Vec3;
+    use sc_geom::{Arena, Node};
+
+    #[test]
+    fn a_capture_at_an_awkward_width_is_not_skewed() {
+        let Some((device, queue)) = crate::gpu::test_device() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        // Padding is the reason rows have to be unpacked at all: a row that is
+        // not already a multiple of the alignment comes back wider than it was
+        // asked for.
+        assert_eq!(COPY_ALIGNMENT, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        assert_eq!(FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
+
+        let mut arena = Arena::new();
+        let id = arena
+            .insert(Node::Box {
+                half: Vec3::splat(10.0),
+                round: 0.0,
+            })
+            .expect("a box is valid");
+        let field = sc_geom::wgsl::generate(&arena, Some(id));
+        let renderer = Renderer::new(&device, &queue, FORMAT, &field);
+        let camera = OrbitCamera::default();
+
+        // The draw is scissored to the left half, so the image carries a hard
+        // vertical boundary. Unpacked with the wrong stride that boundary walks
+        // sideways a little further down every row, which is what row padding
+        // gets wrong and what a length check cannot see.
+        for width in [61u32, 63, 64, 65, 100, 257] {
+            let height = 23u32;
+            let split = width / 2;
+            let image = capture(&device, &queue, width, height, |encoder, view| {
+                renderer.draw_in(
+                    &queue,
+                    encoder,
+                    view,
+                    &camera,
+                    [0.0, 0.0, split as f32, height as f32],
+                );
+            });
+            assert_eq!(
+                image.pixels.len(),
+                (width * height * 4) as usize,
+                "capture {width}x{height} came back the wrong size"
+            );
+
+            let at = |x: u32, y: u32| {
+                let i = ((y * width + x) * 4) as usize;
+                [image.pixels[i], image.pixels[i + 1], image.pixels[i + 2]]
+            };
+            let clear = at(width - 1, 0);
+            let boundary = |y: u32| (0..width).find(|&x| at(x, y) == clear).unwrap_or(width);
+            let first = boundary(0);
+            assert_eq!(first, split, "the boundary is not where it was drawn");
+            for y in 1..height {
+                assert_eq!(
+                    boundary(y),
+                    first,
+                    "capture {width}x{height} is skewed: row {y} breaks at {}",
+                    boundary(y)
+                );
+            }
+        }
+    }
 }

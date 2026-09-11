@@ -18,27 +18,41 @@ pub struct Mesh {
 /// What a slicer needs to know about a mesh before it will accept it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Topology {
+    /// Number of triangles classified.
+    pub triangles: usize,
     /// Edges used by exactly one triangle. Any of these means a hole.
     pub boundary_edges: usize,
     /// Edges used by three or more triangles.
     pub non_manifold_edges: usize,
-    /// Edges used twice in the *same* direction, meaning the two triangles
-    /// disagree about which side is outside.
+    /// Edges the triangles around them traverse more often one way than the
+    /// other, meaning they disagree about which side is outside.
+    ///
+    /// On an edge shared by exactly two triangles this is the familiar flipped
+    /// face. On one shared by more it is the same disagreement, counted the
+    /// same way, because a surface that closes traverses every edge as often in
+    /// each direction however many triangles meet there.
     pub inconsistent_edges: usize,
 }
 
 impl Topology {
-    /// No holes and no disagreement about which side is outside.
+    /// No holes and no disagreement about which side is outside, among the
+    /// triangles that are present.
     ///
     /// These are the two defects that actually stop a slicer: a hole leaves the
     /// solid undefined, and inconsistent winding inverts it. Non-manifold edges
     /// are deliberately not included. See [`Topology::is_manifold`].
+    ///
+    /// Every one of those checks is vacuous on a mesh with no triangles, so
+    /// this is true of an empty export. It is not a claim that there is
+    /// anything to print: `triangles` is, and [`Topology::is_manifold`] folds it
+    /// in.
     #[must_use]
     pub fn is_printable(&self) -> bool {
         self.boundary_edges == 0 && self.inconsistent_edges == 0
     }
 
-    /// Additionally free of edges shared by more than two triangles.
+    /// A solid: everything [`Topology::is_printable`] checks, on at least one
+    /// triangle, and no edge shared by more than two of them.
     ///
     /// Uniform dual contouring places exactly one vertex per cell. Where two
     /// separate sheets of the surface pass through the same cell (a thin gap,
@@ -52,9 +66,13 @@ impl Topology {
     /// crossings form more than one connected component and emitting a vertex
     /// for each. Raising the resolution also makes it rarer, since it only
     /// occurs where a feature is finer than a cell.
+    ///
+    /// The other two conditions are not decoration. Read on its own the
+    /// non-manifold count is satisfied by a mesh full of holes, and by an empty
+    /// one, neither of which is a solid.
     #[must_use]
     pub fn is_manifold(&self) -> bool {
-        self.non_manifold_edges == 0
+        self.triangles > 0 && self.is_printable() && self.non_manifold_edges == 0
     }
 }
 
@@ -180,6 +198,7 @@ impl Mesh {
         }
 
         let mut report = Topology {
+            triangles: self.indices.len(),
             boundary_edges: 0,
             non_manifold_edges: 0,
             inconsistent_edges: 0,
@@ -187,15 +206,81 @@ impl Mesh {
         for (forward, backward) in edges.values().copied() {
             match forward + backward {
                 0 | 1 => report.boundary_edges += 1,
-                2 => {
-                    // Healthy: one triangle traverses the edge each way.
-                    if forward != 1 || backward != 1 {
-                        report.inconsistent_edges += 1;
-                    }
-                }
+                2 => {}
                 _ => report.non_manifold_edges += 1,
+            }
+            // A closed, consistently wound surface traverses every edge as
+            // often one way as the other. Checking that, rather than only the
+            // healthy (1, 1) case, catches the same defect on an edge shared by
+            // more than two triangles, where the old test simply did not look: a
+            // triangle emitted twice with the same winding left three edges at
+            // (2, 1) and the mesh still called itself printable.
+            if forward != backward {
+                report.inconsistent_edges += 1;
             }
         }
         report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{unit_box, with_triangles_removed};
+
+    #[test]
+    fn a_closed_box_passes_every_check() {
+        let t = unit_box(Vec3::splat(1.0)).topology();
+        assert_eq!(t.triangles, 12);
+        assert_eq!(t.boundary_edges, 0);
+        assert_eq!(t.non_manifold_edges, 0);
+        assert_eq!(t.inconsistent_edges, 0);
+        assert!(t.is_printable() && t.is_manifold(), "{t:?}");
+    }
+
+    #[test]
+    fn a_mesh_with_a_hole_is_neither_printable_nor_manifold() {
+        // `is_manifold` says "additionally", so it has to include what
+        // `is_printable` checks. On its own it called a mesh with three open
+        // edges manifold, which is true of the edge count and useless as an
+        // answer to "can this be printed".
+        let torn = with_triangles_removed(&unit_box(Vec3::splat(1.0)), 0, 1);
+        let t = torn.topology();
+        assert_eq!(t.boundary_edges, 3, "{t:?}");
+        assert!(!t.is_printable(), "{t:?}");
+        assert!(!t.is_manifold(), "{t:?}");
+    }
+
+    #[test]
+    fn a_triangle_emitted_twice_is_not_printable() {
+        // Duplicating a face leaves a zero-thickness flap: three edges shared
+        // by three triangles, two traversals one way and one the other. The
+        // winding disagrees, and counting that only on two-triangle edges
+        // missed it entirely.
+        let mut mesh = unit_box(Vec3::splat(1.0));
+        mesh.indices.push(mesh.indices[0]);
+        let t = mesh.topology();
+        assert_eq!(t.non_manifold_edges, 3, "{t:?}");
+        assert_eq!(t.inconsistent_edges, 3, "{t:?}");
+        assert!(!t.is_printable(), "{t:?}");
+    }
+
+    #[test]
+    fn a_single_flipped_triangle_is_caught() {
+        let mut mesh = unit_box(Vec3::splat(1.0));
+        mesh.indices[0].swap(1, 2);
+        let t = mesh.topology();
+        assert_eq!(t.inconsistent_edges, 3, "{t:?}");
+        assert!(!t.is_printable(), "{t:?}");
+    }
+
+    #[test]
+    fn an_empty_mesh_encloses_nothing_and_is_not_manifold() {
+        // Every edge check passes vacuously on a mesh with no edges. That is
+        // why the triangle count is part of the report: a slicer handed an
+        // empty file has no solid, whatever the edge counts say.
+        let t = Mesh::default().topology();
+        assert_eq!(t.triangles, 0);
+        assert!(!t.is_manifold(), "{t:?}");
     }
 }

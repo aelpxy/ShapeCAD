@@ -123,6 +123,132 @@ fn a_snapshot_naming_a_dead_node_is_rejected() {
     );
 }
 
+/// Deleting a node deliberately leaves its label behind, so that undoing the
+/// deletion brings the two back together. Writing that label out produced a
+/// file this build's own loader refused, which is the one thing a save must
+/// never do: a saved file that cannot be opened is not a saved file.
+#[test]
+fn a_label_left_on_a_deleted_node_does_not_break_the_file() {
+    let mut doc = Document::new();
+    let keep = sc_doc::add(&mut doc, Node::Sphere { radius: 4.0 }).unwrap();
+    let scrap = sc_doc::add(&mut doc, Node::Sphere { radius: 2.0 }).unwrap();
+    doc.apply(Command::SetRoot { root: Some(keep) }).unwrap();
+    doc.apply(Command::SetName {
+        id: scrap,
+        name: Some("offcut".into()),
+    })
+    .unwrap();
+    doc.apply(Command::Delete { id: scrap }).unwrap();
+    assert_eq!(doc.name(scrap), Some("offcut"), "undo lost the label");
+
+    assert!(
+        doc.snapshot().names.iter().all(|(id, _)| *id != scrap),
+        "a tombstoned label was written to the file"
+    );
+
+    let path = scratch("deadlabel");
+    file::save(&doc, &path).unwrap();
+    let loaded = file::open(&path).expect("a saved document must reopen");
+    assert_eq!(loaded.hash(), doc.hash());
+    assert_eq!(loaded.name(scrap), None);
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// Everything below writes an arena by hand, because these are the states no
+/// sequence of commands can produce: a file is the one way into the kernel that
+/// nothing else checks.
+fn load_arena(name: &str, slots: &str, root: &str) -> Result<Document, FileError> {
+    let json = format!(
+        r#"{{"format":4,"generator":"test","units":"mm",
+            "arena":{{"slots":[{slots}]}},"root":{root},"names":[]}}"#
+    );
+    let path = scratch(name);
+    std::fs::write(&path, json).unwrap();
+    let out = file::open(&path);
+    std::fs::remove_file(&path).ok();
+    out
+}
+
+/// A child pointing at a tombstone evaluates as empty space rather than as an
+/// error, so the part opens looking like a part with a piece missing.
+#[test]
+fn a_child_pointing_at_a_tombstone_is_refused() {
+    let err = load_arena(
+        "dangling",
+        r#"null,{"Union":{"a":0,"b":0,"smooth":0.0}}"#,
+        "1",
+    )
+    .expect_err("a dangling child loaded");
+    assert!(matches!(err, FileError::Invalid(_)), "got {err}");
+}
+
+/// A negative radius bounds to an inverted box, `min` above `max`. Bounds may
+/// over-report and never under-report, and an inverted one clips the whole part
+/// out of an export without anything saying so.
+#[test]
+fn an_out_of_range_parameter_is_refused() {
+    let err = load_arena("badparam", r#"{"Sphere":{"radius":-5.0}}"#, "0")
+        .expect_err("an invalid node loaded");
+    assert!(matches!(err, FileError::Invalid(_)), "got {err}");
+}
+
+/// The arena is a DAG. A loop in it is not a shape, it is a walk that never
+/// finishes: evaluation recurses until the stack runs out.
+#[test]
+fn a_cyclic_arena_is_refused() {
+    let err = load_arena(
+        "cyclic",
+        r#"{"Union":{"a":1,"b":1,"smooth":0.0}},{"Union":{"a":0,"b":0,"smooth":0.0}}"#,
+        "0",
+    )
+    .expect_err("a cyclic arena loaded");
+    assert!(matches!(err, FileError::Invalid(_)), "got {err}");
+}
+
+/// The arena refuses to delete a node a placement is derived from, so a file
+/// holding that pair is a file no session produced. Regeneration would silently
+/// leave the placement where it was found.
+#[test]
+fn a_placement_derived_from_a_dead_node_is_refused() {
+    let err = load_arena(
+        "deadbase",
+        r#"{"Sphere":{"radius":2.0}},null,
+           {"Transform":{"child":0,"xform":{"translation":[0.0,0.0,0.0],
+            "rotation":[0.0,0.0,0.0,1.0],"scale":1.0},"on":1}}"#,
+        "2",
+    )
+    .expect_err("a derivation on a dead node loaded");
+    assert!(matches!(err, FileError::Invalid(_)), "got {err}");
+}
+
+/// A placement derived from something inside its own subtree would be defined
+/// in terms of its own result. The arena rejects the edit that would make one;
+/// loading has to reject the file that already contains one.
+#[test]
+fn a_placement_derived_from_its_own_subtree_is_refused() {
+    let err = load_arena(
+        "selfbase",
+        r#"{"Sphere":{"radius":2.0}},
+           {"Transform":{"child":0,"xform":{"translation":[0.0,0.0,1.0],
+            "rotation":[0.0,0.0,0.0,1.0],"scale":1.0},"on":0}}"#,
+        "1",
+    )
+    .expect_err("a self-derived placement loaded");
+    assert!(matches!(err, FileError::Invalid(_)), "got {err}");
+}
+
+/// Validation must not cost a real document its ability to open. The engine is
+/// the deepest model in the repo and every node in it is legal.
+#[test]
+fn validation_still_lets_the_samples_through() {
+    for doc in [samples::bracket(), samples::engine()] {
+        let snapshot = doc.snapshot();
+        let back = Document::from_snapshot(snapshot).expect("a sample failed validation");
+        assert_eq!(back.hash(), doc.hash());
+    }
+}
+
 #[test]
 fn the_format_is_readable_json() {
     // The file being legible to a person - and to a language model - is a

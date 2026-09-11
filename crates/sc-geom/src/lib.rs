@@ -128,6 +128,25 @@ mod tests {
         assert_near(eval(&b.arena, t, Vec3::new(8.0, 0.0, 0.0)), 3.0, "outside");
     }
 
+    /// A scale small enough that dividing a point by it overflows makes the
+    /// subtree under it evaluate as `+inf`, the same value a missing node
+    /// reports. A blend above it then turned the whole model into NaN, so one
+    /// over-enthusiastic drag on a scale handle emptied the viewport and left
+    /// every other feature in the document invisible too.
+    #[test]
+    fn a_vanishingly_small_scale_does_not_poison_the_features_beside_it() {
+        let mut b = Builder::new();
+        let speck = b.sphere(1.0).unwrap();
+        let shrunk = b.transform(speck, Transform::from_scale(1e-40)).unwrap();
+        let other = b.sphere(3.0).unwrap();
+        let blended = b.smooth_union(shrunk, other, 0.5).unwrap();
+
+        let p = Vec3::new(5.0, 0.0, 0.0);
+        let d = eval(&b.arena, blended, p);
+        assert!(d.is_finite(), "the blend evaluated to {d}");
+        assert_near(d, eval(&b.arena, other, p), "the surviving sphere");
+    }
+
     #[test]
     fn shell_hollows_inward_and_keeps_the_outer_surface() {
         let mut b = Builder::new();
@@ -485,6 +504,9 @@ mod tests {
             Node::Offset {
                 child: leaf,
                 distance: 0.5,
+            },
+            Node::Prism {
+                profile: profile.clone(),
             },
             Node::Extrude {
                 profile,

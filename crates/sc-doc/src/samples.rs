@@ -29,6 +29,7 @@ pub fn bracket() -> Document {
         },
     )
     .unwrap();
+    named(&mut d, plate, "Base plate");
 
     let wall = add(
         &mut d,
@@ -38,6 +39,7 @@ pub fn bracket() -> Document {
         },
     )
     .unwrap();
+    named(&mut d, wall, "Upright");
     let wall = add(
         &mut d,
         Node::Transform {
@@ -74,11 +76,7 @@ pub fn bracket() -> Document {
         // Named, like every feature. The design tree labels a boolean by the
         // feature it applied, so an unnamed cut reads as "Difference" and says
         // nothing about what it did.
-        d.apply(Command::SetName {
-            id: drill,
-            name: Some("Bolt hole".into()),
-        })
-        .unwrap();
+        named(&mut d, drill, "Bolt hole");
         let drill = add(
             &mut d,
             Node::Transform {
@@ -113,16 +111,8 @@ pub fn bracket() -> Document {
     .unwrap();
 
     d.apply(Command::SetRoot { root: Some(part) }).unwrap();
-    d.apply(Command::SetName {
-        id: body,
-        name: Some("body".into()),
-    })
-    .unwrap();
-    d.apply(Command::SetName {
-        id: part,
-        name: Some("bracket".into()),
-    })
-    .unwrap();
+    named(&mut d, body, "body");
+    named(&mut d, part, "bracket");
     d
 }
 
@@ -258,6 +248,7 @@ fn barrel(d: &mut Document) -> NodeId {
             },
         )
         .unwrap();
+        named(d, fin, "Cooling fin");
         let z = FIRST + PITCH * i as f32;
         let fin = at(d, fin, Vec3::new(0.0, 0.0, z));
         stack = joined(d, stack, fin, 1.5);
@@ -286,6 +277,7 @@ fn head(d: &mut Document) -> NodeId {
         },
     )
     .unwrap();
+    named(d, boss, "Plug boss");
     let boss = at(d, boss, Vec3::new(0.0, 28.0, 132.0));
     head = joined(d, head, boss, 2.5);
 
@@ -302,6 +294,7 @@ fn head(d: &mut Document) -> NodeId {
             },
         )
         .unwrap();
+        named(d, port, "Port stub");
         let port = at_turned(d, port, Vec3::new(46.0 * side, 0.0, 123.0), lying);
         head = joined(d, head, port, 2.5);
     }
@@ -320,6 +313,7 @@ fn feet(d: &mut Document, body: NodeId) -> NodeId {
             },
         )
         .unwrap();
+        named(d, foot, "Mounting foot");
         let foot = at(d, foot, Vec3::new(54.0 * side, 0.0, 5.0));
         body = joined(d, body, foot, 3.0);
     }
@@ -433,11 +427,7 @@ pub fn engine() -> Document {
         (head, "head"),
         (part, "engine"),
     ] {
-        d.apply(Command::SetName {
-            id,
-            name: Some(name.into()),
-        })
-        .unwrap();
+        named(&mut d, id, name);
     }
     d
 }

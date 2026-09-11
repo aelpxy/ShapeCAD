@@ -89,11 +89,13 @@ impl SketchPlane {
 mod tests {
     use super::*;
 
-    /// Everything else derives from the frame, so it is what the tests pin down.
-    fn to_world(plane: SketchPlane, p: Vec2) -> Vec3 {
-        let (u, v, _) = plane.frame();
-        u * p.x + v * p.y
-    }
+    /// A few sketch coordinates to carry through, including the degenerate one.
+    const POINTS: [Vec2; 4] = [
+        Vec2::ZERO,
+        Vec2::new(3.0, -7.0),
+        Vec2::new(-12.5, 40.0),
+        Vec2::new(0.0, 1.0),
+    ];
 
     #[test]
     fn every_frame_is_right_handed() {
@@ -106,6 +108,59 @@ mod tests {
                 plane.name()
             );
         }
+    }
+
+    /// Right-handed is not enough on its own. Axes that are not unit length, or
+    /// not square to each other, would scale or shear a sketch on the way into
+    /// the model: a 40mm rectangle would come out some other size, and the field
+    /// under it would no longer be a distance.
+    #[test]
+    fn every_frame_is_orthonormal() {
+        for plane in SketchPlane::ALL {
+            let (u, v, n) = plane.frame();
+            for (name, axis) in [("u", u), ("v", v), ("n", n)] {
+                assert!(
+                    (axis.length() - 1.0).abs() < 1.0e-6,
+                    "{}: {name} is {} long",
+                    plane.name(),
+                    axis.length()
+                );
+            }
+            for (a, b, pair) in [(u, v, "u,v"), (v, n, "v,n"), (n, u, "n,u")] {
+                assert!(
+                    a.dot(b).abs() < 1.0e-6,
+                    "{}: {pair} are not square, dot is {}",
+                    plane.name(),
+                    a.dot(b)
+                );
+            }
+        }
+    }
+
+    /// The three are meant to be three different planes, each described in the
+    /// terms a printed part is thought about.
+    #[test]
+    fn the_three_planes_are_distinct_and_described() {
+        for (i, plane) in SketchPlane::ALL.into_iter().enumerate() {
+            for other in SketchPlane::ALL.into_iter().skip(i + 1) {
+                assert_ne!(plane, other);
+                assert_ne!(plane.name(), other.name());
+                assert_ne!(plane.describe(), other.describe());
+                assert!(
+                    (plane.frame().2 - other.frame().2).length() > 1.0e-6,
+                    "{} and {} face the same way",
+                    plane.name(),
+                    other.name()
+                );
+            }
+            assert!(plane.describe().len() > 40, "{} says nothing", plane.name());
+            assert!(
+                !plane.describe().contains('\u{2014}'),
+                "{} has an em dash in it",
+                plane.name()
+            );
+        }
+        assert!(SketchPlane::ALL.contains(&SketchPlane::default()));
     }
 
     #[test]
@@ -126,14 +181,62 @@ mod tests {
         }
     }
 
+    /// Through the real `to_world`, not a copy of it: the placement and the lift
+    /// are two routes to the same point, and the interface draws a sketch by one
+    /// and builds it by the other.
     #[test]
     fn a_placement_carries_sketch_coordinates_into_the_model() {
         for plane in SketchPlane::ALL {
-            for p in [Vec2::new(3.0, -7.0), Vec2::ZERO, Vec2::new(-12.5, 40.0)] {
+            for p in POINTS {
                 let through_placement = plane.placement().apply_point(Vec3::new(p.x, p.y, 0.0));
                 assert!(
-                    (through_placement - to_world(plane, p)).length() < 1.0e-5,
-                    "{} placed {p:?} at {through_placement:?}",
+                    (through_placement - plane.to_world(p)).length() < 1.0e-5,
+                    "{} placed {p:?} at {through_placement:?}, lifted it to {:?}",
+                    plane.name(),
+                    plane.to_world(p)
+                );
+            }
+        }
+    }
+
+    /// A pocket is placed behind its plane and swept through, so the offset has
+    /// to run along the normal on every plane, not only on the one that was
+    /// tried first. On XZ the normal is negative, which is where a sign gets
+    /// lost.
+    #[test]
+    fn an_offset_placement_moves_along_the_normal() {
+        for plane in SketchPlane::ALL {
+            let (.., n) = plane.frame();
+            for offset in [-3.0, 0.0, 12.5] {
+                let placed = plane.placement_at(offset);
+                assert!(
+                    (placed.translation - n * offset).length() < 1.0e-6,
+                    "{} at {offset} moved to {:?}, expected {:?}",
+                    plane.name(),
+                    placed.translation,
+                    n * offset
+                );
+                // Only the translation moves: an offset plane is the same plane.
+                assert_eq!(placed.rotation, plane.placement().rotation);
+                assert!((placed.scale - 1.0).abs() < f32::EPSILON);
+            }
+            assert_eq!(plane.placement(), plane.placement_at(0.0));
+        }
+    }
+
+    /// And the offset lands where the sketch frame says it should, which is what
+    /// a pocket depends on to start outside the material.
+    #[test]
+    fn an_offset_sketch_point_lands_off_the_plane() {
+        for plane in SketchPlane::ALL {
+            let (.., n) = plane.frame();
+            for p in POINTS {
+                let placed = plane
+                    .placement_at(-2.0)
+                    .apply_point(Vec3::new(p.x, p.y, 0.0));
+                assert!(
+                    (placed - (plane.to_world(p) - n * 2.0)).length() < 1.0e-5,
+                    "{} put {p:?} at {placed:?}",
                     plane.name()
                 );
             }
@@ -141,16 +244,10 @@ mod tests {
     }
 
     #[test]
-    fn an_offset_placement_moves_along_the_normal() {
-        let placed = SketchPlane::Xy.placement_at(-3.0);
-        assert!((placed.translation - Vec3::new(0.0, 0.0, -3.0)).length() < 1.0e-6);
-    }
-
-    #[test]
     fn the_build_plate_is_the_identity() {
         assert_eq!(SketchPlane::Xy.placement(), Transform::IDENTITY);
         assert_eq!(
-            to_world(SketchPlane::Xy, Vec2::new(5.0, 6.0)),
+            SketchPlane::Xy.to_world(Vec2::new(5.0, 6.0)),
             Vec3::new(5.0, 6.0, 0.0)
         );
     }

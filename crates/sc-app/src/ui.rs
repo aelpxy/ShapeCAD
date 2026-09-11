@@ -17,6 +17,10 @@ use sc_doc::Command;
 use sc_geom::glam::{Vec2 as GVec2, Vec3};
 use sc_geom::{Node, NodeId, Profile};
 
+/// The size of the workspace switch, which has to be known before it is drawn
+/// so that it can be placed clear of the buttons on either side of it.
+const SWITCH: Vec2 = Vec2::new(180.0, 34.0);
+
 const WORKSPACES: [(&str, &str); 2] = [
     (
         "Model",
@@ -33,7 +37,7 @@ const TOOLS: [(Icon, &str, &str); 2] = [
     (
         Icon::Cursor,
         "Select",
-        "Click the model to select the feature under the pointer, right-click it for the actions menu. Drag to orbit, scroll to zoom.",
+        "Click the model to select the feature under the pointer, then drag one of its blue grips to change that dimension. Right-click for the actions menu, drag the background to orbit, scroll to zoom.",
     ),
     (
         Icon::Pen,
@@ -73,10 +77,13 @@ pub(crate) fn draw(ui: &mut egui::Ui, state: &mut AppState) -> Chrome {
         ui.ctx().request_repaint();
     }
     shortcuts(ui.ctx(), state);
+    // Measured before any panel has taken its share, so both are sized against
+    // the window rather than against each other.
+    let window = ui.max_rect().width();
     top_bar(ui, state);
     status_bar(ui, state);
-    left_panel(ui, state);
-    right_panel(ui, state);
+    left_panel(ui, state, window);
+    right_panel(ui, state, window);
 
     // Claim the leftover space explicitly rather than reading the parent's
     // remaining rect: a floating layer such as the file browser perturbs that,
@@ -89,9 +96,10 @@ pub(crate) fn draw(ui: &mut egui::Ui, state: &mut AppState) -> Chrome {
                 viewport: rect,
                 overlays: Vec::new(),
             };
+            let slots = slots(rect, state.sketch.is_some(), state.tutorial.is_some());
             datum_planes(ui, state, rect, &mut layout.overlays);
-            overlays(ui, state, rect, &mut layout.overlays);
-            sketch_overlay(ui, state, rect, &mut layout.overlays);
+            overlays(ui, state, rect, &slots, &mut layout.overlays);
+            sketch_overlay(ui, state, rect, &slots, &mut layout.overlays);
             layout
         })
         .inner;
@@ -203,11 +211,9 @@ fn menu_height(state: &AppState, target: MenuTarget) -> f32 {
                 .arena()
                 .get(id)
                 .is_some_and(|n| n.kind() == "extrude");
-            if extrude {
-                11.0
-            } else {
-                10.0
-            }
+            // Sketch on this face, and detach from one, each appear only when
+            // they apply.
+            10.0 + f32::from(u8::from(extrude)) + f32::from(u8::from(state.selection_is_attached()))
         }
     };
     items * 27.0 + 46.0
@@ -384,8 +390,8 @@ fn empty_menu(ui: &mut egui::Ui, state: &mut AppState) {
         state.frame_model();
         state.close_menu();
     }
-    for (axis, _, normal, label) in AXES {
-        if theme::menu_item(ui, Icon::Plane, label, Some(axis), true, false).clicked() {
+    for (axis, normal, view, _) in AXES {
+        if theme::menu_item(ui, Icon::Plane, view, Some(axis), true, false).clicked() {
             state.look_along(normal);
             state.close_menu();
         }
@@ -409,6 +415,14 @@ fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
     const ZOOM_OUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
     const ZOOM_RESET: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Num0);
     const FIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F);
+
+    // A modal owns the keyboard. These are taken out of the queue before any
+    // widget is laid out, so without this the f in a filename framed the model
+    // and never reached the file browser's name field. Escape belongs to the
+    // browser too: it is how the browser is dismissed.
+    if state.browser.is_some() {
+        return;
+    }
 
     // Escape abandons a drag and puts the dimension back. Checked before
     // anything else that consumes Escape, so that a drag started by mistake can
@@ -462,10 +476,15 @@ fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
             state.set_ui_scale(state.ui_scale - 0.25);
         } else if i.consume_shortcut(&ZOOM_RESET) {
             state.set_ui_scale(1.0);
-        } else if i.consume_shortcut(&FIT) {
-            state.frame_model();
         }
     });
+
+    // The one unmodified letter, so it is the one that has to give way to a
+    // field being typed into. A dimension can be edited by typing as well as by
+    // dragging, and f there means f, not fit.
+    if !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_shortcut(&FIT)) {
+        state.frame_model();
+    }
 }
 
 fn file_browser(ctx: &egui::Context, state: &mut AppState) {
@@ -481,29 +500,86 @@ fn file_browser(ctx: &egui::Context, state: &mut AppState) {
     }
 }
 
+/// Where the workspace switch goes.
+///
+/// Centred in the bar, which is what it is for, but never over one of the two
+/// groups of buttons it sits between: on a narrow window the exact centre put
+/// the pill straight across Sample and Save. If the gap is narrower than the
+/// switch there is nothing left to do but centre it in the gap.
+fn centred_between(bar: egui::Rect, left_end: f32, right_start: f32, size: Vec2) -> egui::Rect {
+    let gap = egui::Rect::from_min_max(
+        egui::pos2(left_end, bar.top()),
+        egui::pos2(right_start.max(left_end), bar.bottom()),
+    );
+    let x = if gap.width() >= size.x {
+        bar.center()
+            .x
+            .clamp(gap.left() + size.x * 0.5, gap.right() - size.x * 0.5)
+    } else {
+        gap.center().x
+    };
+    egui::Rect::from_center_size(egui::pos2(x, bar.center().y), size)
+}
+
+/// A top bar button that drops its label when the bar is short of room.
+///
+/// The glyph and the tooltip carry the meaning either way, and a bar whose
+/// groups overlap is worse than one whose buttons are terser.
+fn bar_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    enabled: bool,
+    compact: bool,
+) -> egui::Response {
+    if compact {
+        theme::icon_button(ui, icon, enabled)
+    } else {
+        theme::tool_button(ui, icon, label, false, enabled)
+    }
+}
+
+/// Bar width below which the file buttons drop their labels.
+///
+/// Below this the three groups cannot all fit and the middle one ends up
+/// painted over the file buttons. Shedding the wordmark and the labels buys
+/// about 250 points, measured against the 900 point minimum window at 150
+/// percent zoom, where the bar has 600 points to work with.
+const ROOM_FOR_WORDS: f32 = 1060.0;
+/// And below this, the wordmark goes too.
+const ROOM_FOR_NAME: f32 = 900.0;
+
 fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
     egui::Panel::top("top")
         .exact_size(62.0)
-        .frame(theme::bar(true))
+        .frame(theme::bar())
         .show(ui, |ui| {
             let full = ui.max_rect();
+            // Where the two groups of buttons ended, so the switch between them
+            // can be placed without running over either.
+            let mut left_end = full.left();
+            let mut right_start = full.right();
+
+            let compact = full.width() < ROOM_FOR_WORDS;
 
             ui.horizontal_centered(|ui| {
                 theme::logo(ui, 30.0);
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    ui.add_space(9.0);
-                    ui.label(RichText::new("ShapeCAD").size(15.5).strong());
-                    ui.label(
-                        RichText::new(state.title())
-                            .size(10.5)
-                            .color(theme::palette().text_dim),
-                    );
-                });
+                if full.width() >= ROOM_FOR_NAME {
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(9.0);
+                        ui.label(RichText::new("ShapeCAD").size(15.5).strong());
+                        ui.label(
+                            RichText::new(state.title())
+                                .size(10.5)
+                                .color(theme::palette().text_dim),
+                        );
+                    });
+                }
 
-                ui.add_space(16.0);
+                ui.add_space(if compact { 8.0 } else { 16.0 });
                 ui.spacing_mut().item_spacing.x = 2.0;
-                let new = theme::tool_button(ui, Icon::File, "New", false, true);
+                let new = bar_button(ui, Icon::File, "New", true, compact);
                 if theme::hint(
                     new,
                     "New document",
@@ -515,7 +591,7 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
                     state.new_document();
                 }
 
-                let open = theme::tool_button(ui, Icon::Folder, "Open", false, true);
+                let open = bar_button(ui, Icon::Folder, "Open", true, compact);
                 if theme::hint(
                     open,
                     "Open document",
@@ -527,7 +603,7 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
                     state.browse(Purpose::Open);
                 }
 
-                let sample = theme::tool_button(ui, Icon::Layers, "Sample", false, true);
+                let sample = bar_button(ui, Icon::Layers, "Sample", true, compact);
                 if theme::hint(
                     sample,
                     "Load the sample",
@@ -540,7 +616,7 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
                 }
 
                 let can_save = state.dirty || state.path.is_none();
-                let save = theme::tool_button(ui, Icon::Save, "Save", false, can_save);
+                let save = bar_button(ui, Icon::Save, "Save", can_save, compact);
                 let help = if can_save {
                     "Writes the document to disk. Ctrl+Shift+S saves it somewhere new."
                 } else {
@@ -550,81 +626,130 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
                     state.save();
                 }
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    top_bar_actions(ui, state);
-                });
+                left_end = ui.cursor().left();
+                right_start = ui
+                    .with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        top_bar_actions(ui, state);
+                    })
+                    .response
+                    .rect
+                    .left();
             });
 
             // Centred exactly, which a horizontal layout cannot do on its own.
-            let width = 190.0;
-            let centre = egui::Rect::from_center_size(full.center(), Vec2::new(width, 34.0));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(centre), |ui| {
-                theme::segmented(ui, &mut state.tab, &WORKSPACES);
-            });
+            //
+            // Dropped entirely when the bar is short. Measured at the 900 point
+            // minimum and 150 percent zoom, the three groups want about 680
+            // points of a 600 point bar, so one of them has to go, and this is
+            // the one: it is a two state view toggle whose second state is not
+            // built yet, against file actions and export, which do things. When
+            // Print exists this should move somewhere that scales instead.
+            if !compact {
+                let switch = centred_between(full, left_end + 8.0, right_start - 8.0, SWITCH);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(switch), |ui| {
+                    theme::segmented(ui, &mut state.tab, &WORKSPACES);
+                });
+            }
         });
 }
 
 fn status_bar(ui: &mut egui::Ui, state: &AppState) {
     egui::Panel::bottom("status")
         .exact_size(30.0)
-        .frame(theme::bar(false))
+        .frame(theme::bar())
         .show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                let status = ui.label(
-                    RichText::new(&state.status)
-                        .size(11.5)
-                        .color(theme::palette().text_dim),
-                );
-                theme::hint(
-                    status,
-                    "Status",
-                    "The result of the last thing you did, including why an operation was refused.",
-                    None,
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let unit = ui.label(RichText::new("mm").size(11.5).color(theme::palette().text_dim));
-                    theme::hint(
-                        unit,
-                        "Millimetres",
-                        "Every dimension in the document is in millimetres. There is no other unit.",
-                        None,
-                    );
-                    ui.add_space(10.0);
-                    if let Some(b) = state.doc.bounds() {
-                        let s = b.size();
-                        let size = ui.label(
-                            RichText::new(format!("{:.1} x {:.1} x {:.1}", s.x, s.y, s.z))
+            let bar = ui.max_rect();
+            // The readouts are laid out first and the message gets what is
+            // left, truncated. The other way round, which is how this read, a
+            // long refusal ran straight under them.
+            let taken = ui
+                .scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(bar)
+                        .layout(Layout::right_to_left(Align::Center)),
+                    |ui| readouts(ui, state),
+                )
+                .response
+                .rect;
+
+            let room = egui::Rect::from_min_max(
+                bar.min,
+                egui::pos2(taken.left() - 10.0, bar.max.y),
+            );
+            if room.width() < 40.0 {
+                return;
+            }
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(room)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| {
+                    let status = ui.add(
+                        egui::Label::new(
+                            RichText::new(&state.status)
                                 .size(11.5)
                                 .color(theme::palette().text_dim),
-                        );
-                        theme::hint(
+                        )
+                        .truncate(),
+                    );
+                    theme::hint(
+                        status,
+                        "Status",
+                        "The result of the last thing you did, including why an operation was refused.",
+                        None,
+                    );
+                },
+            );
+        });
+}
+
+/// The right-hand end of the status bar: how big the model is, and what the
+/// last edit cost.
+fn readouts(ui: &mut egui::Ui, state: &AppState) {
+    let unit = ui.label(
+        RichText::new("mm")
+            .size(11.5)
+            .color(theme::palette().text_dim),
+    );
+    theme::hint(
+        unit,
+        "Millimetres",
+        "Every dimension in the document is in millimetres. There is no other unit.",
+        None,
+    );
+    ui.add_space(10.0);
+    if let Some(b) = state.doc.bounds() {
+        let s = b.size();
+        let size = ui.label(
+            RichText::new(format!("{:.1} x {:.1} x {:.1}", s.x, s.y, s.z))
+                .size(11.5)
+                .color(theme::palette().text_dim),
+        );
+        theme::hint(
                             size,
                             "Bounding box",
                             "How much space the model occupies along X, Y and Z. Compare it against your printer's build volume.",
                             None,
                         );
-                        ui.add_space(10.0);
-                    }
-                    let (how, why) = if state.last_edit_rebuilt {
-                        (
+        ui.add_space(10.0);
+    }
+    let (how, why) = if state.last_edit_rebuilt {
+        (
                             "rebuild",
                             "The last edit changed the shape of the model, so the shader was regenerated and recompiled.",
                         )
-                    } else {
-                        (
+    } else {
+        (
                             "upload",
                             "The last edit only changed a number, so it was uploaded to the GPU without recompiling anything.",
                         )
-                    };
-                    let timing = ui.label(
-                        RichText::new(format!("{how} {:.1} ms", state.last_edit_ms))
-                            .size(11.5)
-                            .color(theme::palette().text_dim),
-                    );
-                    theme::hint(timing, "Last edit", why, None);
-                });
-            });
-        });
+    };
+    let timing = ui.label(
+        RichText::new(format!("{how} {:.1} ms", state.last_edit_ms))
+            .size(11.5)
+            .color(theme::palette().text_dim),
+    );
+    theme::hint(timing, "Last edit", why, None);
 }
 
 fn panel_frame() -> egui::Frame {
@@ -633,9 +758,22 @@ fn panel_frame() -> egui::Frame {
         .inner_margin(Margin::same(12))
 }
 
-fn left_panel(ui: &mut egui::Ui, state: &mut AppState) {
+/// How wide a side panel may be in a window of a given width.
+///
+/// The window has a minimum size but the interface scale does not, so at 300%
+/// the whole shell has to lay out in a few hundred points. Two panels that each
+/// insisted on a fixed width then took the window between them: the property
+/// panel disappeared entirely and the viewport was squeezed to nothing, which
+/// left every projection in this file dividing by a zero width.
+fn panel_width(window: f32, natural: f32) -> f32 {
+    // A third each at the worst, so the 3D view always keeps the third in the
+    // middle. It is what the application is for.
+    natural.min(window / 3.0).max(0.0)
+}
+
+fn left_panel(ui: &mut egui::Ui, state: &mut AppState, window: f32) {
     egui::Panel::left("design")
-        .exact_size(292.0)
+        .exact_size(panel_width(window, 292.0))
         .frame(panel_frame())
         .show(ui, |ui| {
             // The whole column scrolls: on a short window the tool list would
@@ -866,7 +1004,7 @@ fn plane_row(ui: &mut egui::Ui, state: &mut AppState) {
         );
         for plane in SketchPlane::ALL {
             let active = state.plane == plane && state.attached_to.is_none();
-            let response = ui.add(chip(plane.name(), active, true));
+            let response = theme::chip(ui, plane.name(), active, true);
             if theme::hint(
                 response,
                 plane.name(),
@@ -885,7 +1023,7 @@ fn plane_row(ui: &mut egui::Ui, state: &mut AppState) {
             .selected
             .is_some_and(|id| state.attachable_face(id).is_some());
         let attached = state.attached_to.is_some();
-        let response = ui.add(chip("Face", attached, can_attach || attached));
+        let response = theme::chip(ui, "Face", attached, can_attach || attached);
         let help = if can_attach || attached {
             "Puts the next sketch on the far face of the selected pad, so a hole lands on the surface you can see rather than at the origin."
         } else {
@@ -923,7 +1061,12 @@ fn top_bar_actions(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(6.0);
 
     let running = state.tutorial.is_some();
-    let help = theme::tool_button(ui, Icon::Help, "Guide", running, true);
+    let compact = ui.max_rect().width() < 300.0;
+    let help = if compact {
+        theme::icon_button(ui, Icon::Help, true)
+    } else {
+        theme::tool_button(ui, Icon::Help, "Guide", running, true)
+    };
     if theme::hint(
                     help,
                     "Guided tour",
@@ -986,25 +1129,6 @@ fn appearance_switch(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
-/// A small toggle used for the plane picker and the workspace tabs.
-fn chip(label: &str, active: bool, enabled: bool) -> egui::Button<'static> {
-    let colour = if !enabled {
-        theme::palette().text_dim.gamma_multiply(0.45)
-    } else if active {
-        theme::palette().text
-    } else {
-        theme::palette().text_dim
-    };
-    egui::Button::new(RichText::new(label.to_owned()).size(11.5).color(colour))
-        .fill(if active {
-            theme::palette().surface_alt
-        } else {
-            egui::Color32::TRANSPARENT
-        })
-        .stroke(egui::Stroke::NONE)
-        .min_size(Vec2::new(38.0, 24.0))
-}
-
 /// The tool list: one ghost row per operation, grouped.
 fn tools(ui: &mut egui::Ui, state: &mut AppState) {
     sketch_tools(ui, state);
@@ -1040,7 +1164,7 @@ fn add_tools(ui: &mut egui::Ui, state: &mut AppState) {
         (
             Icon::Square,
             "Rectangle",
-            "Pads a 40 by 30 mm rectangle off the active plane. Edit its width, height and depth afterwards in the property panel.",
+            "Arms a 40 by 30 mm rectangular pad. Click where it goes on the active plane, or press Escape to put it away. Its width, height and depth are draggable afterwards.",
             Profile::Rect {
                 width: 40.0,
                 height: 30.0,
@@ -1049,13 +1173,13 @@ fn add_tools(ui: &mut egui::Ui, state: &mut AppState) {
         (
             Icon::Circle,
             "Circle",
-            "Pads a 15 mm radius disc off the active plane, giving a cylinder you can re-dimension later.",
+            "Arms a 15 mm radius disc, which pads into a cylinder. Click where it goes on the active plane, or press Escape to put it away.",
             Profile::Circle { radius: 15.0 },
         ),
         (
             Icon::Hexagon,
             "Hexagon",
-            "Pads a six sided prism off the active plane. The side count is a parameter, so the same node can become any regular polygon.",
+            "Arms a six sided prism. Click where it goes on the active plane. The side count is a parameter afterwards, so the same node becomes any regular polygon.",
             Profile::RegularPolygon {
                 sides: 6,
                 radius: 15.0,
@@ -1122,7 +1246,7 @@ fn cut_tools(ui: &mut egui::Ui, state: &mut AppState) {
         (
             Icon::Slot,
             "Slot",
-            "Cuts a 20 by 10 mm slot straight through the model from the active plane.",
+            "Arms a 20 by 10 mm slot, cut straight through the model. Click where it goes, or press Escape to put it away.",
             Profile::Rect {
                 width: 20.0,
                 height: 10.0,
@@ -1131,13 +1255,13 @@ fn cut_tools(ui: &mut egui::Ui, state: &mut AppState) {
         (
             Icon::Hole,
             "Hole",
-            "Cuts a 10 mm bore straight through the model from the active plane. Select a pad first and pick Face to drill from its top surface.",
+            "Arms a 10 mm bore, cut straight through the model. Click where it goes; select a pad first and pick Face to drill from the surface you can see.",
             Profile::Circle { radius: 5.0 },
         ),
         (
             Icon::HexHole,
             "Hex hole",
-            "Cuts a hexagonal pocket through the model, sized for a captive nut.",
+            "Arms a hexagonal pocket sized for a captive nut, cut through the model. Click where it goes.",
             Profile::RegularPolygon {
                 sides: 6,
                 radius: 5.0,
@@ -1166,6 +1290,9 @@ fn cut_tools(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// Shown by every modify tool when there is nothing to apply it to.
 const NO_SELECTION: &str = "Select a node in the design tree or the viewport first. This wraps the selection rather than adding beside it.";
+
+/// Offered by the tool panel, the property panel and the context menu alike.
+const DETACH: &str = "Stops this following the face it was built on. It stays exactly where it is now; only the link is cut.";
 
 /// Operations that wrap the selection rather than adding to it.
 fn modify_tools(ui: &mut egui::Ui, state: &mut AppState) {
@@ -1220,23 +1347,16 @@ fn modify_tools(ui: &mut egui::Ui, state: &mut AppState) {
 
         if attached {
             let row = rows.row(Icon::Plane, "Detach from face", false, true);
-            if theme::hint(
-                row,
-                "Detach from face",
-                "Stops this following the face it was built on. It stays exactly where it is now; only the link is cut.",
-                None,
-            )
-            .clicked()
-            {
+            if theme::hint(row, "Detach from face", DETACH, None).clicked() {
                 state.detach_selection();
             }
         }
     });
 }
 
-fn right_panel(ui: &mut egui::Ui, state: &mut AppState) {
+fn right_panel(ui: &mut egui::Ui, state: &mut AppState, window: f32) {
     egui::Panel::right("properties")
-        .exact_size(320.0)
+        .exact_size(panel_width(window, 320.0))
         .frame(panel_frame())
         .show(ui, |ui| {
             theme::card().show(ui, |ui| {
@@ -1283,33 +1403,65 @@ fn derived_note(ui: &mut egui::Ui) {
 
 /// The selected node's icon, name and id, across the top of the panel.
 fn properties_header(ui: &mut egui::Ui, state: &AppState, id: NodeId, node: &Node) {
+    /// Tall enough for the title, which is the largest type in the panel.
+    const HEIGHT: f32 = 26.0;
+
     let (title, subtitle) = label_for(state, id, node);
-    ui.horizontal(|ui| {
-        let (glyph, _) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
-        crate::icon::draw(
-            ui.painter(),
-            glyph,
-            crate::icon::for_kind(node.kind()),
-            theme::palette().text,
-        );
-        ui.add_space(2.0);
-        theme::large_title(ui, &title);
-        if let Some(subtitle) = subtitle {
-            ui.add_space(5.0);
-            ui.label(
-                RichText::new(subtitle)
-                    .size(11.0)
-                    .color(theme::palette().text_dim),
+    let (row, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), HEIGHT),
+        egui::Sense::hover(),
+    );
+
+    // The id is placed first and the name gets what is left of the row. The
+    // other way round, a name and its kind ran straight under the id once the
+    // panel was narrow enough, which at 150% on a small window it is.
+    let tag = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(Layout::right_to_left(Align::Center)),
+            |ui| {
+                ui.label(
+                    RichText::new(format!("{id}"))
+                        .size(11.0)
+                        .color(theme::palette().text_dim),
+                );
+            },
+        )
+        .response
+        .rect;
+
+    let room = egui::Rect::from_min_max(row.min, egui::pos2(tag.left() - 6.0, row.max.y));
+    if room.width() < 24.0 {
+        return;
+    }
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(room)
+            .layout(Layout::left_to_right(Align::Center)),
+        |ui| {
+            let (glyph, _) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
+            crate::icon::draw(
+                ui.painter(),
+                glyph,
+                crate::icon::for_kind(node.kind()),
+                theme::palette().text,
             );
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(format!("{id}"))
-                    .size(11.0)
-                    .color(theme::palette().text_dim),
-            );
-        });
-    });
+            ui.add_space(2.0);
+            theme::large_title(ui, &title);
+            if let Some(subtitle) = subtitle {
+                ui.add_space(5.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(subtitle)
+                            .size(11.0)
+                            .color(theme::palette().text_dim),
+                    )
+                    .truncate(),
+                );
+            }
+        },
+    );
 }
 
 fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) {
@@ -1334,10 +1486,13 @@ fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) 
         any = true;
         ui.horizontal(|ui| {
             ui.add_space(2.0);
-            ui.label(
-                RichText::new(pretty(name))
-                    .size(12.5)
-                    .color(theme::palette().text_dim),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(pretty(name))
+                        .size(12.5)
+                        .color(theme::palette().text_dim),
+                )
+                .truncate(),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let mut v = value;
@@ -1346,7 +1501,10 @@ fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) 
                     .speed(speed)
                     .fixed_decimals(2)
                     .suffix(unit_for(name));
-                let response = ui.add_sized(Vec2::new(112.0, 26.0), field);
+                // The panel is a share of the window, so the field cannot
+                // insist on a width the panel may not have.
+                let width = 112.0_f32.min(ui.available_width());
+                let response = ui.add_sized(Vec2::new(width, 26.0), field);
                 if theme::hint(response, &pretty(name), describe_param(name), None).changed() {
                     edit = Some((name.to_string(), v));
                 }
@@ -1379,14 +1537,7 @@ fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) 
     theme::section(ui, "NODE");
     if state.selection_is_attached() {
         let row = theme::row(ui, Icon::Plane, "Detach from face", false, true);
-        if theme::hint(
-            row,
-            "Detach from face",
-            "Stops this following the face it was built on. It stays exactly where it is now; only the link is cut.",
-            None,
-        )
-        .clicked()
-        {
+        if theme::hint(row, "Detach from face", DETACH, None).clicked() {
             state.detach_selection();
         }
     }
@@ -1417,130 +1568,310 @@ fn properties(ui: &mut egui::Ui, state: &mut AppState, id: NodeId, node: &Node) 
     }
 }
 
+/// Where each piece of floating chrome sits over the 3D view.
+///
+/// One place works all of them out, because the only thing that matters about
+/// these rectangles is how they sit against each other: two that overlap take
+/// each other's clicks, since a claimed rect is what decides whether a press
+/// belongs to the chrome or to the model behind it.
+#[derive(Clone, Copy, Debug)]
+struct Slots {
+    /// The axis legend and the standard views, top right.
+    legend: egui::Rect,
+    /// How to move the camera, top left. `None` when the legend leaves no room.
+    navigation: Option<egui::Rect>,
+    /// The tool bar, bottom centre.
+    toolbar: egui::Rect,
+    /// The sketch readout, above the tool bar while a profile is open.
+    sketch: Option<egui::Rect>,
+    /// The guided tour's card, above whichever of those is showing.
+    tutorial: Option<egui::Rect>,
+}
+
+/// How far floating chrome sits from the edge of the viewport.
+const INSET: f32 = 14.0;
+/// Space between two pieces of floating chrome.
+const GAP: f32 = 10.0;
+
+/// Narrows a rect until it fits across the viewport, and slides it inside.
+///
+/// The window has a minimum size but the interface scale does not, so at 300%
+/// the viewport is a couple of hundred points across and a bar written as 380
+/// wide runs out over the panels on both sides.
+fn narrowed(viewport: egui::Rect, rect: egui::Rect) -> egui::Rect {
+    let width = rect.width().min(viewport.width() - INSET * 2.0).max(0.0);
+    let left = rect
+        .left()
+        .min(viewport.max.x - INSET - width)
+        .max(viewport.min.x + INSET);
+    egui::Rect::from_min_size(
+        egui::pos2(left, rect.top()),
+        Vec2::new(width, rect.height()),
+    )
+}
+
+/// Lays the floating chrome out in a viewport of a given size.
+///
+/// The bottom three stack upwards from the tool bar rather than each hanging
+/// off the bottom edge at a distance of its own, which is how the tour card and
+/// the sketch readout came to be drawn over one another. Anything with no room
+/// left is dropped: half a card over the top of another says less than nothing.
+fn slots(viewport: egui::Rect, sketching: bool, touring: bool) -> Slots {
+    /// Wide enough for three letters and their padding.
+    const LEGEND: Vec2 = Vec2::new(110.0, 30.0);
+    const TOOLBAR: Vec2 = Vec2::new(380.0, 44.0);
+    const SKETCH: Vec2 = Vec2::new(430.0, 40.0);
+    /// Wide enough for three lines of body text at this size, and tall enough
+    /// for the longest of them plus the progress track.
+    const TOUR: Vec2 = Vec2::new(310.0, 196.0);
+    /// A navigation line with less room than this has nothing useful left to
+    /// say once it is truncated, so it is dropped instead.
+    const NAVIGATION_MIN: f32 = 190.0;
+
+    let legend = narrowed(
+        viewport,
+        egui::Rect::from_min_size(
+            egui::pos2(viewport.max.x - LEGEND.x - INSET, viewport.min.y + INSET),
+            LEGEND,
+        ),
+    );
+
+    let room = legend.left() - GAP - (viewport.min.x + INSET);
+    let navigation = (room >= NAVIGATION_MIN).then(|| {
+        egui::Rect::from_min_size(
+            egui::pos2(viewport.min.x + INSET, legend.top()),
+            Vec2::new(room.min(520.0), legend.height()),
+        )
+    });
+
+    let centred = |size: Vec2, bottom: f32| {
+        narrowed(
+            viewport,
+            egui::Rect::from_center_size(
+                egui::pos2(viewport.center().x, bottom - size.y * 0.5),
+                size,
+            ),
+        )
+    };
+
+    let toolbar = centred(TOOLBAR, viewport.max.y - INSET);
+    let sketch = sketching
+        .then(|| centred(SKETCH, toolbar.top() - GAP))
+        .filter(|rect| rect.top() >= viewport.min.y);
+
+    // The tour card goes above whichever of those is showing, and only if it
+    // still clears the legend along the top.
+    let ceiling = sketch.unwrap_or(toolbar).top() - GAP;
+    let tutorial = touring
+        .then(|| {
+            narrowed(
+                viewport,
+                egui::Rect::from_min_size(
+                    egui::pos2(viewport.min.x + INSET, ceiling - TOUR.y),
+                    TOUR,
+                ),
+            )
+        })
+        .filter(|rect| rect.top() >= legend.bottom() + GAP);
+
+    Slots {
+        legend,
+        navigation,
+        toolbar,
+        sketch,
+        tutorial,
+    }
+}
+
+impl Slots {
+    /// Every slot in use, for the check that has to see all of them at once.
+    #[cfg(test)]
+    fn all(&self) -> Vec<egui::Rect> {
+        [
+            Some(self.legend),
+            self.navigation,
+            Some(self.toolbar),
+            self.sketch,
+            self.tutorial,
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+/// Draws a floating card in one of the slots and reports the rect it filled.
+///
+/// A card sizes itself to its content and egui lays that content out from the
+/// left of whatever room it is given, so a slot wider than the card left the
+/// card off centre and claimed a strip of bare viewport beside it, where a
+/// click then did nothing at all. The width the card took last frame is what
+/// places it in this one; the alternative is laying it out twice.
+fn floating_card<R>(
+    ui: &mut egui::Ui,
+    id: &str,
+    slot: egui::Rect,
+    align: Align,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::Rect {
+    let key = egui::Id::new(("floating", id));
+    let width: f32 = ui
+        .ctx()
+        .memory(|m| m.data.get_temp(key))
+        .unwrap_or(slot.width())
+        .min(slot.width());
+    let left = match align {
+        Align::Min => slot.left(),
+        Align::Center => slot.center().x - width * 0.5,
+        Align::Max => slot.right() - width,
+    };
+    // The room given is still the whole slot, only moved: handing the card
+    // exactly the width it took last time would let a card that wraps its text
+    // shrink a little further every frame.
+    let placed = egui::Rect::from_min_size(egui::pos2(left, slot.top()), slot.size());
+    let used = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(placed), |ui| {
+            theme::floating().show(ui, add);
+        })
+        .response
+        .rect;
+    ui.ctx()
+        .memory_mut(|m| m.data.insert_temp(key, used.width()));
+    used
+}
+
 /// Chrome that floats over the 3D view.
 fn overlays(
     ui: &mut egui::Ui,
     state: &mut AppState,
     viewport: egui::Rect,
+    slots: &Slots,
     claimed: &mut Vec<egui::Rect>,
 ) {
     grips(ui, state, viewport);
     armed_preview(ui, state, viewport);
-    tutorial_card(ui, state, viewport, claimed);
+    tutorial_card(ui, state, slots.tutorial, claimed);
+    axis_legend(ui, state, slots.legend, claimed);
+    navigation_line(ui, slots.navigation);
+    tool_bar(ui, state, slots.toolbar, claimed);
+}
 
-    // Axis legend and Fit, top right.
-    let legend = egui::Rect::from_min_size(
-        egui::pos2(viewport.max.x - 124.0, viewport.min.y + 14.0),
-        Vec2::new(110.0, 30.0),
-    );
-    claimed.push(legend);
-    ui.scope_builder(egui::UiBuilder::new().max_rect(legend), |ui| {
-        theme::floating().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                // The legend doubles as the standard views. Clicking an axis
-                // looks down it, which is the only reliable way back to a
-                // square-on view after orbiting.
-                for (axis, colour, normal, help) in AXES {
-                    let response = ui.add(axis_chip(axis, colour));
-                    if theme::hint(response, help, "Looks straight down this axis.", None).clicked()
-                    {
-                        state.look_along(normal);
-                    }
+/// The axis legend, top right, which doubles as the standard views.
+fn axis_legend(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    slot: egui::Rect,
+    claimed: &mut Vec<egui::Rect>,
+) {
+    let used = floating_card(ui, "legend", slot, Align::Max, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            // Clicking an axis looks down it, which is the only reliable way
+            // back to a square-on view after orbiting.
+            for (i, (axis, normal, view, help)) in AXES.into_iter().enumerate() {
+                let response = theme::axis_chip(ui, axis, theme::palette().axis[i]);
+                if theme::hint(response, view, help, None).clicked() {
+                    state.look_along(normal);
                 }
-            });
+            }
         });
     });
+    claimed.push(used);
+}
 
-    // How to move around, stated rather than assumed.
-    let hint = egui::Rect::from_min_size(
-        egui::pos2(viewport.min.x + 16.0, viewport.min.y + 14.0),
-        Vec2::new(520.0, 30.0),
-    );
-    ui.scope_builder(egui::UiBuilder::new().max_rect(hint), |ui| {
-        ui.label(
-            RichText::new(
-                "Drag to orbit · Right-drag to pan · Scroll to zoom · Right-click for actions",
-            )
-            .size(10.5)
-            .color(theme::palette().text_dim),
-        );
-    });
-
-    // Tool bar, bottom centre.
-    let bar = egui::Rect::from_center_size(
-        egui::pos2(viewport.center().x, viewport.max.y - 36.0),
-        Vec2::new(380.0, 44.0),
-    );
-    claimed.push(bar);
-    ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
-        theme::floating().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for (i, (glyph, label, help)) in TOOLS.iter().enumerate() {
-                    let active = state.tool == i;
-                    let response = theme::tool_button(ui, *glyph, label, active, true);
-                    if theme::hint(response, label, help, None).clicked() && state.tool != i {
-                        state.tool = i;
-                        if i == TOOL_SKETCH {
-                            state.start_sketch();
-                        } else {
-                            state.cancel_sketch();
-                            state.status = format!("{label} tool");
-                        }
-                    }
-                }
-                ui.add_space(4.0);
-                let fit = theme::icon_button(ui, Icon::Frame, true);
-                if theme::hint(
-                    fit,
-                    "Fit in view",
-                    "Frames the whole model in the viewport. Double-clicking the model focuses on that point instead.",
-                    Some("F"),
+/// How to move the camera, stated rather than assumed.
+///
+/// The only text in the interface painted straight onto the 3D view with no
+/// card under it, so it is drawn a good deal darker than a muted label
+/// elsewhere: what is behind it is the scene's colour, not one this code picks.
+/// Deliberately not claimed, since a click here belongs to the model.
+fn navigation_line(ui: &mut egui::Ui, slot: Option<egui::Rect>) {
+    let Some(slot) = slot else {
+        return;
+    };
+    ui.scope_builder(egui::UiBuilder::new().max_rect(slot), |ui| {
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Drag to orbit · Right-drag to pan · Scroll to zoom · Right-click for actions",
                 )
-                .clicked()
-                {
-                    state.frame_model();
-                }
-            });
-        });
+                .size(10.5)
+                .color(
+                    theme::palette()
+                        .text_dim
+                        .lerp_to_gamma(theme::palette().text, 0.45),
+                ),
+            )
+            .truncate(),
+        );
     });
 }
 
-/// The axis legend, which doubles as the standard view buttons.
-const AXES: [(&str, egui::Color32, Vec3, &str); 3] = [
+/// The floating tool bar, bottom centre.
+fn tool_bar(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    slot: egui::Rect,
+    claimed: &mut Vec<egui::Rect>,
+) {
+    let used = floating_card(ui, "toolbar", slot, Align::Center, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (i, (glyph, label, help)) in TOOLS.iter().enumerate() {
+                let active = state.tool == i;
+                let response = theme::tool_button(ui, *glyph, label, active, true);
+                if theme::hint(response, label, help, None).clicked() && state.tool != i {
+                    state.tool = i;
+                    if i == TOOL_SKETCH {
+                        state.start_sketch();
+                    } else {
+                        state.cancel_sketch();
+                        state.status = format!("{label} tool");
+                    }
+                }
+            }
+            ui.add_space(4.0);
+            let fit = theme::icon_button(ui, Icon::Frame, true);
+            if theme::hint(
+                fit,
+                "Fit in view",
+                "Frames the whole model in the viewport. Double-clicking the model focuses on that point instead.",
+                Some("F"),
+            )
+            .clicked()
+            {
+                state.frame_model();
+            }
+        });
+    });
+    claimed.push(used);
+}
+
+/// The axis legend, which doubles as the standard view buttons: the letter, the
+/// direction it looks along, and what that view is called.
+///
+/// The tint each one is drawn in comes from the palette, in the same order, so
+/// the legend matches the coloured ground axes in the scene behind it.
+const AXES: [(&str, Vec3, &str, &str); 3] = [
     (
         "X",
-        egui::Color32::from_rgb(0xC7, 0x5C, 0x5C),
         Vec3::X,
         "Right view",
+        "Looks down the X axis, from the right, with Y across and Z up.",
     ),
     (
         "Y",
-        egui::Color32::from_rgb(0x66, 0x9E, 0x66),
         Vec3::Y,
         "Front view",
+        "Looks down the Y axis, from the front, with X across and Z up.",
     ),
     (
         "Z",
-        egui::Color32::from_rgb(0x5C, 0x7F, 0xC7),
         Vec3::Z,
         "Top view",
+        "Looks down the Z axis, straight at the build plate, with X across.",
     ),
 ];
-
-/// One letter of the axis legend, as a button.
-fn axis_chip(axis: &str, colour: egui::Color32) -> egui::Button<'static> {
-    egui::Button::new(
-        RichText::new(axis.to_owned())
-            .size(11.5)
-            .strong()
-            .color(colour),
-    )
-    .fill(egui::Color32::TRANSPARENT)
-    .stroke(egui::Stroke::NONE)
-    .min_size(Vec2::new(26.0, 24.0))
-}
 
 /// Half-width of a datum plane as drawn, in millimetres.
 const PLANE_EXTENT: f32 = 45.0;
@@ -1560,8 +1891,6 @@ fn datum_planes(
         return;
     }
 
-    let aspect = viewport.width() / viewport.height().max(1.0);
-    let camera = state.camera();
     let painter = ui.painter_at(viewport);
     let mut picked = None;
 
@@ -1573,14 +1902,7 @@ fn datum_planes(
             GVec2::new(-PLANE_EXTENT, PLANE_EXTENT),
         ]
         .iter()
-        .map(|c| {
-            camera.project(plane.to_world(*c), aspect).map(|ndc| {
-                egui::pos2(
-                    viewport.min.x + (ndc.x * 0.5 + 0.5) * viewport.width(),
-                    viewport.min.y + (0.5 - ndc.y * 0.5) * viewport.height(),
-                )
-            })
-        })
+        .map(|c| screen_of(state, viewport, plane.to_world(*c)))
         .collect();
         let Some(corners) = corners else { continue };
 
@@ -1678,11 +2000,32 @@ fn label(painter: &egui::Painter, at: egui::Pos2, text: &str) {
 }
 
 /// Maps a point in the viewport to normalised device coordinates.
+///
+/// The dimensions are floored at a point: a viewport can be squeezed to nothing
+/// between the panels, and the whole of the picking and the sketching downstream
+/// of this would then be handed a NaN.
 pub(crate) fn ndc_of(pos: egui::Pos2, viewport: egui::Rect) -> GVec2 {
     GVec2::new(
-        ((pos.x - viewport.min.x) / viewport.width()) * 2.0 - 1.0,
-        1.0 - ((pos.y - viewport.min.y) / viewport.height()) * 2.0,
+        ((pos.x - viewport.min.x) / viewport.width().max(1.0)) * 2.0 - 1.0,
+        1.0 - ((pos.y - viewport.min.y) / viewport.height().max(1.0)) * 2.0,
     )
+}
+
+/// The aspect ratio to project with, from the shape of the viewport.
+fn aspect_of(viewport: egui::Rect) -> f32 {
+    viewport.width().max(1.0) / viewport.height().max(1.0)
+}
+
+/// Maps a point in the world to the viewport, the inverse of [`ndc_of`].
+///
+/// `None` when the point is behind the camera, which is a thing that happens to
+/// one corner of a datum plane whenever the view is nearly edge on to it.
+fn screen_of(state: &AppState, viewport: egui::Rect, world: Vec3) -> Option<egui::Pos2> {
+    let ndc = state.camera().project(world, aspect_of(viewport))?;
+    Some(egui::pos2(
+        viewport.min.x + (ndc.x * 0.5 + 0.5) * viewport.width().max(1.0),
+        viewport.min.y + (0.5 - ndc.y * 0.5) * viewport.height().max(1.0),
+    ))
 }
 
 /// One step's card: where you are, what to do, and how far along.
@@ -1721,7 +2064,15 @@ fn tutorial_step_card(ui: &mut egui::Ui, step: &crate::tutorial::Step, at: usize
             );
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.small_button(RichText::new("Skip").size(11.0)).clicked() {
+            let button = ui.small_button(RichText::new("Skip").size(11.0));
+            if theme::hint(
+                button,
+                "Skip this step",
+                "Moves to the next card without doing what this one asks. The tour keeps running; the Guide button in the top bar ends it.",
+                None,
+            )
+            .clicked()
+            {
                 skip = true;
             }
         });
@@ -1741,7 +2092,14 @@ fn tutorial_closing_card(ui: &mut egui::Ui) -> bool {
         .color(theme::palette().text_dim),
     );
     ui.add_space(8.0);
-    theme::primary_button(ui, "Done").clicked()
+    let done = theme::primary_button(ui, "Done");
+    theme::hint(
+        done,
+        "Done",
+        "Closes the tour. The Guide button in the top bar brings it back from the beginning.",
+        None,
+    )
+    .clicked()
 }
 
 /// The tutorial card, bottom left of the viewport.
@@ -1753,40 +2111,27 @@ fn tutorial_closing_card(ui: &mut egui::Ui) -> bool {
 fn tutorial_card(
     ui: &mut egui::Ui,
     state: &mut AppState,
-    viewport: egui::Rect,
+    slot: Option<egui::Rect>,
     claimed: &mut Vec<egui::Rect>,
 ) {
-    /// Wide enough for three lines of body text at this size, and tall enough
-    /// for the longest of them plus the progress track.
-    const WIDTH: f32 = 310.0;
-    const HEIGHT: f32 = 196.0;
-    /// Clear of the floating tool bar along the bottom of the viewport.
-    const ABOVE_TOOLBAR: f32 = 74.0;
-
-    let Some(tutorial) = state.tutorial else {
+    let (Some(tutorial), Some(slot)) = (state.tutorial, slot) else {
         return;
     };
-    let card = egui::Rect::from_min_size(
-        egui::pos2(
-            viewport.min.x + 16.0,
-            viewport.max.y - HEIGHT - ABOVE_TOOLBAR,
-        ),
-        Vec2::new(WIDTH, HEIGHT),
-    );
-    claimed.push(card);
 
     let mut close = false;
     let mut skip = false;
-    ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
-        theme::floating().show(ui, |ui| {
-            ui.set_width(WIDTH - 28.0);
-            if let Some(step) = tutorial.step() {
-                skip |= tutorial_step_card(ui, step, tutorial.at);
-            } else {
-                close = tutorial_closing_card(ui);
-            }
-        });
+    // The margins of the card it is drawn in, so the body text wraps to the
+    // width the slot was laid out for.
+    let width = slot.width() - 16.0;
+    let used = floating_card(ui, "tutorial", slot, Align::Min, |ui| {
+        ui.set_width(width);
+        if let Some(step) = tutorial.step() {
+            skip |= tutorial_step_card(ui, step, tutorial.at);
+        } else {
+            close = tutorial_closing_card(ui);
+        }
     });
+    claimed.push(used);
 
     if skip {
         let mut t = tutorial;
@@ -1813,10 +2158,9 @@ fn armed_preview(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
     if !viewport.contains(cursor) {
         return;
     }
-    let aspect = viewport.width() / viewport.height().max(1.0);
     let Some(hit) = state.camera().plane_hit(
         ndc_of(cursor, viewport),
-        aspect,
+        aspect_of(viewport),
         state.plane_origin(),
         state.plane_normal(),
     ) else {
@@ -1824,18 +2168,11 @@ fn armed_preview(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
     };
     let at = state.snap(state.to_plane(hit));
 
-    let to_screen = |world: Vec3| -> Option<egui::Pos2> {
-        let ndc = state.camera().project(world, aspect)?;
-        Some(egui::pos2(
-            viewport.min.x + (ndc.x * 0.5 + 0.5) * viewport.width(),
-            viewport.min.y + (0.5 - ndc.y * 0.5) * viewport.height(),
-        ))
-    };
     let outline: Vec<egui::Pos2> = armed
         .profile
         .polygon()
         .into_iter()
-        .filter_map(|p| to_screen(state.to_world(at + p)))
+        .filter_map(|p| screen_of(state, viewport, state.to_world(at + p)))
         .collect();
     if outline.len() < 3 {
         return;
@@ -1855,7 +2192,7 @@ fn armed_preview(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
         egui::Stroke::new(2.0, colour),
     ));
 
-    let Some(centre) = to_screen(state.to_world(at)) else {
+    let Some(centre) = screen_of(state, viewport, state.to_world(at)) else {
         return;
     };
     label(
@@ -1920,13 +2257,16 @@ fn grips(ui: &egui::Ui, state: &AppState, viewport: egui::Rect) {
             GRIP_RADIUS
         };
         // A dark halo under the ring, so the grip reads against a light face and
-        // a shadowed one alike. The viewport is not a surface whose colour this
-        // code gets to choose.
+        // a shadowed one alike, and a fill of `on_ink` rather than of a card's
+        // colour. The viewport is not a surface whose colour this code gets to
+        // choose: the model is the same light blue in either scheme, and a fill
+        // that followed the palette turned the dark scheme's grips into black
+        // dots that read as holes in the surface.
         painter.circle_filled(at, radius + 1.0, egui::Color32::from_black_alpha(40));
         painter.circle(
             at,
             radius,
-            theme::palette().surface,
+            theme::palette().on_ink,
             egui::Stroke::new(2.5, colour),
         );
 
@@ -1953,9 +2293,7 @@ fn rubber_band(
     painter: &egui::Painter,
     screen: &[egui::Pos2],
     points: &[GVec2],
-    to_screen: &impl Fn(Vec3) -> Option<egui::Pos2>,
 ) {
-    let aspect = viewport.width() / viewport.height().max(1.0);
     let Some(cursor) = ui.ctx().pointer_latest_pos() else {
         return;
     };
@@ -1964,14 +2302,14 @@ fn rubber_band(
     }
     let Some(hit) = state.camera().plane_hit(
         ndc_of(cursor, viewport),
-        aspect,
+        aspect_of(viewport),
         state.plane_origin(),
         state.plane_normal(),
     ) else {
         return;
     };
     let snapped = state.snap(state.to_plane(hit));
-    let Some(preview) = to_screen(state.to_world(snapped)) else {
+    let Some(preview) = screen_of(state, viewport, state.to_world(snapped)) else {
         return;
     };
 
@@ -2001,21 +2339,12 @@ fn sketch_overlay(
     ui: &mut egui::Ui,
     state: &AppState,
     viewport: egui::Rect,
+    slots: &Slots,
     claimed: &mut Vec<egui::Rect>,
 ) {
     let Some(points) = state.sketch.as_ref() else {
         return;
     };
-    let aspect = viewport.width() / viewport.height().max(1.0);
-
-    let to_screen = |world: Vec3| -> Option<egui::Pos2> {
-        let ndc = state.camera().project(world, aspect)?;
-        Some(egui::pos2(
-            viewport.min.x + (ndc.x * 0.5 + 0.5) * viewport.width(),
-            viewport.min.y + (0.5 - ndc.y * 0.5) * viewport.height(),
-        ))
-    };
-
     let painter = ui.painter_at(viewport);
     let stroke = egui::Stroke::new(2.0, theme::palette().accent);
     // Sketch coordinates are in the plane's own frame, not always on XY. Lifting
@@ -2023,7 +2352,7 @@ fn sketch_overlay(
     // entirely the wrong place.
     let screen: Vec<egui::Pos2> = points
         .iter()
-        .filter_map(|p| to_screen(state.to_world(*p)))
+        .filter_map(|p| screen_of(state, viewport, state.to_world(*p)))
         .collect();
 
     for pair in screen.windows(2) {
@@ -2037,7 +2366,7 @@ fn sketch_overlay(
         );
     }
 
-    rubber_band(ui, state, viewport, &painter, &screen, points, &to_screen);
+    rubber_band(ui, state, viewport, &painter, &screen, points);
 
     for (i, point) in screen.iter().enumerate() {
         let first = i == 0;
@@ -2053,31 +2382,28 @@ fn sketch_overlay(
         );
     }
 
-    // Hint, anchored below the tool bar.
-    let hint = egui::Rect::from_center_size(
-        egui::pos2(viewport.center().x, viewport.max.y - 96.0),
-        Vec2::new(430.0, 40.0),
-    );
-    claimed.push(hint);
-    ui.scope_builder(egui::UiBuilder::new().max_rect(hint), |ui| {
-        theme::floating().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("{} points", points.len()))
-                        .size(12.0)
-                        .family(theme::semibold()),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "{:.0} mm grid · Enter to extrude · Backspace undo · Esc cancel",
-                        state.grid
-                    ))
-                    .size(11.5)
-                    .color(theme::palette().text_dim),
-                );
-            });
+    // The readout, in its slot just above the tool bar.
+    let Some(slot) = slots.sketch else {
+        return;
+    };
+    let used = floating_card(ui, "sketch", slot, Align::Center, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} points", points.len()))
+                    .size(12.0)
+                    .family(theme::semibold()),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{:.0} mm grid · Enter to extrude · Backspace undo · Esc cancel",
+                    state.grid
+                ))
+                .size(11.5)
+                .color(theme::palette().text_dim),
+            );
         });
     });
+    claimed.push(used);
 }
 
 /// One line on what a node contributes to the model, for its tree tooltip.
@@ -2522,5 +2848,268 @@ mod tree_tests {
             Some("Join")
         );
         assert_eq!(operation(&Node::Sphere { radius: 1.0 }), None);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{draw, shortcuts, Chrome};
+    use crate::dialog::Purpose;
+    use crate::state::AppState;
+    use crate::theme;
+
+    /// Lays the whole shell out at a given size, in points, and reports where
+    /// the chrome landed along with everything that was painted.
+    ///
+    /// Several passes, for the same reason the snapshot capture runs several:
+    /// a panel's width and the springs behind the widgets both need a frame or
+    /// two to settle, and the last one is the layout a user would see.
+    fn lay_out(state: &mut AppState, size: egui::Vec2) -> (Chrome, Vec<(String, egui::Rect)>) {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+
+        let mut chrome = Chrome::default();
+        let mut texts = Vec::new();
+        for pass in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(f64::from(pass) * 0.25),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                chrome = draw(ui, state);
+            });
+            output.textures_delta.clear();
+            texts.clear();
+            for shape in &output.shapes {
+                collect_text(&shape.shape, shape.clip_rect, &mut texts);
+            }
+        }
+        (chrome, texts)
+    }
+
+    /// Every string painted in the frame, with the rectangle it covers.
+    ///
+    /// Taken from the galley's own bounds rather than from its size: a galley
+    /// laid out in a right to left row is anchored by its right edge, and
+    /// measuring it from the anchor would put it a whole word to the right of
+    /// where it is actually drawn.
+    fn collect_text(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(t) => {
+                // What survives the clip rect is what a reader sees. A panel
+                // that scrolls emits the rows below its own bottom edge too.
+                let rect = t.galley.rect.translate(t.pos.to_vec2());
+                if clip.intersects(rect) {
+                    out.push((t.galley.text().to_owned(), rect.intersect(clip)));
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, clip, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The window has a minimum size but the interface scale does not, so at
+    /// 300% the whole shell has to lay out in a few hundred points. Both side
+    /// panels asked for a fixed width, so the right one and the entire viewport
+    /// were squeezed out of existence, and every projection in this file then
+    /// divided by a zero width.
+    #[test]
+    fn the_viewport_survives_the_smallest_window() {
+        let mut state = AppState::new();
+        for size in [
+            egui::vec2(300.0, 200.0),
+            egui::vec2(600.0, 400.0),
+            egui::vec2(900.0, 600.0),
+        ] {
+            let (chrome, _) = lay_out(&mut state, size);
+            assert!(
+                chrome.viewport.width() >= size.x / 4.0,
+                "the viewport collapsed to {:?} in a {size:?} window",
+                chrome.viewport.size()
+            );
+            assert!(
+                chrome.viewport.height() > 1.0,
+                "the viewport collapsed to {:?} in a {size:?} window",
+                chrome.viewport.size()
+            );
+            assert!(
+                chrome.viewport.is_finite(),
+                "the viewport is not a usable rectangle: {:?}",
+                chrome.viewport
+            );
+        }
+    }
+
+    /// The readouts on the right of the status bar are laid out after the
+    /// message on the left, so a long message ran straight under them.
+    #[test]
+    fn a_long_status_does_not_run_under_the_readouts() {
+        let size = egui::vec2(460.0, 360.0);
+        let mut state = AppState::new();
+        state.load_sample();
+        state.status =
+            "Refused: another node still references the selection, so it was not deleted"
+                .to_owned();
+        let (_, texts) = lay_out(&mut state, size);
+
+        // Everything painted in the bottom bar, which is the one row in the
+        // interface where two runs of text are laid out towards each other.
+        let bar: Vec<&(String, egui::Rect)> = texts
+            .iter()
+            .filter(|(_, rect)| rect.center().y > size.y - 30.0)
+            .collect();
+        assert!(
+            bar.iter().any(|(text, _)| text.starts_with("Refused")),
+            "the status bar did not show the message at all: {bar:?}"
+        );
+        for (i, (text, rect)) in bar.iter().enumerate() {
+            for (other, over) in bar.iter().skip(i + 1) {
+                assert!(
+                    !rect.intersects(*over),
+                    "{text:?} and {other:?} overlap in the status bar"
+                );
+            }
+        }
+    }
+
+    /// A panel keeps its natural width while the window can afford it, and
+    /// never takes so much that the two of them leave no viewport between.
+    #[test]
+    fn a_side_panel_gives_way_to_the_viewport() {
+        use super::panel_width;
+
+        assert!((panel_width(1500.0, 292.0) - 292.0).abs() < f32::EPSILON);
+        assert!((panel_width(1500.0, 320.0) - 320.0).abs() < f32::EPSILON);
+        for window in [0.0, 60.0, 300.0, 600.0, 900.0, 1500.0_f32] {
+            let both = panel_width(window, 292.0) + panel_width(window, 320.0);
+            assert!(
+                both <= window * 2.0 / 3.0 + 0.01,
+                "the panels take {both} of a {window} point window"
+            );
+            assert!(panel_width(window, 292.0) >= 0.0);
+        }
+    }
+
+    /// The workspace switch is centred in the top bar, but not at the cost of
+    /// covering the buttons on either side of it.
+    #[test]
+    fn the_workspace_switch_keeps_clear_of_the_buttons() {
+        use super::centred_between;
+
+        let bar = egui::Rect::from_min_size(egui::pos2(14.0, 0.0), egui::vec2(872.0, 62.0));
+        let size = egui::vec2(180.0, 34.0);
+
+        // Room to spare: exactly centred.
+        let wide = centred_between(bar, 200.0, 800.0, size);
+        assert!((wide.center().x - bar.center().x).abs() < 0.01);
+
+        // Tight: pushed off centre rather than over a button.
+        let tight = centred_between(bar, 420.0, 620.0, size);
+        assert!(tight.left() >= 420.0 && tight.right() <= 620.0, "{tight:?}");
+
+        // No room at all: centred in what gap there is, and still inside it.
+        let none = centred_between(bar, 500.0, 520.0, size);
+        assert!((none.center().x - 510.0).abs() < 0.01, "{none:?}");
+    }
+
+    /// Two pieces of floating chrome that overlap take each other's clicks,
+    /// because each one claims its rectangle from the model behind it. The tour
+    /// card and the sketch readout were both anchored to the bottom of the
+    /// viewport and sat on top of one another; the navigation line and the axis
+    /// legend did the same along the top of a narrow one.
+    #[test]
+    fn floating_chrome_never_overlaps_itself() {
+        for width in [300.0, 460.0, 700.0, 900.0, 1400.0_f32] {
+            for height in [340.0, 520.0, 850.0_f32] {
+                let viewport =
+                    egui::Rect::from_min_size(egui::pos2(292.0, 62.0), egui::vec2(width, height));
+                for sketching in [false, true] {
+                    let slots = super::slots(viewport, sketching, true);
+                    let rects = slots.all();
+                    for (i, rect) in rects.iter().enumerate() {
+                        assert!(
+                            viewport.contains_rect(*rect),
+                            "{rect:?} escapes a {width} by {height} viewport"
+                        );
+                        for other in rects.iter().skip(i + 1) {
+                            assert!(
+                                !rect.intersects(*other),
+                                "{rect:?} and {other:?} overlap in a {width} by {height} \
+                                 viewport, sketching {sketching}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The property panel names the node across the top and pins its id to the
+    /// right of the same row. The name was laid out first and took the whole
+    /// row, so in a panel narrowed by the interface scale the two ran into one
+    /// another.
+    #[test]
+    fn a_nodes_name_does_not_run_under_its_id() {
+        let mut state = AppState::new();
+        state.load_sample();
+        state.selected = state.doc.root();
+        let (_, texts) = lay_out(&mut state, egui::vec2(620.0, 420.0));
+
+        let tag = texts
+            .iter()
+            .find(|(text, _)| text.starts_with('#'))
+            .expect("the panel shows the node id");
+        for (text, rect) in &texts {
+            if text == "bracket" || text == "transform" {
+                assert!(
+                    !rect.intersects(tag.1),
+                    "{text:?} at {rect:?} runs under the id at {:?}",
+                    tag.1
+                );
+            }
+        }
+    }
+
+    /// A modal owns the keyboard. The shortcuts are consumed at the top of the
+    /// frame, before any widget is laid out, so an unmodified letter was taken
+    /// out of the queue before the file browser's name field could see it:
+    /// typing an f into a filename framed the model instead.
+    #[test]
+    fn a_shortcut_does_not_reach_past_the_file_browser() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut state = AppState::new();
+        state.browse(Purpose::SaveAs);
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::F,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut survived = false;
+        let mut output = ctx.run_ui(input, |ui| {
+            shortcuts(ui.ctx(), &mut state);
+            survived = ui.ctx().input(|i| i.key_pressed(egui::Key::F));
+        });
+        output.textures_delta.clear();
+        assert!(
+            survived,
+            "the letter was eaten by a shortcut before the name field could see it"
+        );
     }
 }

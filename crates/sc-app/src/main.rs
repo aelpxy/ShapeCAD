@@ -213,9 +213,64 @@ fn nearest_monitor_width(widths: &[u32], window_width: u32) -> u32 {
         .unwrap_or(0)
 }
 
+/// The pointer in normalised device coordinates, with the viewport aspect.
+///
+/// Both arguments are in physical pixels, and deliberately so. This is a ratio
+/// of one length to another, so the display's scale factor and the interface
+/// zoom divide out of both and the answer is the same at any of them. Dividing
+/// by `pixels_per_point` here would be harmless; dividing one of the two and
+/// not the other is how a click lands somewhere the pointer is not.
+///
+/// `grab_grip` does convert to interface points, and it is right to. It
+/// compares a distance against `ui::GRIP_REACH`, which is a length in points,
+/// and against grips put on screen by the very function `ui::grips` draws them
+/// with. A ratio needs no unit; a length does.
+///
+/// `None` for a viewport too small to divide by, which is what a window reports
+/// on its way back from being minimised.
+fn viewport_ndc(viewport: [f32; 4], cursor: PhysicalPosition<f64>) -> Option<(Vec2, f32)> {
+    let [left, top, width, height] = viewport;
+    if width <= 1.0 || height <= 1.0 {
+        return None;
+    }
+    Some((
+        Vec2::new(
+            ((cursor.x as f32 - left) / width) * 2.0 - 1.0,
+            1.0 - ((cursor.y as f32 - top) / height) * 2.0,
+        ),
+        width / height,
+    ))
+}
+
 /// How far the pointer may move between press and release and still count as a
 /// click, in physical pixels.
 const CLICK_SLOP: f64 = 5.0;
+
+/// How long after a click a second one still pairs with it.
+const DOUBLE_CLICK_MS: u128 = 350;
+
+/// How far apart in physical pixels the two may land and still be one gesture.
+///
+/// A hair wider than `CLICK_SLOP`, because the hand has to travel back to the
+/// button and settle between the two.
+const DOUBLE_CLICK_SLOP: f64 = 6.0;
+
+/// Whether a release pairs with the click before it.
+///
+/// A double click frames what is under the pointer, which moves the camera, so
+/// it has to be sure: near in time and near in space, both.
+fn double_click(
+    last: (std::time::Instant, PhysicalPosition<f64>),
+    now: std::time::Instant,
+    at: Option<PhysicalPosition<f64>>,
+) -> bool {
+    let (when, where_) = last;
+    let Some(at) = at else {
+        return false;
+    };
+    let moved = ((at.x - where_.x).powi(2) + (at.y - where_.y).powi(2)).sqrt();
+    moved < DOUBLE_CLICK_SLOP && now.duration_since(when).as_millis() < DOUBLE_CLICK_MS
+}
 
 /// When the next frame should be drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,6 +429,99 @@ enum Gesture {
     Pan,
 }
 
+/// A gesture the press already started, which the release has to end.
+///
+/// One value rather than two flags, because they are alternatives: a dimension
+/// and a whole feature cannot both be following the same pointer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Started {
+    #[default]
+    Nothing,
+    /// A dimension is being pushed or pulled.
+    Drag,
+    /// The selection is being dragged around the drag plane.
+    Move,
+}
+
+/// What the next click was promised to before the button went down.
+///
+/// Also alternatives, and enforced as such: `AppState::arm` cancels a sketch
+/// and `AppState::start_sketch` disarms, because two things waiting for one
+/// click means the one checked first always wins and the other never fires.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Pending {
+    #[default]
+    Nothing,
+    /// A feature is armed, waiting to be told where it goes.
+    Armed,
+    /// A profile is being drawn.
+    Sketch,
+}
+
+/// What was in flight when a left release arrived.
+///
+/// A press already decided which of five things it meant, and the release has
+/// to reach the same answer. Written down as a value so the combinations can be
+/// checked as a table rather than reasoned about across a winit match.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InFlight {
+    started: Started,
+    pending: Pending,
+    /// The pointer stayed within the click slop, so this was a click rather
+    /// than a camera gesture the orbit has already had.
+    clicked: bool,
+    /// The release landed in the 3D view rather than on chrome.
+    in_viewport: bool,
+}
+
+/// What a left release means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Release {
+    /// Nothing: the pointer travelled, so the camera has already had it, or the
+    /// release landed somewhere that names nothing in the model.
+    Nothing,
+    FinishDrag,
+    FinishMove,
+    PlaceArmed,
+    SketchPoint,
+    Select,
+}
+
+/// Decides what a left release does.
+///
+/// A press that only dismissed the context menu never reaches here; it is
+/// answered where it is recognised, so that closing a menu cannot also select
+/// whatever was behind it.
+///
+/// Two rules, and the reason they are worth writing down separately is that
+/// they pull in opposite directions:
+///
+/// - **Finishing outranks starting, wherever the pointer is.** A push/pull and
+///   a free drag each hold an undo step open. A release over the property
+///   panel, or past the edge of the window, is still the release that has to
+///   close it. Making either conditional on the viewport leaves the step open,
+///   and everything the user does afterwards merges into one undo entry.
+/// - **Starting something needs the pointer in the 3D view.** Placing a
+///   feature, placing a sketch point and selecting all act on a spot in the
+///   model, and a release over the tree or a panel names no such spot.
+fn left_release(f: InFlight) -> Release {
+    match f.started {
+        Started::Drag => return Release::FinishDrag,
+        Started::Move => return Release::FinishMove,
+        Started::Nothing => {}
+    }
+    if !f.clicked || !f.in_viewport {
+        return Release::Nothing;
+    }
+    match f.pending {
+        // An armed feature takes the click: it was armed precisely so that the
+        // next one would say where it goes.
+        Pending::Armed => Release::PlaceArmed,
+        Pending::Sketch => Release::SketchPoint,
+        Pending::Nothing => Release::Select,
+    }
+}
+
 /// Pointer state.
 #[derive(Clone, Copy, Debug, Default)]
 struct Pointer {
@@ -406,11 +554,6 @@ struct App {
     /// Right drag pans and right click opens the context menu, so the two are
     /// separated the same way the left button separates click from orbit.
     right_press_at: Option<PhysicalPosition<f64>>,
-    /// A free drag of the selection: the placement being written into, where the
-    /// pointer first met the drag plane, and where the feature was then. A move
-    /// is the difference between the first two, so the feature travels with the
-    /// pointer rather than jumping its centre to it.
-    moving: Option<(sc_geom::NodeId, Vec3, Vec3)>,
     /// The press currently in flight only closed the context menu, so its
     /// release must not be read as a click on the model.
     dismissing_press: bool,
@@ -435,7 +578,6 @@ impl App {
             cursor: None,
             press_at: None,
             right_press_at: None,
-            moving: None,
             dismissing_press: false,
             last_frame: std::time::Instant::now(),
             last_click: None,
@@ -637,18 +779,7 @@ impl App {
 
     /// The pointer in normalised device coordinates, with the viewport aspect.
     fn pointer_ndc(&self) -> Option<(Vec2, f32)> {
-        let cursor = self.cursor?;
-        let [left, top, width, height] = self.viewport;
-        if width <= 1.0 || height <= 1.0 {
-            return None;
-        }
-        Some((
-            Vec2::new(
-                ((cursor.x as f32 - left) / width) * 2.0 - 1.0,
-                1.0 - ((cursor.y as f32 - top) / height) * 2.0,
-            ),
-            width / height,
-        ))
+        viewport_ndc(self.viewport, self.cursor?)
     }
 
     /// Centres the view on whatever is under the pointer.
@@ -729,7 +860,13 @@ impl App {
     fn grab_grip(&mut self) -> bool {
         use sc_geom::glam::Vec2;
 
-        if self.state.sketch.is_some() || self.state.tool != state::TOOL_SELECT {
+        // Not while something is armed. That click was promised to the feature
+        // waiting to be placed, and a grip that happens to lie under the
+        // pointer must not quietly spend it resizing something else instead.
+        if self.state.sketch.is_some()
+            || self.state.armed.is_some()
+            || self.state.tool != state::TOOL_SELECT
+        {
             return false;
         }
         let Some(cursor) = self.cursor else {
@@ -788,10 +925,10 @@ impl App {
     fn pointer_moved(&mut self, position: PhysicalPosition<f64>) {
         // A drag in progress owns the pointer outright: no orbit, no
         // pan, and no selection change underneath it.
-        if self.moving.is_some() {
+        if self.state.moving.is_some() {
             self.cursor = Some(position);
-            if let (Some((id, grabbed, from)), Some(now)) = (self.moving, self.drag_plane_hit()) {
-                self.state.move_to(id, from + (now - grabbed));
+            if let Some(now) = self.drag_plane_hit() {
+                self.state.move_to_plane(now);
             }
             self.request_redraw();
             return;
@@ -841,13 +978,7 @@ impl App {
 
     /// Where the pointer meets the plane a free drag moves across.
     fn drag_plane_hit(&self) -> Option<Vec3> {
-        let cursor = self.cursor?;
-        let [left, top, width, height] = self.viewport;
-        let ndc = Vec2::new(
-            ((cursor.x as f32 - left) / width) * 2.0 - 1.0,
-            1.0 - ((cursor.y as f32 - top) / height) * 2.0,
-        );
-        let aspect = width / height.max(1.0);
+        let (ndc, aspect) = self.pointer_ndc()?;
         let id = self.state.selected?;
         let root = self.state.doc.root()?;
         let origin =
@@ -881,36 +1012,24 @@ impl App {
         if self.state.hit_at(ndc, aspect, tolerance) != Some(selected) {
             return false;
         }
+        // Found before the step is opened. Nothing here may fail between
+        // `begin_move` and the gesture being recorded, or the step it opened
+        // has no release coming to close it.
         let Some(grabbed) = self.drag_plane_hit() else {
             return false;
         };
-        let Some(id) = self.state.begin_move() else {
+        if self.state.begin_move(grabbed).is_none() {
             return false;
-        };
-        let from = self
-            .state
-            .doc
-            .arena()
-            .get(id)
-            .and_then(|n| match n {
-                sc_geom::Node::Transform { xform, .. } => Some(xform.translation),
-                _ => None,
-            })
-            .unwrap_or(Vec3::ZERO);
-        self.moving = Some((id, grabbed, from));
+        }
         self.input.gesture = Gesture::None;
         true
     }
 
     /// Drops the armed feature where the pointer meets the active plane.
     fn place_armed(&mut self) {
-        let Some(cursor) = self.cursor else { return };
-        let [left, top, width, height] = self.viewport;
-        let ndc = Vec2::new(
-            ((cursor.x as f32 - left) / width) * 2.0 - 1.0,
-            1.0 - ((cursor.y as f32 - top) / height) * 2.0,
-        );
-        let aspect = width / height.max(1.0);
+        let Some((ndc, aspect)) = self.pointer_ndc() else {
+            return;
+        };
         let origin = self.state.plane_origin();
         let normal = self.state.plane_normal();
         match self.state.camera().plane_hit(ndc, aspect, origin, normal) {
@@ -924,13 +1043,9 @@ impl App {
 
     /// Places a sketch point where the pointer meets the build plate.
     fn place_sketch_point(&mut self) {
-        let Some(cursor) = self.cursor else { return };
-        let [left, top, width, height] = self.viewport;
-        let ndc = Vec2::new(
-            ((cursor.x as f32 - left) / width) * 2.0 - 1.0,
-            1.0 - ((cursor.y as f32 - top) / height) * 2.0,
-        );
-        let aspect = width / height.max(1.0);
+        let Some((ndc, aspect)) = self.pointer_ndc() else {
+            return;
+        };
         let origin = self.state.plane_origin();
         let normal = self.state.plane_normal();
         match self.state.camera().plane_hit(ndc, aspect, origin, normal) {
@@ -939,6 +1054,95 @@ impl App {
                 self.state.add_sketch_point(snapped);
             }
             None => self.state.status = "That is not on the sketch plane".to_string(),
+        }
+    }
+
+    /// A left press: grabs a grip, grabs the selection, or starts an orbit.
+    ///
+    /// The order is the order of specificity. A grip is checked first because
+    /// the alternative is orbiting the camera the instant someone tries to
+    /// resize a feature, and the selection before empty space because a press
+    /// on unselected geometry has to stay a way to select it, or nothing could
+    /// be picked without being moved by accident.
+    fn left_press(&mut self) {
+        self.press_at = self.cursor;
+        if self.grab_grip() || self.grab_selection() {
+            self.request_redraw();
+            return;
+        }
+        self.input.gesture = Gesture::Orbit;
+    }
+
+    /// A left release: whatever the press started, finished.
+    fn left_up(&mut self) {
+        let in_flight = InFlight {
+            started: if self.state.drag.is_some() {
+                Started::Drag
+            } else if self.state.moving.is_some() {
+                Started::Move
+            } else {
+                Started::Nothing
+            },
+            pending: if self.state.armed.is_some() {
+                Pending::Armed
+            } else if self.state.sketch.is_some() {
+                Pending::Sketch
+            } else {
+                Pending::Nothing
+            },
+            clicked: self.drag_distance() < CLICK_SLOP,
+            in_viewport: self.pointer_in_viewport(),
+        };
+        // Spent here, so that a release with no press behind it, or one whose
+        // press went to the chrome, cannot be measured against an older
+        // gesture and read as a click on the model.
+        self.press_at = None;
+        self.input.gesture = Gesture::None;
+
+        match left_release(in_flight) {
+            Release::FinishDrag => {
+                self.state.finish_drag();
+                self.request_redraw();
+                return;
+            }
+            Release::FinishMove => {
+                self.state.finish_move();
+                self.request_redraw();
+                return;
+            }
+            Release::PlaceArmed => {
+                self.place_armed();
+                self.request_redraw();
+            }
+            Release::SketchPoint => {
+                self.place_sketch_point();
+                self.request_redraw();
+            }
+            Release::Select => {
+                self.select_under_pointer();
+                self.request_redraw();
+            }
+            Release::Nothing => {}
+        }
+
+        // A quick second click in the same spot frames what is under the
+        // pointer. Not while sketching, where a second click is a second point,
+        // and not on the chrome: a button pressed twice quickly is a button
+        // pressed twice, and framing on it aims a ray through a panel at
+        // whatever happens to lie behind it.
+        if self.state.sketch.is_some() || !in_flight.in_viewport {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let is_double = self
+            .last_click
+            .is_some_and(|last| double_click(last, now, self.cursor));
+        if is_double {
+            self.focus_under_pointer();
+            self.last_click = None;
+            self.request_redraw();
+        } else {
+            self.last_click = self.cursor.map(|c| (now, c));
         }
     }
 
@@ -955,103 +1159,48 @@ impl App {
             self.state.close_menu();
             self.dismissing_press = true;
             self.input.gesture = Gesture::None;
+            self.press_at = None;
             self.request_redraw();
             return;
         }
         if !down && self.dismissing_press {
             self.dismissing_press = false;
             self.input.gesture = Gesture::None;
+            self.press_at = None;
+            self.right_press_at = None;
             return;
         }
 
         if down && (self.input.egui_owns || !self.pointer_in_viewport()) {
+            // The press belongs to the chrome. Forgetting where it landed is
+            // what stops the release that follows it being measured against
+            // some earlier press and read as a click on the model.
+            self.press_at = None;
             return;
         }
         match button {
             MouseButton::Left => {
-                // A grip under the pointer takes the press. Checked before
-                // anything else, because the alternative is orbiting the camera
-                // the instant someone tries to resize a feature.
-                if down && self.grab_grip() {
-                    self.press_at = self.cursor;
-                    self.request_redraw();
-                    return;
-                }
-                if !down && self.state.drag.is_some() {
-                    self.state.finish_drag();
-                    self.input.gesture = Gesture::None;
-                    self.request_redraw();
-                    return;
-                }
-                // A press on the thing that is already selected drags it. Not on
-                // anything else: a press on unselected geometry has to stay a
-                // way to select it, or nothing could ever be picked without
-                // being moved by accident.
-                if down && self.grab_selection() {
-                    self.press_at = self.cursor;
-                    self.request_redraw();
-                    return;
-                }
-                if !down && self.moving.take().is_some() {
-                    self.state.finish_move();
-                    self.input.gesture = Gesture::None;
-                    self.request_redraw();
-                    return;
-                }
-                // An armed feature takes the click: it was armed precisely so
-                // that the next one would say where it goes.
-                if !down && self.state.armed.is_some() {
-                    if self.drag_distance() < CLICK_SLOP {
-                        self.place_armed();
-                    }
-                    self.input.gesture = Gesture::None;
-                    self.request_redraw();
-                    return;
-                }
                 if down {
-                    self.press_at = self.cursor;
-                } else if self.state.sketch.is_some() {
-                    // A click places a point; a drag orbited instead.
-                    if self.drag_distance() < CLICK_SLOP {
-                        self.place_sketch_point();
-                        self.request_redraw();
-                    }
-                } else if !down {
-                    // A click rather than a drag, with the pointer tool armed:
-                    // select whatever is under it.
-                    if self.drag_distance() < CLICK_SLOP && self.pointer_in_viewport() {
-                        self.select_under_pointer();
-                        self.request_redraw();
-                    }
+                    self.left_press();
+                } else {
+                    self.left_up();
                 }
-
-                // A quick second click in the same spot frames what is
-                // under the pointer.
-                if !down && self.state.sketch.is_none() {
-                    let now = std::time::Instant::now();
-                    let is_double = self.last_click.is_some_and(|(at, pos)| {
-                        let close = self.cursor.is_some_and(|c| {
-                            ((c.x - pos.x).powi(2) + (c.y - pos.y).powi(2)).sqrt() < 6.0
-                        });
-                        close && now.duration_since(at).as_millis() < 350
-                    });
-                    if is_double {
-                        self.focus_under_pointer();
-                        self.last_click = None;
-                        self.request_redraw();
-                    } else {
-                        self.last_click = self.cursor.map(|c| (now, c));
-                    }
-                }
-                self.input.gesture = if down { Gesture::Orbit } else { Gesture::None };
             }
             MouseButton::Right => {
-                if down {
-                    self.right_press_at = self.cursor;
-                } else if self.right_drag_distance() < CLICK_SLOP && self.pointer_in_viewport() {
+                // Not while a left gesture is in flight. Opening a node menu
+                // selects what is under the pointer, and changing the selection
+                // halfway through a drag leaves the panels describing one
+                // feature while the hand is still moving another.
+                if self.state.drag.is_some() || self.state.moving.is_some() {
+                    return;
+                }
+                if !down && self.right_drag_distance() < CLICK_SLOP && self.pointer_in_viewport() {
                     // A right click rather than a pan.
                     self.open_context_menu();
                 }
+                // Forgotten on release, so the next release cannot be measured
+                // against a press that has already been spent.
+                self.right_press_at = if down { self.cursor } else { None };
                 self.input.gesture = if down { Gesture::Pan } else { Gesture::None };
             }
             MouseButton::Middle => {
@@ -1059,6 +1208,22 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Ends whatever gesture is in flight, as a release would have.
+    ///
+    /// Keeping where the drag got to rather than putting it back: the user's
+    /// last intent was where they left the pointer, and a feature that snaps
+    /// home because a notification stole focus is worse than one that stayed.
+    /// What matters is that the undo step closes, which both do.
+    fn end_gesture(&mut self) {
+        self.state.finish_drag();
+        self.state.finish_move();
+        self.input.gesture = Gesture::None;
+        self.press_at = None;
+        self.right_press_at = None;
+        self.dismissing_press = false;
+        self.request_redraw();
     }
 
     fn request_redraw(&self) {
@@ -1265,6 +1430,16 @@ impl ApplicationHandler for App {
                 self.handle_mouse_button(state, button);
             }
 
+            // The release that would have ended a gesture is not coming. Alt
+            // tabbing with the button down, or a compositor taking the pointer
+            // for a workspace switch, both end the drag without a button event,
+            // and a drag holds an undo step open: left that way, every edit for
+            // the rest of the session merges into one entry that undo takes
+            // back in a single press.
+            WindowEvent::Focused(false) => {
+                self.end_gesture();
+            }
+
             // The desktop switched between light and dark while we were running.
             // Only matters when the user asked to follow it, which
             // `set_system_scheme` decides.
@@ -1309,10 +1484,23 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        nearest_monitor_width, next_frame, surface_state, viewport_owns_pointer, NextFrame,
-        SurfaceState,
+        double_click, left_release, nearest_monitor_width, next_frame, surface_state, viewport_ndc,
+        viewport_owns_pointer, App, InFlight, NextFrame, Pending, Release, Started, SurfaceState,
     };
+    use sc_geom::glam::Vec3;
+    use sc_geom::Node;
     use std::time::{Duration, Instant};
+    use winit::dpi::PhysicalPosition;
+
+    /// A release with nothing in flight, in the 3D view, that did not travel.
+    fn click() -> InFlight {
+        InFlight {
+            started: Started::Nothing,
+            pending: Pending::Nothing,
+            clicked: true,
+            in_viewport: true,
+        }
+    }
 
     const VIEWPORT: [f32; 4] = [300.0, 60.0, 1000.0, 800.0];
 
@@ -1442,5 +1630,198 @@ mod tests {
     #[test]
     fn an_unmapped_window_falls_back_to_the_widest() {
         assert_eq!(nearest_monitor_width(&[3840, 1080], 0), 3840);
+    }
+
+    /// The five things a left press can mean, in the order they outrank each
+    /// other. Written as a table because the bug is never in one case, it is in
+    /// two of them both believing they own the click.
+    #[test]
+    fn a_click_in_the_view_means_one_thing_at_a_time() {
+        assert_eq!(left_release(click()), Release::Select);
+        assert_eq!(
+            left_release(InFlight {
+                pending: Pending::Sketch,
+                ..click()
+            }),
+            Release::SketchPoint
+        );
+        assert_eq!(
+            left_release(InFlight {
+                pending: Pending::Armed,
+                ..click()
+            }),
+            Release::PlaceArmed
+        );
+        assert_eq!(
+            left_release(InFlight {
+                started: Started::Move,
+                ..click()
+            }),
+            Release::FinishMove
+        );
+        assert_eq!(
+            left_release(InFlight {
+                started: Started::Drag,
+                ..click()
+            }),
+            Release::FinishDrag
+        );
+    }
+
+    /// The case that leaves an undo step open. A push/pull and a free drag each
+    /// hold one from the press to the release, and a release that landed on the
+    /// property panel, or past the edge of the window, is still the release
+    /// that has to close it. Refusing it there means every edit for the rest of
+    /// the session merges into the one entry undo takes back.
+    #[test]
+    fn a_release_outside_the_view_still_ends_a_drag() {
+        for started in [Started::Drag, Started::Move] {
+            for clicked in [true, false] {
+                let out = left_release(InFlight {
+                    started,
+                    clicked,
+                    in_viewport: false,
+                    ..click()
+                });
+                assert_ne!(
+                    out,
+                    Release::Nothing,
+                    "{started:?} released outside the view was dropped, leaving its step open"
+                );
+            }
+        }
+    }
+
+    /// Starting something, unlike finishing it, needs a spot in the model.
+    /// Placing a feature, placing a sketch point and selecting all name one,
+    /// and a release over the tree or a panel names none.
+    #[test]
+    fn a_release_outside_the_view_starts_nothing() {
+        for pending in [Pending::Nothing, Pending::Armed, Pending::Sketch] {
+            assert_eq!(
+                left_release(InFlight {
+                    pending,
+                    in_viewport: false,
+                    ..click()
+                }),
+                Release::Nothing,
+                "{pending:?} acted on a release that landed on the chrome"
+            );
+        }
+    }
+
+    /// A press that travelled was a camera gesture and the orbit has already
+    /// had it. Dropping a sketch point at the end of an orbit would put a
+    /// corner wherever the drag happened to stop.
+    #[test]
+    fn a_drag_of_the_camera_places_nothing() {
+        for pending in [Pending::Nothing, Pending::Armed, Pending::Sketch] {
+            assert_eq!(
+                left_release(InFlight {
+                    pending,
+                    clicked: false,
+                    ..click()
+                }),
+                Release::Nothing
+            );
+        }
+    }
+
+    /// The release that ends a gesture does not always arrive. Alt tabbing with
+    /// the button down, or a compositor taking the pointer for a workspace
+    /// switch, ends the drag with no button event at all.
+    ///
+    /// A drag holds an undo step open from the press to the release. Left that
+    /// way, every edit for the rest of the session lands in the same step, and
+    /// one press of undo takes back an afternoon's work rather than one action.
+    /// `Focused(false)` is where that is caught, so this drives the same call.
+    #[test]
+    fn losing_the_window_mid_drag_closes_the_undo_step() {
+        let mut app = App::new();
+        app.state.new_document();
+        app.state.add_body(Node::Sphere { radius: 6.0 }, "Ball");
+        app.state.begin_move(Vec3::ZERO).expect("movable");
+
+        // No release is coming: the window lost focus with the button down.
+        app.end_gesture();
+        assert!(app.state.moving.is_none(), "the gesture is still in flight");
+
+        app.state.add_body(Node::Sphere { radius: 4.0 }, "First");
+        let after_first = app.state.doc.hash().expect("rooted");
+        app.state.add_body(
+            Node::Box {
+                half: Vec3::splat(3.0),
+                round: 0.0,
+            },
+            "Second",
+        );
+
+        app.state.undo();
+
+        assert_eq!(
+            app.state.doc.hash().expect("rooted"),
+            after_first,
+            "one undo took back two bodies, so the drag left its step open"
+        );
+    }
+
+    /// Physical pixels against interface points, which is the unit mistake the
+    /// input handling is most exposed to. Where the pointer sits in the
+    /// viewport is a ratio of one length to another, so the display's scale
+    /// factor cancels: the same pointer on the same pixel gives the same answer
+    /// at 1x and at 2x, and nothing here needs dividing by `pixels_per_point`.
+    ///
+    /// The asymmetry with `grab_grip`, which does divide, is deliberate. That
+    /// one compares a distance against a reach measured in points, and a length
+    /// carries a unit where a ratio does not.
+    #[test]
+    fn the_pointer_lands_in_the_same_place_at_any_interface_scale() {
+        let at_1x = viewport_ndc(
+            [300.0, 60.0, 1000.0, 800.0],
+            PhysicalPosition::new(800.0, 260.0),
+        );
+        let at_2x = viewport_ndc(
+            [600.0, 120.0, 2000.0, 1600.0],
+            PhysicalPosition::new(1600.0, 520.0),
+        );
+        assert_eq!(at_1x, at_2x, "the same click read differently at 2x");
+
+        let (ndc, aspect) = at_1x.expect("a viewport with area");
+        assert!((ndc.x - 0.0).abs() < 1.0e-6, "got {ndc:?}");
+        assert!((ndc.y - 0.5).abs() < 1.0e-6, "got {ndc:?}");
+        assert!((aspect - 1.25).abs() < 1.0e-6, "got {aspect}");
+    }
+
+    /// A window on its way back from being minimised reports a viewport with no
+    /// area, and dividing by it gives an infinity that traces a ray to nowhere.
+    #[test]
+    fn a_viewport_with_no_area_has_no_pointer_position() {
+        assert!(viewport_ndc([0.0, 0.0, 0.0, 800.0], PhysicalPosition::new(5.0, 5.0)).is_none());
+        assert!(viewport_ndc([0.0, 0.0, 1000.0, 0.0], PhysicalPosition::new(5.0, 5.0)).is_none());
+    }
+
+    /// A double click moves the camera, so it has to be sure. Two clicks a
+    /// quarter of a second apart on opposite sides of the viewport are two
+    /// clicks, and so are two in the same place a second apart.
+    #[test]
+    fn a_double_click_is_near_in_both_time_and_space() {
+        let first = Instant::now();
+        let at = PhysicalPosition::new(700.0, 400.0);
+        let soon = first + Duration::from_millis(100);
+        let later = first + Duration::from_millis(900);
+
+        assert!(double_click((first, at), soon, Some(at)));
+        assert!(
+            !double_click((first, at), soon, Some(PhysicalPosition::new(760.0, 400.0))),
+            "two clicks a finger apart paired up"
+        );
+        assert!(
+            !double_click((first, at), later, Some(at)),
+            "a click most of a second later paired up"
+        );
+        assert!(
+            !double_click((first, at), soon, None),
+            "a release with no pointer position paired up"
+        );
     }
 }

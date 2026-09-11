@@ -68,7 +68,8 @@ pub fn inside(bvh: &Bvh, p: Vec3) -> bool {
 /// Voxelizes `mesh` at `resolution` voxels along its longest axis.
 ///
 /// # Errors
-/// [`MeshError::EmptyMesh`] if there is nothing to voxelize.
+/// [`MeshError::EmptyMesh`] if there is nothing to voxelize, and
+/// [`MeshError::BoundsNotRepresentable`] if the mesh is too wide to sample.
 pub fn voxelize(mesh: &Mesh, resolution: u32) -> Result<Grid> {
     if mesh.indices.is_empty() {
         return Err(MeshError::EmptyMesh);
@@ -82,12 +83,19 @@ pub fn voxelize(mesh: &Mesh, resolution: u32) -> Result<Grid> {
 /// one resolution, which the resolution property test does.
 ///
 /// # Errors
-/// [`MeshError::EmptyMesh`] if the tree holds no triangles.
+/// [`MeshError::EmptyMesh`] if the tree holds no triangles, and
+/// [`MeshError::BoundsNotRepresentable`] if it is too wide to sample.
 pub fn voxelize_bvh(bvh: &Bvh, resolution: u32) -> Result<Grid> {
     if bvh.triangles().is_empty() {
         return Err(MeshError::EmptyMesh);
     }
-    let (dims, origin, spacing) = layout(bvh.bounds().min, bvh.bounds().max, resolution);
+    let bounds = bvh.bounds();
+    let (dims, origin, spacing) = layout(bounds.min, bounds.max, resolution);
+    if !is_representable(dims, origin, spacing) {
+        return Err(MeshError::BoundsNotRepresentable {
+            extent: format!("{} to {}", bounds.min, bounds.max),
+        });
+    }
 
     let plane = dims[0] as usize * dims[1] as usize;
     let mut data = vec![0.0f32; plane * dims[2] as usize];
@@ -119,6 +127,25 @@ fn layout(min: Vec3, max: Vec3, resolution: u32) -> ([u32; 3], Vec3, f32) {
     ];
     let origin = min - Vec3::splat(spacing * PAD_VOXELS as f32);
     (dims, origin, spacing)
+}
+
+/// Whether a layout can actually be sampled in 32-bit floating point.
+///
+/// Neither half follows from the vertices being finite, which is all the
+/// readers can check. A span wide enough to overflow makes the spacing and the
+/// origin infinite, and every sample a `NaN`. Short of that, a span beyond the
+/// square root of `f32::MAX` overflows the squared distances
+/// [`Bvh::nearest`](crate::bvh::Bvh::nearest) compares, which prunes the tree
+/// against an infinity and answers infinity. Both produce a grid that breaks
+/// the preconditions [`Grid`] documents while reporting success, so the caller
+/// is told instead.
+fn is_representable(dims: [u32; 3], origin: Vec3, spacing: f32) -> bool {
+    let span = Vec3::new(
+        dims[0].saturating_sub(1) as f32,
+        dims[1].saturating_sub(1) as f32,
+        dims[2].saturating_sub(1) as f32,
+    ) * spacing;
+    origin.is_finite() && spacing.is_finite() && spacing > 0.0 && span.length_squared().is_finite()
 }
 
 /// Fills one constant-z slab of the grid.
@@ -167,12 +194,16 @@ pub fn voxel_value(grid: &Grid, i: u32, j: u32, k: u32) -> f32 {
 }
 
 /// The two opposite corners of the region the samples cover.
+///
+/// Degenerate at the origin for a placeholder grid, which is what a mesh node
+/// deserialises to before its sidecar is read: its dimensions are zero, and one
+/// less than that is not a voxel count.
 #[must_use]
 pub fn sample_box(grid: &Grid) -> (Vec3, Vec3) {
     let extent = Vec3::new(
-        (grid.dims[0] - 1) as f32,
-        (grid.dims[1] - 1) as f32,
-        (grid.dims[2] - 1) as f32,
+        grid.dims[0].saturating_sub(1) as f32,
+        grid.dims[1].saturating_sub(1) as f32,
+        grid.dims[2].saturating_sub(1) as f32,
     );
     (grid.origin, grid.origin + grid.spacing * extent)
 }
@@ -372,6 +403,94 @@ mod tests {
             voxelize(&Mesh::default(), 8).unwrap_err(),
             MeshError::EmptyMesh
         );
+    }
+
+    #[test]
+    fn a_mesh_too_wide_for_32_bit_floats_is_refused_rather_than_gridded() {
+        // Every coordinate here is a finite `f32` and passes the readers'
+        // finiteness check, but their difference is not: the span overflows,
+        // the spacing and the origin come out infinite, and every sample is a
+        // `NaN`. That is a grid breaking all four of `Grid`'s preconditions
+        // while reporting success.
+        let mesh = Mesh::from_triangles(&[[
+            Vec3::new(-3.4e38, 0.0, 0.0),
+            Vec3::new(3.4e38, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ]]);
+        assert!(
+            mesh.positions.iter().all(|p| p.is_finite()),
+            "the fixture must be finite vertex by vertex"
+        );
+        assert!(matches!(
+            voxelize(&mesh, 8).unwrap_err(),
+            MeshError::BoundsNotRepresentable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_mesh_whose_squared_span_overflows_is_refused_too() {
+        // Short of infinity there is a second range that cannot be worked:
+        // `Bvh::nearest` compares squared distances, so a span beyond the
+        // square root of `f32::MAX` prunes the whole tree against an infinity
+        // and answers infinity.
+        let mesh = Mesh::from_triangles(&[[
+            Vec3::ZERO,
+            Vec3::new(1.0e25, 0.0, 0.0),
+            Vec3::new(0.0, 1.0e25, 0.0),
+        ]]);
+        assert!(matches!(
+            voxelize(&mesh, 8).unwrap_err(),
+            MeshError::BoundsNotRepresentable { .. }
+        ));
+    }
+
+    #[test]
+    fn every_grid_the_voxelizer_returns_is_valid_and_finite() {
+        // Whatever the input, a successful voxelization has to hand back a grid
+        // the kernel will accept, because nothing downstream re-checks it.
+        let flat = Mesh::from_triangles(&[[
+            Vec3::ZERO,
+            Vec3::new(10.0, 0.0, 0.0),
+            Vec3::new(0.0, 10.0, 0.0),
+        ]]);
+        let point = Mesh::from_triangles(&[[Vec3::ONE; 3]]);
+        let sliver = Mesh::from_triangles(&[[
+            Vec3::ZERO,
+            Vec3::new(100.0, 1.0e-4, 0.0),
+            Vec3::new(50.0, 0.0, 0.0),
+        ]]);
+        for mesh in [
+            flat,
+            point,
+            sliver,
+            unit_box(Vec3::new(10.0, 10.0, 0.0)),
+            unit_box(Vec3::splat(1.0e-4)),
+            uv_sphere(4.0, 12, 8),
+        ] {
+            for resolution in [0u32, 1, 2, 3, 8] {
+                let grid = voxelize(&mesh, resolution).unwrap();
+                assert!(grid.is_valid(), "invalid grid at resolution {resolution}");
+                assert!(
+                    grid.data.iter().all(|v| v.is_finite()),
+                    "a sample is not finite at resolution {resolution}"
+                );
+                assert!(
+                    grid.boundary_clearance() >= CLEARANCE_VOXELS * grid.spacing,
+                    "clearance {} against {} voxels of {} at resolution {resolution}",
+                    grid.boundary_clearance(),
+                    CLEARANCE_VOXELS,
+                    grid.spacing
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sample_box_answers_a_placeholder_grid_rather_than_underflowing() {
+        // A mesh node deserialises to `Grid::default`, which has a zero on
+        // every axis, until its sidecar is read.
+        let grid = Grid::default();
+        assert_eq!(sample_box(&grid), (grid.origin, grid.origin));
     }
 
     #[test]

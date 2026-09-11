@@ -80,10 +80,36 @@ impl Triangle {
     /// Voronoi region test from Ericson, *Real-Time Collision Detection*,
     /// section 5.1.5. It is branch-heavy but exact on the edges and corners,
     /// which is where a projection-and-clamp version goes wrong.
+    ///
+    /// A triangle with a repeated corner is a segment and is answered as one.
     #[must_use]
     pub fn closest_point(&self, p: Vec3) -> Vec3 {
         let (a, b, c) = (self.a, self.b, self.c);
         let (ab, ac, ap) = (b - a, c - a, p - a);
+
+        // Ericson's region tests assume a triangle with area. Without it the
+        // barycentric denominators vanish and the region tests stop
+        // partitioning space: a coincident pair makes the a-b region match
+        // every query and collapse the answer onto `a`, and three collinear
+        // corners misclassify by up to the length of the sliver. Neither is
+        // exotic. Welding in `Mesh::from_triangles` turns any facet naming a
+        // vertex twice into the first, and the second is what a badly
+        // triangulated face from a CAD exporter looks like.
+        //
+        // A triangle with no area is a segment, so answer it as the segment it
+        // is: the two corners furthest apart, since the third lies between
+        // them.
+        // Relative, not absolute. The cross product's magnitude scales with the
+        // triangle's size, so an absolute threshold either misses a large
+        // sliver or swallows a small honest triangle. Dividing by the edge
+        // lengths leaves the squared sine of the corner angle, which is the
+        // shape rather than the scale.
+        let normal = ab.cross(ac);
+        let scale = ab.length_squared() * ac.length_squared();
+        if scale <= 0.0 || normal.length_squared() <= FLAT_SINE_SQUARED * scale {
+            let (u, v) = longest_edge(a, b, c);
+            return closest_on_segment(u, v, p);
+        }
 
         let d1 = ab.dot(ap);
         let d2 = ac.dot(ap);
@@ -169,6 +195,41 @@ fn safe_ratio(num: f32, den: f32) -> f32 {
     } else {
         (num / den).clamp(0.0, 1.0)
     }
+}
+
+/// The point of the segment `a..b` nearest `p`, or `a` if the segment is a
+/// point.
+/// Squared sine of the corner angle below which a triangle is treated as a
+/// segment.
+///
+/// A hundredth of a degree squared, give or take: a triangle this thin is a
+/// line as far as anything downstream is concerned, and answering it as one is
+/// wrong by at most its own width. On a 100mm triangle that is a thousandth of
+/// a millimetre, well under the tracer's tolerance and far under anything a
+/// printer resolves. Against the barycentric path, which divides two quantities
+/// both at the f32 noise floor at this shape, it is the better answer: a
+/// measured counterexample was off by 0.04mm.
+const FLAT_SINE_SQUARED: f32 = 1.0e-10;
+
+/// The two corners furthest apart, for a triangle that has collapsed to a line.
+fn longest_edge(a: Vec3, b: Vec3, c: Vec3) -> (Vec3, Vec3) {
+    let (ab, bc, ca) = (
+        (b - a).length_squared(),
+        (c - b).length_squared(),
+        (a - c).length_squared(),
+    );
+    if ab >= bc && ab >= ca {
+        (a, b)
+    } else if bc >= ca {
+        (b, c)
+    } else {
+        (c, a)
+    }
+}
+
+fn closest_on_segment(a: Vec3, b: Vec3, p: Vec3) -> Vec3 {
+    let ab = b - a;
+    a + ab * safe_ratio(ab.dot(p - a), ab.length_squared())
 }
 
 /// One node of the tree.
@@ -563,6 +624,204 @@ mod tests {
         // The sign decision compares against 0.5, so anything well under that
         // margin cannot flip a voxel that is not already on the surface.
         assert!(worst < 0.02, "dipole approximation drifted by {worst}");
+    }
+
+    #[test]
+    fn a_repeated_first_vertex_does_not_hide_the_rest_of_the_triangle() {
+        // Reduced from a fuzz run against a sampled reference. With `a == b`
+        // the two edge dot products that decide the a-b region are identically
+        // zero, so that region matches every query in space and the answer
+        // collapses onto `a` however far away `c` is. Here the truth is eight
+        // times nearer than what comes back.
+        let a = Vec3::new(9.982, 0.321, 9.66);
+        let c = Vec3::new(-8.684, -9.176, -9.678);
+        let p = Vec3::new(-11.7285, -10.794, -11.9595);
+        let t = Triangle { a, b: a, c };
+
+        let truth = (c - p).length();
+        let got = (t.closest_point(p) - p).length();
+        assert!(
+            (got - truth).abs() < 1e-3,
+            "closest point is {got} from the query, but `c` itself is {truth}"
+        );
+        let bvh = Bvh::build(vec![t]);
+        assert!((bvh.distance(p) - truth).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_degenerate_triangle_is_answered_as_the_segment_it_is() {
+        // Two of the three corners coinciding leaves a segment, whichever pair
+        // it is. Exporters emit these, and welding bit-identical corners in
+        // `Mesh::from_triangles` produces them from any file that repeats a
+        // vertex within one facet.
+        let near = Vec3::new(9.0, 0.0, 9.0);
+        let far = Vec3::new(-9.0, -9.0, -9.0);
+        let p = Vec3::new(-11.0, -11.0, -11.0);
+        let truth = (far - p).length();
+        for t in [
+            Triangle {
+                a: near,
+                b: near,
+                c: far,
+            },
+            Triangle {
+                a: near,
+                b: far,
+                c: near,
+            },
+            Triangle {
+                a: near,
+                b: far,
+                c: far,
+            },
+            Triangle {
+                a: far,
+                b: near,
+                c: near,
+            },
+        ] {
+            let got = (t.closest_point(p) - p).length();
+            assert!(
+                (got - truth).abs() < 1e-3,
+                "{got} rather than {truth} for {t:?}"
+            );
+        }
+        // All three the same point is the one case with nothing to choose.
+        let point = Triangle {
+            a: far,
+            b: far,
+            c: far,
+        };
+        assert_eq!(point.closest_point(p), far);
+    }
+
+    #[test]
+    fn the_build_terminates_when_the_split_key_cannot_separate_anything() {
+        // The median split is on position within the slice, not on the key, so
+        // a set of triangles sharing one centroid still halves at every level.
+        // Splitting on the key's value instead would recurse forever here.
+        let mut tris = Vec::new();
+        for i in 0..64 {
+            let s = 1.0 + i as f32;
+            tris.push(tri([-s, -s, 0.0], [s, 0.0, 0.0], [0.0, s, 0.0]));
+        }
+        assert!(
+            tris.iter().all(|t| t.centroid() == tris[0].centroid()),
+            "the fixture must actually share a centroid"
+        );
+        let bvh = Bvh::build(tris.clone());
+        assert_eq!(bvh.triangles().len(), 64);
+        for n in 0..30 {
+            let a = n as f32 * 0.83;
+            let p = Vec3::new(a.sin() * 40.0, a.cos() * 25.0, (a * 1.3).sin() * 30.0);
+            let brute = tris
+                .iter()
+                .map(|t| (t.closest_point(p) - p).length())
+                .fold(f32::INFINITY, f32::min);
+            assert!((bvh.distance(p) - brute).abs() < 1e-3, "at {p}");
+        }
+    }
+
+    #[test]
+    fn a_tree_of_coincident_triangles_still_answers() {
+        let t = tri([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let bvh = Bvh::build(vec![t; 64]);
+        assert_eq!(bvh.triangles().len(), 64);
+        assert!((bvh.distance(Vec3::new(0.25, 0.25, 3.0)) - 3.0).abs() < 1e-5);
+        assert!(bvh.winding_number(Vec3::new(0.25, 0.25, 3.0)).is_finite());
+    }
+
+    #[test]
+    fn a_tree_of_one_triangle_is_a_single_leaf_that_answers_exactly() {
+        let t = tri([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let bvh = Bvh::build(vec![t]);
+        assert_eq!(bvh.node_count(), 1);
+        let n = bvh.nearest(Vec3::new(0.25, 0.25, 2.0)).unwrap();
+        assert_eq!(n.triangle, 0);
+        assert!((n.distance - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn nearest_is_exact_at_the_corners_and_edges_where_leaves_meet() {
+        // Leaf boundaries fall on the triangles themselves, because the split
+        // key is the centroid. A pruning test that culled a node at a tie would
+        // show up here and nowhere else.
+        for mesh in [uv_sphere(5.0, 17, 11), unit_box(Vec3::new(3.0, 1.0, 7.0))] {
+            let bvh = Bvh::from_mesh(&mesh);
+            let tris = bvh.triangles().to_vec();
+            let mut probes = Vec::new();
+            for t in &tris {
+                probes.push(t.a);
+                probes.push((t.a + t.b) * 0.5);
+                probes.push(t.centroid());
+                probes.push(t.centroid() + Vec3::splat(1.0e-3));
+                probes.push(t.centroid() * 1.0001);
+            }
+            for p in probes {
+                let brute = tris
+                    .iter()
+                    .map(|t| (t.closest_point(p) - p).length())
+                    .fold(f32::INFINITY, f32::min);
+                let got = bvh.distance(p);
+                assert!(
+                    (got - brute).abs() <= 1.0e-5,
+                    "at {p}: tree says {got}, every triangle says {brute}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_dipole_approximation_holds_on_open_surfaces_too() {
+        // A closed mesh makes the far field easy: the aggregate dipole of a
+        // closed subtree cancels, so the approximated term is near zero anyway.
+        // An open one does not cancel, which is the case the ratio has to be
+        // chosen for, and it is also what a torn download actually is.
+        let sheet = {
+            let mut tris = Vec::new();
+            for i in 0..16 {
+                for j in 0..16 {
+                    let (x, y) = (-10.0 + i as f32 * 1.25, -10.0 + j as f32 * 1.25);
+                    let at = |dx: f32, dy: f32| [x + dx, y + dy, 0.0];
+                    tris.push(tri(at(0.0, 0.0), at(1.25, 0.0), at(1.25, 1.25)));
+                    tris.push(tri(at(0.0, 0.0), at(1.25, 1.25), at(0.0, 1.25)));
+                }
+            }
+            Bvh::build(tris)
+        };
+        let torn = {
+            let mut mesh = uv_sphere(10.0, 32, 20);
+            mesh.indices.drain(0..6);
+            mesh.recompute_normals();
+            Bvh::from_mesh(&mesh)
+        };
+
+        let mut worst = 0.0f32;
+        for bvh in [&sheet, &torn] {
+            for n in 0..1500 {
+                let t = n as f32;
+                let dir = Vec3::new(
+                    (t * 0.7351).fract() - 0.5,
+                    (t * 0.4327).fract() - 0.5,
+                    (t * 0.9137).fract() - 0.5,
+                );
+                if dir.length() < 1.0e-6 {
+                    continue;
+                }
+                let p = dir.normalize() * (0.5 + (n % 40) as f32 * 1.7);
+                let a = bvh.winding_number(p);
+                let e = bvh.winding_number_exact(p);
+                worst = worst.max((a - e).abs());
+                assert_eq!(
+                    a > 0.5,
+                    e > 0.5,
+                    "the approximation flipped the inside test at {p}: {a} against {e}"
+                );
+            }
+        }
+        // An order of magnitude below the half the threshold sits at, which is
+        // the margin the comment on `FAR_FIELD_RATIO` claims to buy.
+        assert!(worst < 0.05, "dipole approximation drifted by {worst}");
     }
 
     #[test]

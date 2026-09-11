@@ -5,7 +5,7 @@
 //! defect that makes a part unprintable, and it is invisible in a render.
 
 use sc_geom::glam::Vec3;
-use sc_geom::{Builder, NodeId};
+use sc_geom::{Builder, Node, NodeId, Profile};
 use sc_mesh::{contour, Mesh, Settings};
 
 fn mesh_of(build: impl FnOnce(&mut Builder) -> NodeId, resolution: u32) -> Mesh {
@@ -218,4 +218,141 @@ fn known_limitation_two_sheets_in_one_cell_are_non_manifold() {
         fine_share <= coarse_share,
         "refining made it proportionally worse: {coarse_share} then {fine_share}"
     );
+}
+
+#[test]
+fn a_part_far_from_the_origin_is_meshed_whole() {
+    // The mesher took its grid from `Aabb::finite_or(1000.0)`, which clamps
+    // finite coordinates as well as infinite ones. A part sitting more than a
+    // metre out was cut off at the clamp: the surface ran off the edge of the
+    // sampling grid and the export came back full of holes, or, further out
+    // still, with the clamped box inverted and nothing in it at all.
+    for distance in [100.0f32, 1000.0, 10_000.0] {
+        let mesh = mesh_of(
+            |b| {
+                let s = b.sphere(1.0).unwrap();
+                b.translate(s, Vec3::splat(distance)).unwrap()
+            },
+            24,
+        );
+        assert!(
+            mesh.triangle_count() > 0,
+            "nothing meshed at {distance} mm from the origin"
+        );
+        assert_printable(&mesh, &format!("sphere at {distance} mm"));
+
+        // Volume is not asserted here: the divergence theorem sums terms of
+        // order |p|^3 that cancel down to the part's own volume, which in f32 at
+        // a kilometre out is all rounding. The bounds are the honest measure.
+        let size = mesh.bounds().size();
+        for (axis, v) in [("x", size.x), ("y", size.y), ("z", size.z)] {
+            assert!(
+                (v - 2.0).abs() < 0.2,
+                "{axis} extent {v} is not the 2 mm sphere at {distance} mm out"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_prism_cut_through_a_plate_leaves_a_watertight_bore() {
+    // A prism is unbounded along its sweep. As a cut operand the difference
+    // takes its bounds from the other side, so the infinity never reaches the
+    // grid, and this is the case the sample parts actually use.
+    let mesh = mesh_of(
+        |b| {
+            let body = b.cuboid(Vec3::new(10.0, 10.0, 3.0)).unwrap();
+            let bore = b
+                .arena
+                .insert(Node::Prism {
+                    profile: Profile::Circle { radius: 3.0 },
+                })
+                .unwrap();
+            b.difference(body, bore).unwrap()
+        },
+        48,
+    );
+    assert_printable(&mesh, "plate bored by a prism");
+
+    let expected = 20.0 * 20.0 * 6.0 - std::f32::consts::PI * 9.0 * 6.0;
+    let actual = mesh.volume();
+    assert!(
+        (actual - expected).abs() / expected < 0.02,
+        "bored plate volume {actual} differs from {expected} by more than 2%"
+    );
+}
+
+#[test]
+fn a_prism_unioned_into_a_part_still_resolves_its_profile() {
+    // Here the infinity does reach the grid. The cell size has to come from the
+    // part's bounded extent: taking it from the clamped, unbounded axis put the
+    // whole model inside a single cell and meshed it to nothing.
+    //
+    // The result is a chunk of an infinite solid, so it is cut off at the grid
+    // and is not printable. That is the honest answer, and unlike an empty file
+    // it is one the export check can see.
+    let mesh = mesh_of(
+        |b| {
+            let body = b.cuboid(Vec3::new(10.0, 10.0, 3.0)).unwrap();
+            let post = b
+                .arena
+                .insert(Node::Prism {
+                    profile: Profile::Circle { radius: 3.0 },
+                })
+                .unwrap();
+            b.union(body, post).unwrap()
+        },
+        16,
+    );
+    assert!(mesh.triangle_count() > 0, "the model meshed to nothing");
+    let size = mesh.bounds().size();
+    assert!(
+        (size.x - 20.0).abs() < 1.0 && (size.y - 20.0).abs() < 1.0,
+        "the plate's 20 mm profile was not resolved: {size:?}"
+    );
+}
+
+#[test]
+fn a_coarse_grid_produces_a_solid_rather_than_nothing() {
+    // One cell along the longest axis is a degenerate request, but it must not
+    // silently produce an empty file. The grid used to start exactly on the
+    // model's bounding face, where a box evaluates to exactly zero, and with
+    // zero counted as outside a cube two cells across had no sample inside it
+    // at all.
+    for resolution in [0u32, 1, 2, 3] {
+        let mesh = mesh_of(|b| b.cube(10.0).unwrap(), resolution);
+        assert!(
+            mesh.triangle_count() > 0,
+            "a 20 mm cube meshed to nothing at resolution {resolution}"
+        );
+        assert!(
+            mesh.volume() > 0.0,
+            "resolution {resolution} is wound inside out"
+        );
+    }
+}
+
+#[test]
+fn a_feature_thinner_than_a_cell_is_absent_rather_than_noise() {
+    // A 0.8 mm plate sampled on a 12 mm grid cannot be represented. What must
+    // not happen is the mesher emitting a few hundred triangles that pass every
+    // watertightness check and enclose a quarter of a percent of the part: that
+    // is a file somebody prints.
+    //
+    // The noise came from the grid starting exactly on the plate's own faces,
+    // where the field is exactly zero, so which side of the surface a sample
+    // landed on came down to the rounding of `min + k * spacing`.
+    let true_volume = 100.0 * 100.0 * 0.8;
+    for resolution in [8u32, 16, 24] {
+        let mesh = mesh_of(
+            |b| b.cuboid(Vec3::new(50.0, 50.0, 0.4)).unwrap(),
+            resolution,
+        );
+        let volume = mesh.volume();
+        assert!(
+            mesh.triangle_count() == 0 || (volume - true_volume).abs() / true_volume < 0.5,
+            "resolution {resolution} produced {} triangles enclosing {volume} mm^3 against a true {true_volume} mm^3",
+            mesh.triangle_count()
+        );
+    }
 }

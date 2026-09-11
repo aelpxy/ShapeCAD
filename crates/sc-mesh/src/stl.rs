@@ -20,10 +20,33 @@ const BINARY_HEADER: usize = 84;
 /// Bytes per binary triangle record: twelve floats plus the attribute word.
 const BINARY_TRIANGLE: usize = 50;
 
+/// The three corners of triangle `t`, refusing a coordinate no reader accepts.
+///
+/// [`read`] rejects a non-finite coordinate, and every slicer does the same, so
+/// writing one produces a file that cannot be read back while reporting success
+/// to whoever pressed export. Better to fail at the point the mesh is wrong.
+fn corners(mesh: &Mesh, t: usize) -> std::io::Result<[Vec3; 3]> {
+    let [a, b, c] = mesh.indices[t];
+    let face = [
+        mesh.positions[a as usize],
+        mesh.positions[b as usize],
+        mesh.positions[c as usize],
+    ];
+    if face.iter().all(|p| p.is_finite()) {
+        Ok(face)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("triangle {t} has a coordinate that is not a finite number"),
+        ))
+    }
+}
+
 /// Writes `mesh` as binary STL.
 ///
 /// # Errors
-/// Any I/O failure, or a mesh with more than `u32::MAX` triangles.
+/// Any I/O failure, a mesh with more than `u32::MAX` triangles, or a vertex
+/// coordinate that is not a finite number.
 pub fn write(mesh: &Mesh, path: &std::path::Path) -> std::io::Result<()> {
     let mut out = BufWriter::new(std::fs::File::create(path)?);
 
@@ -42,12 +65,8 @@ pub fn write(mesh: &Mesh, path: &std::path::Path) -> std::io::Result<()> {
     })?;
     out.write_all(&count.to_le_bytes())?;
 
-    for &[a, b, c] in &mesh.indices {
-        let (pa, pb, pc) = (
-            mesh.positions[a as usize],
-            mesh.positions[b as usize],
-            mesh.positions[c as usize],
-        );
+    for t in 0..mesh.indices.len() {
+        let [pa, pb, pc] = corners(mesh, t)?;
         // STL stores a face normal; most slicers recompute it from the winding,
         // but writing a correct one avoids arguments with the ones that do not.
         let n = (pb - pa).cross(pc - pa).normalize_or_zero();
@@ -70,16 +89,12 @@ pub fn write(mesh: &Mesh, path: &std::path::Path) -> std::io::Result<()> {
 /// for the rare tool that still refuses binary.
 ///
 /// # Errors
-/// Any I/O failure.
+/// Any I/O failure, or a vertex coordinate that is not a finite number.
 pub fn write_ascii(mesh: &Mesh, path: &Path) -> std::io::Result<()> {
     let mut out = BufWriter::new(std::fs::File::create(path)?);
     writeln!(out, "solid shapecad")?;
-    for &[a, b, c] in &mesh.indices {
-        let (pa, pb, pc) = (
-            mesh.positions[a as usize],
-            mesh.positions[b as usize],
-            mesh.positions[c as usize],
-        );
+    for t in 0..mesh.indices.len() {
+        let [pa, pb, pc] = corners(mesh, t)?;
         let n = (pb - pa).cross(pc - pa).normalize_or_zero();
         // Nine significant digits round-trip an f32 exactly, so a file written
         // here and read back gives bit-identical vertices.
@@ -545,5 +560,104 @@ endsolid part
     fn a_file_that_is_neither_variant_is_rejected() {
         let err = read_bytes(b"this is just some text, at some length or another").unwrap_err();
         assert!(matches!(err, MeshError::Syntax { .. }), "{err}");
+    }
+
+    #[test]
+    fn the_binary_layout_is_byte_for_byte_what_a_reader_expects() {
+        let source = unit_box(Vec3::splat(2.0));
+        let path = scratch("layout");
+        write(&source, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            bytes.len(),
+            BINARY_HEADER + BINARY_TRIANGLE * source.triangle_count(),
+            "a binary STL is exactly 84 + 50n bytes"
+        );
+        assert_eq!(declared_triangles(&bytes) as usize, source.triangle_count());
+        assert!(
+            !starts_with_solid(&bytes),
+            "the header must not open with the ASCII keyword"
+        );
+        for t in 0..source.triangle_count() {
+            let attribute = BINARY_HEADER + t * BINARY_TRIANGLE + 48;
+            assert_eq!(
+                u16::from_le_bytes([bytes[attribute], bytes[attribute + 1]]),
+                0,
+                "attribute word of triangle {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_written_normal_is_the_unit_outward_normal_of_the_winding() {
+        // Readers that trust the stored normal rather than the winding are the
+        // reason to write one at all, so it has to agree with the winding and
+        // point out of the solid.
+        let source = unit_box(Vec3::splat(2.0));
+        let path = scratch("normals");
+        write(&source, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        for (t, &[a, b, c]) in source.indices.iter().enumerate() {
+            let o = BINARY_HEADER + t * BINARY_TRIANGLE;
+            let stored = Vec3::new(
+                le_f32(&bytes, o),
+                le_f32(&bytes, o + 4),
+                le_f32(&bytes, o + 8),
+            );
+            let (pa, pb, pc) = (
+                source.positions[a as usize],
+                source.positions[b as usize],
+                source.positions[c as usize],
+            );
+            let wound = (pb - pa).cross(pc - pa).normalize();
+            assert!(
+                (stored - wound).length() < 1.0e-6,
+                "triangle {t} stores {stored:?} against a winding normal of {wound:?}"
+            );
+            assert!(
+                (stored.length() - 1.0).abs() < 1.0e-6,
+                "{stored:?} is not unit"
+            );
+            // The box is centred on the origin, so outward is away from it.
+            let centroid = (pa + pb + pc) / 3.0;
+            assert!(stored.dot(centroid) > 0.0, "triangle {t} points inward");
+        }
+    }
+
+    #[test]
+    fn a_mesh_with_no_triangles_writes_a_file_that_still_reads() {
+        // The bare header is a well-formed STL of zero triangles, and writing
+        // something a reader chokes on would turn "the model is empty" into
+        // "the file is corrupt".
+        let path = scratch("empty-binary");
+        write(&Mesh::default(), &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), BINARY_HEADER);
+        assert_eq!(declared_triangles(&bytes), 0);
+        assert!(is_binary(&bytes), "an 84-byte file is a binary STL");
+        assert_eq!(read(&path).unwrap().triangle_count(), 0);
+        std::fs::remove_file(&path).ok();
+
+        let path = scratch("empty-ascii");
+        write_ascii(&Mesh::default(), &path).unwrap();
+        assert_eq!(read(&path).unwrap().triangle_count(), 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_non_finite_vertex_is_refused_rather_than_written() {
+        // `read` rejects a non-finite coordinate, so writing one produces a file
+        // this crate will not read back and no slicer will accept, while
+        // reporting success to whoever pressed export.
+        let mut mesh = unit_box(Vec3::splat(1.0));
+        mesh.positions[0].y = f32::INFINITY;
+        let path = scratch("non-finite");
+        let err = write(&mesh, &path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        std::fs::remove_file(&path).ok();
     }
 }

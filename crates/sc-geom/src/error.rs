@@ -25,7 +25,8 @@ pub enum GeomError {
     Cycle {
         /// The node being edited.
         at: NodeId,
-        /// The child reference that would close the loop.
+        /// The reference that would close the loop: either a child, or the
+        /// feature a derived placement is built on.
         via: NodeId,
     },
     /// Refusing to delete a node that something still points at.

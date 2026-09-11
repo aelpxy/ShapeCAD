@@ -11,11 +11,18 @@ use glam::{Vec2, Vec3};
 ///
 /// This one function is why fillets cannot fail in this kernel: blending is
 /// arithmetic on distances, not surgery on boundary topology. A `k` of zero or
-/// less degrades to a plain [`f32::min`].
+/// less degrades to a plain [`f32::min`], and so does an operand that is not
+/// finite.
 #[inline]
 #[must_use]
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
-    if k <= 0.0 {
+    // The interpolation below multiplies an operand by a weight that saturates
+    // at zero, so an infinite operand yields `inf * 0`, which is NaN rather
+    // than the other operand. [`eval`] returns `+inf` for a node it cannot
+    // find, and a transform small enough to overflow its own division returns
+    // it too, so this is not a theoretical input: without the guard one absent
+    // operand blanks the whole model instead of just itself.
+    if k <= 0.0 || !a.is_finite() || !b.is_finite() {
         return a.min(b);
     }
     let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
@@ -164,4 +171,66 @@ pub fn normal(arena: &Arena, id: NodeId, p: Vec3, eps: f32) -> Vec3 {
     ];
     let n: Vec3 = K.iter().map(|&k| k * eval(arena, id, p + k * eps)).sum();
     n.normalize_or_zero()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{smax, smin};
+
+    fn assert_near(got: f32, want: f32, ctx: &str) {
+        assert!(
+            (got - want).abs() < 1.0e-6,
+            "{ctx}: expected {want}, got {got}"
+        );
+    }
+
+    /// [`eval`] hands back `+inf` for a node it cannot find, so that a document
+    /// in the middle of an edit still renders. A positive blend radius used to
+    /// turn that sentinel into NaN, and NaN is not "empty space": it is a model
+    /// that disappears everywhere at once, with no error to say why.
+    #[test]
+    fn a_blend_against_an_absent_operand_is_the_operand_that_is_there() {
+        for k in [0.0, 0.5, 4.0] {
+            assert_near(smin(2.0, f32::INFINITY, k), 2.0, &format!("smin, k = {k}"));
+            assert_near(
+                smin(f32::INFINITY, 2.0, k),
+                2.0,
+                &format!("smin reversed, k = {k}"),
+            );
+            assert_near(
+                smax(2.0, f32::NEG_INFINITY, k),
+                2.0,
+                &format!("smax, k = {k}"),
+            );
+            assert_near(
+                smax(f32::NEG_INFINITY, 2.0, k),
+                2.0,
+                &format!("smax reversed, k = {k}"),
+            );
+        }
+    }
+
+    /// The other side of the same guard. An operand that is infinitely deep
+    /// wins the blend outright rather than poisoning it.
+    #[test]
+    fn a_blend_against_an_unbounded_operand_keeps_its_sign() {
+        let inside = smin(2.0, f32::NEG_INFINITY, 1.0);
+        assert!(
+            inside.is_infinite() && inside.is_sign_negative(),
+            "smin gave {inside}"
+        );
+        let outside = smax(2.0, f32::INFINITY, 1.0);
+        assert!(
+            outside.is_infinite() && outside.is_sign_positive(),
+            "smax gave {outside}"
+        );
+    }
+
+    /// Blending two ordinary distances is untouched by the guard above.
+    #[test]
+    fn a_blend_of_finite_distances_is_unchanged() {
+        assert!((smin(1.0, 3.0, 0.0) - 1.0).abs() < 1e-6);
+        assert!(smin(1.0, 1.0, 2.0) < 1.0, "a blend should round the corner");
+        assert!((smax(1.0, 3.0, 0.0) - 3.0).abs() < 1e-6);
+    }
 }

@@ -77,16 +77,19 @@ impl Profile {
                 q.max(Vec2::ZERO).length() + q.max_element().min(0.0)
             }
             Profile::Circle { radius } => p.length() - radius,
-            Profile::RegularPolygon { .. } | Profile::Path { .. } => {
-                crate::eval::sd_polygon(p, &self.polygon())
-            }
+            // A drawn path already is its polygon. Going through `polygon()`
+            // would clone up to `MAX_PATH_POINTS` vertices onto the heap for
+            // every sample of every voxel.
+            Profile::Path { points } => crate::eval::sd_polygon(p, points),
+            Profile::RegularPolygon { .. } => crate::eval::sd_polygon(p, &self.polygon()),
         }
     }
 
     /// The profile as a closed polygon.
     ///
-    /// Exact for everything but a circle, which is sampled. Used for drawing an
-    /// outline and for the polygon path in generated shaders.
+    /// Exact for everything but a circle, which is sampled. Backs the field for
+    /// the two kinds that have no closed form, and is what the outline drawing
+    /// and the generated shaders walk.
     #[must_use]
     pub fn polygon(&self) -> Vec<Vec2> {
         match self {
@@ -109,8 +112,7 @@ impl Profile {
                 let n = (*sides).max(3);
                 (0..n)
                     .map(|i| {
-                        let a = f32::from(u16::try_from(i).unwrap_or(u16::MAX)) / n as f32
-                            * std::f32::consts::TAU;
+                        let a = i as f32 / n as f32 * std::f32::consts::TAU;
                         Vec2::new(radius * a.cos(), radius * a.sin())
                     })
                     .collect()
@@ -307,6 +309,106 @@ mod tests {
         let (lo, hi) = path.bounds();
         assert_eq!(lo, Vec2::new(0.0, 0.0));
         assert_eq!(hi, Vec2::new(10.0, 20.0));
+    }
+
+    /// A path is drawn by hand, so it arrives with whatever the pointer gave it.
+    /// A vertex clicked twice is a zero length edge, and an edge with no
+    /// direction must not be allowed to move the surface or flip the inside.
+    #[test]
+    fn a_repeated_point_does_not_change_the_region() {
+        let square = |points: Vec<Vec2>| Profile::Path { points };
+        let clean = square(vec![
+            Vec2::ZERO,
+            Vec2::new(10.0, 0.0),
+            Vec2::new(10.0, 10.0),
+            Vec2::new(0.0, 10.0),
+        ]);
+        let stuttered = square(vec![
+            Vec2::ZERO,
+            Vec2::new(10.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(10.0, 10.0),
+            Vec2::new(0.0, 10.0),
+        ]);
+        assert!(stuttered.is_valid(), "a stutter is not a reason to refuse");
+        for p in [
+            Vec2::new(5.0, 5.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(13.0, 0.0),
+            Vec2::new(-2.0, 5.0),
+            Vec2::new(9.5, 0.5),
+        ] {
+            near(
+                stuttered.distance(p),
+                clean.distance(p),
+                "the stutter moved the field",
+            );
+        }
+    }
+
+    /// A path that crosses itself and comes back encloses nothing: the two lobes
+    /// wind opposite ways, so there is no inside for the field to have.
+    #[test]
+    fn a_path_that_crosses_itself_and_cancels_is_refused() {
+        let bowtie = Profile::Path {
+            points: vec![
+                Vec2::ZERO,
+                Vec2::new(10.0, 10.0),
+                Vec2::new(10.0, 0.0),
+                Vec2::new(0.0, 10.0),
+            ],
+        };
+        assert!(!bowtie.is_valid());
+    }
+
+    #[test]
+    fn a_polygon_needs_three_sides_to_enclose_anything() {
+        for sides in [0, 1, 2] {
+            assert!(
+                !Profile::RegularPolygon { sides, radius: 5.0 }.is_valid(),
+                "{sides} sides"
+            );
+        }
+        assert!(Profile::RegularPolygon {
+            sides: 3,
+            radius: 5.0
+        }
+        .is_valid());
+        // Sixty-four is the cap `set_param` clamps a drag to, and validation
+        // has to agree with it or an agent could set what a drag cannot.
+        assert!(!Profile::RegularPolygon {
+            sides: 65,
+            radius: 5.0
+        }
+        .is_valid());
+    }
+
+    #[test]
+    fn a_polygon_is_bounded_by_its_circumradius() {
+        let p = Profile::RegularPolygon {
+            sides: 5,
+            radius: 8.0,
+        };
+        let (lo, hi) = p.bounds();
+        assert_eq!((lo, hi), (Vec2::splat(-8.0), Vec2::splat(8.0)));
+        for v in p.polygon() {
+            assert!(v.length() <= 8.0 + 1.0e-4, "{v:?} is outside the bound");
+            assert!(p.distance(v).abs() < 1.0e-3, "{v:?} is not on the outline");
+        }
+    }
+
+    #[test]
+    fn a_path_keeps_the_points_it_was_drawn_with() {
+        let points = vec![Vec2::ZERO, Vec2::new(4.0, 0.0), Vec2::new(0.0, 3.0)];
+        let path = Profile::Path {
+            points: points.clone(),
+        };
+        assert_eq!(path.polygon(), points);
+        assert!(path.params().is_empty(), "a drawn path has no dimensions");
+        assert!(!path.clone().set_param("width", 5.0), "and none to set");
+        // Inside the triangle, and the nearest edge is the hypotenuse.
+        assert!(path.distance(Vec2::new(0.5, 0.5)) < 0.0);
+        assert!(path.distance(Vec2::new(4.0, 4.0)) > 0.0);
     }
 
     #[test]

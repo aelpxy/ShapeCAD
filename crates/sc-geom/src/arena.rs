@@ -10,6 +10,16 @@ use crate::node::{Node, NodeId};
 use std::collections::HashSet;
 
 /// Storage for an implicit geometry DAG.
+///
+/// Deserialization is permissive by design: it writes straight into `slots`
+/// and checks nothing. A file is the one way in that did not go through
+/// [`Arena::insert`], [`Arena::create_at`] or [`Arena::replace`], so it has to
+/// be checked, but checking it *here* costs the caller the ability to say what
+/// went wrong. Serde would fold a dangling child into a parse failure, and the
+/// loader would report a well-formed file as not a `ShapeCAD` document.
+///
+/// So the check lives in [`Arena::check_structure`] and the loader calls it.
+/// See `sc_doc::file::open`.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Arena {
@@ -87,8 +97,19 @@ impl Arena {
                 reason: "parameters out of range or non-finite".to_string(),
             });
         }
+        // An id the arena has never issued cannot be reached from anywhere, so
+        // a node taking one cannot be closing a loop. Worth the test: without
+        // it every `insert` walks its whole new subtree to learn nothing, which
+        // makes building a model quadratic in its own depth.
+        let issued = (id.0 as usize) < self.slots.len();
         for c in node.children() {
             self.try_get(c)?;
+            // Guarded here rather than in `replace` alone, so that every way
+            // into the arena shares one predicate instead of relying on an
+            // argument about which caller can produce which id.
+            if issued && (c == id || self.reaches(c, id)) {
+                return Err(GeomError::Cycle { at: id, via: c });
+            }
         }
         // A derivation is not a child, so it is checked here rather than by the
         // loop above. Both halves matter: the base has to exist, and it has to
@@ -98,6 +119,76 @@ impl Arena {
             self.try_get(on)?;
             if on == id || node.children().any(|c| self.reaches(c, on)) {
                 return Err(GeomError::Cycle { at: id, via: on });
+            }
+            // And the derivations themselves must not close a loop. Two
+            // placements each deriving from the other pass both tests above:
+            // neither contains the other, so neither chases its own tail
+            // through children. Regeneration still cannot settle, because
+            // moving one moves the other right back. It terminates, having
+            // silently left a placement stale.
+            if self.derives_from(on, id) {
+                return Err(GeomError::Cycle { at: id, via: on });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `from` reaches `target` by following derivations.
+    ///
+    /// Bounded by the number of slots rather than by a visited set: a chain of
+    /// derivations is a path, not a tree, so it either ends or repeats, and it
+    /// cannot be longer than the arena.
+    fn derives_from(&self, from: NodeId, target: NodeId) -> bool {
+        let mut at = from;
+        for _ in 0..self.slots.len() {
+            if at == target {
+                return true;
+            }
+            match self.get(at).and_then(Node::derived_from) {
+                Some(next) => at = next,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Every structural invariant the arena keeps, checked against slots that
+    /// arrived from somewhere other than a mutation.
+    ///
+    /// Every child of a live node is live, no node is its own descendant, and
+    /// any derived placement names a live node outside its own subtree. This is
+    /// the same predicate [`Arena::check`] applies to one node, run over all of
+    /// them.
+    ///
+    /// Deliberately not [`Node::is_valid`]. A [`Node::Mesh`] deserializes with
+    /// a placeholder grid that the document resolves afterwards, so parameter
+    /// validation here would refuse every file containing an import. Parameters
+    /// are the loader's business; structure is the arena's.
+    ///
+    /// Quadratic in the worst case, because each child edge may walk a whole
+    /// subtree. It runs once per file opened, not per frame.
+    ///
+    /// # Errors
+    /// [`GeomError::UnknownNode`] or [`GeomError::DeadNode`] for a reference
+    /// that leads nowhere, and [`GeomError::Cycle`] for a loop, whether through
+    /// children or through a derivation.
+    pub fn check_structure(&self) -> Result<()> {
+        for id in self.live_ids() {
+            let node = self.try_get(id)?;
+            for c in node.children() {
+                self.try_get(c)?;
+                if c == id || self.reaches(c, id) {
+                    return Err(GeomError::Cycle { at: id, via: c });
+                }
+            }
+            if let Some(on) = node.derived_from() {
+                self.try_get(on)?;
+                if on == id
+                    || node.children().any(|c| self.reaches(c, on))
+                    || self.derives_from(on, id)
+                {
+                    return Err(GeomError::Cycle { at: id, via: on });
+                }
             }
         }
         Ok(())
@@ -164,11 +255,6 @@ impl Arena {
     pub fn replace(&mut self, id: NodeId, node: Node) -> Result<Node> {
         self.try_get(id)?;
         self.check(id, &node)?;
-        for c in node.children() {
-            if c == id || self.reaches(c, id) {
-                return Err(GeomError::Cycle { at: id, via: c });
-            }
-        }
         Ok(self.slots[id.0 as usize]
             .replace(node)
             .expect("checked live"))
@@ -423,6 +509,77 @@ mod tests {
             }),
             Err(GeomError::DeadNode(_))
         ));
+    }
+
+    /// Serialised form of a two-node arena, ready to be corrupted the way a
+    /// hand-edited or truncated `.shapecad` file would be. Slot 0 is a sphere,
+    /// slot 1 a union that names it twice.
+    #[cfg(feature = "serde")]
+    fn saved_pair() -> serde_json::Value {
+        let mut arena = Arena::new();
+        let a = sphere(&mut arena, 1.0);
+        arena
+            .insert(Node::Union {
+                a,
+                b: a,
+                smooth: 0.0,
+            })
+            .expect("valid union");
+        serde_json::to_value(&arena).expect("an arena serialises")
+    }
+
+    /// Loading a document deserializes straight into the slot vector, so none
+    /// of the checks `insert` runs have ever seen the contents. A file whose
+    /// sphere has gone missing leaves the union pointing into a tombstone,
+    /// which evaluates as empty space: the part comes back a piece short with
+    /// no error anywhere.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_file_with_a_dangling_child_is_refused() {
+        let mut json = saved_pair();
+        json["slots"][0] = serde_json::Value::Null;
+
+        assert!(
+            serde_json::from_value::<Arena>(json)
+                .expect("deserialisation is permissive")
+                .check_structure()
+                .is_err(),
+            "a union kept a child that is not there"
+        );
+    }
+
+    /// The same hole, with worse consequences: a file describing a loop makes
+    /// `eval` recurse until the stack runs out, which is not a panic a caller
+    /// can catch.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_file_containing_a_cycle_is_refused() {
+        let mut json = saved_pair();
+        json["slots"][0] = serde_json::to_value(Node::Transform {
+            child: NodeId(1),
+            xform: crate::Transform::IDENTITY,
+            on: None,
+        })
+        .expect("a node serialises");
+
+        assert!(
+            serde_json::from_value::<Arena>(json)
+                .expect("deserialisation is permissive")
+                .check_structure()
+                .is_err(),
+            "a file described a node that is its own descendant"
+        );
+    }
+
+    /// And the check must not reject anything a save actually writes.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_well_formed_arena_still_round_trips() {
+        let json = saved_pair();
+        let back: Arena = serde_json::from_value(json).expect("a saved arena reloads");
+
+        assert_eq!(back.len(), 2);
+        assert_eq!(back.parents_of(NodeId(0)), vec![NodeId(1)]);
     }
 
     #[test]

@@ -42,7 +42,13 @@ impl Hit {
 /// A primitive found at the query point, with the path taken to reach it.
 struct Found {
     id: NodeId,
+    /// Distance from the query point to this primitive's surface, in world
+    /// units, so that entries gathered under different placements compare.
     distance: f32,
+    /// The query point in the primitive's own frame. Two entries for one node
+    /// at one local point are two readings of a single surface, not two shapes
+    /// that meet.
+    local: Vec3,
     path: Vec<NodeId>,
 }
 
@@ -61,21 +67,26 @@ pub fn pick(arena: &Arena, root: NodeId, world: Vec3, tolerance: f32) -> Option<
     found.sort_by(|a, b| a.distance.total_cmp(&b.distance));
     let first = found.first()?;
 
-    // A second primitive at comparable distance means this is a seam. Requiring
-    // it to be genuinely close, rather than merely within tolerance, keeps a
-    // click in the middle of a face from being read as an edge.
-    if let Some(second) = found.get(1) {
-        if second.distance <= tolerance {
-            if let Some(boolean) = common_ancestor(&first.path, &second.path) {
-                if matches!(
-                    arena.get(boolean),
-                    Some(Node::Union { .. } | Node::Difference { .. } | Node::Intersection { .. })
-                ) {
-                    return Some(Hit::Seam {
-                        boolean,
-                        between: (first.id, second.id),
-                    });
-                }
+    // A second surface within the same tolerance means the click landed where
+    // two shapes meet rather than in the middle of a face. The tree is a DAG, so
+    // the runner-up can be the same primitive reached down another branch: that
+    // is a second surface only if it was reached at a different point in the
+    // primitive's own frame, as two placements of one part are. The same point
+    // on the same primitive twice is one face, and calling it a seam would offer
+    // a blend on an edge that is not there.
+    let second = found
+        .iter()
+        .find(|f| f.id != first.id || f.local.distance_squared(first.local) > 0.0);
+    if let Some(second) = second {
+        if let Some(boolean) = common_ancestor(&first.path, &second.path) {
+            if matches!(
+                arena.get(boolean),
+                Some(Node::Union { .. } | Node::Difference { .. } | Node::Intersection { .. })
+            ) {
+                return Some(Hit::Seam {
+                    boolean,
+                    between: (first.id, second.id),
+                });
             }
         }
     }
@@ -84,9 +95,11 @@ pub fn pick(arena: &Arena, root: NodeId, world: Vec3, tolerance: f32) -> Option<
 
 /// Walks the tree, carrying the point into each node's own frame.
 ///
-/// A child under a transform must be tested in its local coordinates, and the
-/// tolerance has to be divided by the same scale so it still means the same
-/// distance in world units.
+/// A child under a transform is tested in its local coordinates, and `scale`
+/// carries the accumulated placement so the distance it reports comes back out
+/// in world units. Converting the distance is what makes `tolerance` mean the
+/// same thing at every depth; dividing the tolerance as well would apply the
+/// scale twice.
 fn gather(
     arena: &Arena,
     id: NodeId,
@@ -105,7 +118,7 @@ fn gather(
                 arena,
                 child,
                 xform.inverse_point(p),
-                tolerance / xform.scale,
+                tolerance,
                 scale * xform.scale,
                 path,
                 out,
@@ -117,26 +130,16 @@ fn gather(
             gather(arena, a, p, tolerance, scale, path, out);
             gather(arena, b, p, tolerance, scale, path, out);
         }
-        Node::Offset { child, .. } | Node::Shell { child, .. } => {
-            // Modifiers move the surface, so the child is not at zero where the
-            // result is. Report the modifier itself, which is also the node
-            // worth selecting.
-            let d = eval(arena, id, p).abs() * scale;
-            if d <= tolerance {
-                out.push(Found {
-                    id,
-                    distance: d,
-                    path: path.clone(),
-                });
-            }
-            let _ = child;
-        }
+        // Everything else answers for itself, including the modifiers: an offset
+        // or a shell moves the surface, so its child is not at zero where the
+        // result is, and the modifier is the node worth selecting anyway.
         _ => {
             let d = eval(arena, id, p).abs() * scale;
             if d <= tolerance {
                 out.push(Found {
                     id,
                     distance: d,
+                    local: p,
                     path: path.clone(),
                 });
             }
@@ -158,6 +161,7 @@ fn common_ancestor(a: &[NodeId], b: &[NodeId]) -> Option<NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::Transform;
     use crate::ops::Builder;
 
     #[test]
@@ -205,6 +209,78 @@ mod tests {
         assert_eq!(hit.node(), joint, "selecting a seam selects the blend");
     }
 
+    /// The tolerance is a world-space distance, and it has to stay one all the
+    /// way down. A scaled placement used to apply the scale twice, once to the
+    /// distance and once to the tolerance, so a click missed on anything
+    /// enlarged and caught thin air on anything shrunk.
+    #[test]
+    fn tolerance_is_the_same_distance_under_a_scaled_placement() {
+        let mut b = Builder::new();
+        let s = b.sphere(4.0).unwrap();
+
+        let enlarged = b.transform(s, Transform::from_scale(2.0)).unwrap();
+        // The surface is at r = 8 in the world, and this is 0.08 outside it.
+        assert!(
+            pick(&b.arena, enlarged, Vec3::new(8.08, 0.0, 0.0), 0.1).is_some(),
+            "a click 0.08 from the surface missed a 0.1 tolerance"
+        );
+
+        let shrunk = b.transform(s, Transform::from_scale(0.5)).unwrap();
+        // The surface is at r = 2, and this is 0.15 outside it.
+        assert!(
+            pick(&b.arena, shrunk, Vec3::new(2.15, 0.0, 0.0), 0.1).is_none(),
+            "a click 0.15 from the surface was caught by a 0.1 tolerance"
+        );
+    }
+
+    /// The tree is a DAG, so one primitive can be reached down two branches. Two
+    /// readings of the same surface are still one surface: calling them a seam
+    /// offers a fillet on an edge that is not there.
+    #[test]
+    fn one_surface_reached_down_two_branches_is_not_a_seam() {
+        let mut b = Builder::new();
+        let s = b.sphere(10.0).unwrap();
+        let here = b.translate(s, Vec3::new(4.0, 0.0, 0.0)).unwrap();
+        let also_here = b.translate(s, Vec3::new(4.0, 0.0, 0.0)).unwrap();
+        let both = b.union(here, also_here).unwrap();
+
+        let hit = pick(&b.arena, both, Vec3::new(14.0, 0.0, 0.0), 0.1).unwrap();
+        assert_eq!(hit, Hit::Face(s), "one surface read twice is not an edge");
+    }
+
+    /// The other half of the one above: two placements of one primitive that
+    /// genuinely meet do make a seam, and the boolean joining them is what the
+    /// blend radius lives on.
+    #[test]
+    fn two_placements_of_one_primitive_seam_where_they_touch() {
+        let mut b = Builder::new();
+        let s = b.sphere(10.0).unwrap();
+        let left = b.translate(s, Vec3::new(-10.0, 0.0, 0.0)).unwrap();
+        let right = b.translate(s, Vec3::new(10.0, 0.0, 0.0)).unwrap();
+        let joint = b.union(left, right).unwrap();
+
+        let hit = pick(&b.arena, joint, Vec3::ZERO, 0.1).unwrap();
+        assert_eq!(hit.node(), joint, "the two copies meet at the origin");
+        assert!(matches!(hit, Hit::Seam { .. }), "got {hit:?}");
+    }
+
+    #[test]
+    fn a_modifier_answers_for_the_surface_it_moved() {
+        let mut b = Builder::new();
+        let s = b.sphere(10.0).unwrap();
+        let grown = b.offset(s, 2.0).unwrap();
+        // The offset surface is at 12; the sphere's own is nowhere near.
+        let hit = pick(&b.arena, grown, Vec3::new(12.0, 0.0, 0.0), 0.1).unwrap();
+        assert_eq!(hit, Hit::Face(grown));
+        assert!(pick(&b.arena, grown, Vec3::new(10.0, 0.0, 0.0), 0.1).is_none());
+    }
+
+    #[test]
+    fn picking_an_empty_model_finds_nothing() {
+        let b = Builder::new();
+        assert!(pick(&b.arena, crate::NodeId(3), Vec3::ZERO, 1.0).is_none());
+    }
+
     #[test]
     fn the_middle_of_a_face_is_not_mistaken_for_a_seam() {
         let mut b = Builder::new();
@@ -227,7 +303,9 @@ mod tests {
 ///
 /// Walks the tree accumulating placements. Returns `None` if the node is not
 /// reachable from `root`, which is how a feature that has been removed from the
-/// model reports that it no longer has a position.
+/// model reports that it no longer has a position. A node shared by two
+/// branches sits in two places at once, and this reports the first one found,
+/// depth first with the left operand of a boolean taken first.
 ///
 /// This is what lets a work plane be attached to a feature rather than pinned to
 /// a coordinate: the plane is re-derived from the node each time, so changing

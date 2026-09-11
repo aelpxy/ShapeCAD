@@ -62,6 +62,19 @@ pub enum MeshError {
     },
     /// Voxelization was asked for a grid of a mesh with no triangles.
     EmptyMesh,
+    /// The mesh spans a range that cannot be sampled in 32-bit floating point.
+    ///
+    /// Coordinates are checked for finiteness as they are read, but the
+    /// difference of two finite `f32`s need not be finite and the square of a
+    /// finite one need not be either. The grid's spacing and origin come from
+    /// that difference and the tree compares squared distances, so a mesh this
+    /// wide would produce a grid of infinities and `NaN`s that breaks every
+    /// precondition `Grid` documents, while reporting success.
+    BoundsNotRepresentable {
+        /// The bounding box, already formatted, because the error type is
+        /// `Eq` and a float is not. Same reasoning as `Io::detail`.
+        extent: String,
+    },
 }
 
 impl MeshError {
@@ -106,6 +119,10 @@ impl std::fmt::Display for MeshError {
                 write!(f, "triangle {triangle} has a coordinate that is not finite")
             }
             MeshError::EmptyMesh => write!(f, "mesh has no triangles"),
+            MeshError::BoundsNotRepresentable { extent } => write!(
+                f,
+                "mesh spans {extent}, which is too wide to sample in 32-bit floating point"
+            ),
         }
     }
 }

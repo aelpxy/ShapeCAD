@@ -10,7 +10,8 @@ use crate::sdf::{AssetId, Grid};
 use glam::{Vec2, Vec3};
 use std::sync::Arc;
 
-/// Twice the signed area of a polygon, by the shoelace formula.
+/// Signed area of a polygon, by the shoelace formula. Negative for a clockwise
+/// winding, and the profile's own distance function does not care which.
 ///
 /// Used only to reject degenerate profiles: three collinear points enclose
 /// nothing and would give the field no inside.
@@ -91,7 +92,7 @@ pub enum Node {
     /// An imported triangle mesh, voxelized to a signed distance grid at import.
     ///
     /// The grid is carried in the node rather than looked up from an asset table
-    /// during evaluation. [`eval`](crate::eval) takes a point and an arena and
+    /// during evaluation. [`eval`](crate::eval::eval) takes a point and an arena and
     /// nothing else, and threading an asset context through evaluation, bounds,
     /// hashing, picking and codegen would change every caller in the workspace
     /// for the sake of one node kind. The document resolves [`AssetId`] into a
@@ -222,162 +223,76 @@ pub enum Node {
 /// while two separate allocations holding identical samples are two imports the
 /// user made and can edit apart. [`Grid`] itself compares by value for anyone
 /// who does want that.
+///
+/// One arm per variant, matched on `self` alone, so the compiler names a new
+/// node kind here instead of letting it fall through a catch-all as unequal to
+/// itself. A pair-wise match cannot be exhaustive without writing out every
+/// mismatched combination, and that is exactly how [`Node::Prism`] once ended
+/// up comparing false against a copy of itself.
 impl PartialEq for Node {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Node::Mesh { asset: a, grid: g }, Node::Mesh { asset: b, grid: h }) => {
-                a == b && Arc::ptr_eq(g, h)
+        match self {
+            Node::Sphere { radius } => {
+                matches!(other, Node::Sphere { radius: r } if radius == r)
             }
-            (Node::Mesh { .. }, _) | (_, Node::Mesh { .. }) => false,
-            (
-                Node::Sphere { .. }
-                | Node::Box { .. }
-                | Node::Cylinder { .. }
-                | Node::Torus { .. }
-                | Node::Plane { .. },
-                _,
-            ) => eq_primitive(self, other),
-            _ => eq_operation(self, other),
-        }
-    }
-}
-
-/// Equality for the closed-form primitives. False for a mismatched pair.
-fn eq_primitive(x: &Node, y: &Node) -> bool {
-    match (x, y) {
-        (Node::Sphere { radius: r1 }, Node::Sphere { radius: r2 }) => r1 == r2,
-        (
-            Node::Box {
-                half: h1,
-                round: r1,
-            },
-            Node::Box {
-                half: h2,
-                round: r2,
-            },
-        ) => h1 == h2 && r1 == r2,
-        (
+            Node::Box { half, round } => {
+                matches!(other, Node::Box { half: h, round: r } if half == h && round == r)
+            }
             Node::Cylinder {
-                radius: r1,
-                half_height: hh1,
-                round: rd1,
-            },
-            Node::Cylinder {
-                radius: r2,
-                half_height: hh2,
-                round: rd2,
-            },
-        ) => r1 == r2 && hh1 == hh2 && rd1 == rd2,
-        (
-            Node::Torus {
-                major: j1,
-                minor: n1,
-            },
-            Node::Torus {
-                major: j2,
-                minor: n2,
-            },
-        ) => j1 == j2 && n1 == n2,
-        (
-            Node::Plane {
-                normal: n1,
-                offset: o1,
-            },
-            Node::Plane {
-                normal: n2,
-                offset: o2,
-            },
-        ) => n1 == n2 && o1 == o2,
-        _ => false,
-    }
-}
-
-/// Equality for the booleans, modifiers and the extrusion. False for a
-/// mismatched pair.
-fn eq_operation(x: &Node, y: &Node) -> bool {
-    match (x, y) {
-        (
-            Node::Union {
-                a: a1,
-                b: b1,
-                smooth: s1,
-            },
-            Node::Union {
-                a: a2,
-                b: b2,
-                smooth: s2,
-            },
-        )
-        | (
-            Node::Difference {
-                a: a1,
-                b: b1,
-                smooth: s1,
-            },
-            Node::Difference {
-                a: a2,
-                b: b2,
-                smooth: s2,
-            },
-        )
-        | (
-            Node::Intersection {
-                a: a1,
-                b: b1,
-                smooth: s1,
-            },
-            Node::Intersection {
-                a: a2,
-                b: b2,
-                smooth: s2,
-            },
-        ) => a1 == a2 && b1 == b2 && s1 == s2,
-        (
-            Node::Transform {
-                child: c1,
-                xform: x1,
-                on: o1,
-            },
-            Node::Transform {
-                child: c2,
-                xform: x2,
-                on: o2,
-            },
+                radius,
+                half_height,
+                round,
+            } => matches!(
+                other,
+                Node::Cylinder { radius: r, half_height: hh, round: rd }
+                    if radius == r && half_height == hh && round == rd
+            ),
+            Node::Torus { major, minor } => {
+                matches!(other, Node::Torus { major: j, minor: n } if major == j && minor == n)
+            }
+            Node::Plane { normal, offset } => {
+                matches!(other, Node::Plane { normal: n, offset: o } if normal == n && offset == o)
+            }
+            Node::Mesh { asset, grid } => matches!(
+                other,
+                Node::Mesh { asset: a, grid: g } if asset == a && Arc::ptr_eq(grid, g)
+            ),
+            Node::Union { a, b, smooth } => matches!(
+                other,
+                Node::Union { a: a2, b: b2, smooth: s } if a == a2 && b == b2 && smooth == s
+            ),
+            Node::Difference { a, b, smooth } => matches!(
+                other,
+                Node::Difference { a: a2, b: b2, smooth: s } if a == a2 && b == b2 && smooth == s
+            ),
+            Node::Intersection { a, b, smooth } => matches!(
+                other,
+                Node::Intersection { a: a2, b: b2, smooth: s } if a == a2 && b == b2 && smooth == s
+            ),
             // Provenance counts. Two placements that sit in the same spot but
             // are derived from different faces will part company the next time
             // either face moves, so they are not the same node.
-        ) => c1 == c2 && x1 == x2 && o1 == o2,
-        (
-            Node::Offset {
-                child: c1,
-                distance: d1,
-            },
-            Node::Offset {
-                child: c2,
-                distance: d2,
-            },
-        ) => c1 == c2 && d1 == d2,
-        (
-            Node::Shell {
-                child: c1,
-                thickness: t1,
-            },
-            Node::Shell {
-                child: c2,
-                thickness: t2,
-            },
-        ) => c1 == c2 && t1 == t2,
-        (
-            Node::Extrude {
-                profile: p1,
-                depth: d1,
-            },
-            Node::Extrude {
-                profile: p2,
-                depth: d2,
-            },
-        ) => p1 == p2 && d1 == d2,
-        _ => false,
+            Node::Transform { child, xform, on } => matches!(
+                other,
+                Node::Transform { child: c, xform: x, on: o }
+                    if child == c && xform == x && on == o
+            ),
+            Node::Offset { child, distance } => matches!(
+                other,
+                Node::Offset { child: c, distance: d } if child == c && distance == d
+            ),
+            Node::Extrude { profile, depth } => matches!(
+                other,
+                Node::Extrude { profile: p, depth: d } if profile == p && depth == d
+            ),
+            Node::Prism { profile } => {
+                matches!(other, Node::Prism { profile: p } if profile == p)
+            }
+            Node::Shell { child, thickness } => matches!(
+                other,
+                Node::Shell { child: c, thickness: t } if child == c && thickness == t
+            ),
+        }
     }
 }
 
@@ -393,7 +308,19 @@ impl Node {
     pub fn mesh_grid(&self) -> Option<&Arc<Grid>> {
         match self {
             Node::Mesh { grid, .. } => Some(grid),
-            _ => None,
+            Node::Sphere { .. }
+            | Node::Box { .. }
+            | Node::Cylinder { .. }
+            | Node::Torus { .. }
+            | Node::Plane { .. }
+            | Node::Union { .. }
+            | Node::Difference { .. }
+            | Node::Intersection { .. }
+            | Node::Transform { .. }
+            | Node::Offset { .. }
+            | Node::Extrude { .. }
+            | Node::Prism { .. }
+            | Node::Shell { .. } => None,
         }
     }
 
@@ -438,7 +365,19 @@ impl Node {
     pub fn derived_from(&self) -> Option<NodeId> {
         match *self {
             Node::Transform { on, .. } => on,
-            _ => None,
+            Node::Sphere { .. }
+            | Node::Box { .. }
+            | Node::Cylinder { .. }
+            | Node::Torus { .. }
+            | Node::Plane { .. }
+            | Node::Mesh { .. }
+            | Node::Union { .. }
+            | Node::Difference { .. }
+            | Node::Intersection { .. }
+            | Node::Offset { .. }
+            | Node::Extrude { .. }
+            | Node::Prism { .. }
+            | Node::Shell { .. } => None,
         }
     }
 
@@ -449,6 +388,10 @@ impl Node {
     /// bounds and the generated shader treat the base as a second operand,
     /// evaluating and bounding it twice over.
     pub fn children(&self) -> impl Iterator<Item = NodeId> + '_ {
+        // Written out rather than closed with a wildcard: a new kind that holds
+        // a subtree has to be named here, or its child is invisible to bounds,
+        // to the generated shader, to the cycle check and to the reference
+        // count that stops a live node being deleted.
         let (a, b) = match *self {
             Node::Union { a, b, .. }
             | Node::Difference { a, b, .. }
@@ -456,7 +399,14 @@ impl Node {
             Node::Transform { child, .. }
             | Node::Offset { child, .. }
             | Node::Shell { child, .. } => (Some(child), None),
-            _ => (None, None),
+            Node::Sphere { .. }
+            | Node::Box { .. }
+            | Node::Cylinder { .. }
+            | Node::Torus { .. }
+            | Node::Plane { .. }
+            | Node::Mesh { .. }
+            | Node::Extrude { .. }
+            | Node::Prism { .. } => (None, None),
         };
         a.into_iter().chain(b)
     }
@@ -478,7 +428,17 @@ impl Node {
             Node::Transform { child, .. }
             | Node::Offset { child, .. }
             | Node::Shell { child, .. } => *child = f(*child),
-            _ => {}
+            // Exhaustive for the same reason as [`Node::children`]: a kind that
+            // is silently unrewritable keeps pointing at the node an edit just
+            // replaced.
+            Node::Sphere { .. }
+            | Node::Box { .. }
+            | Node::Cylinder { .. }
+            | Node::Torus { .. }
+            | Node::Plane { .. }
+            | Node::Mesh { .. }
+            | Node::Extrude { .. }
+            | Node::Prism { .. } => {}
         }
     }
 
@@ -652,7 +612,15 @@ impl Node {
                     && round <= radius.min(half_height)
             }
             Node::Torus { major, minor } => major > 0.0 && minor > 0.0 && minor < major,
-            Node::Plane { normal, .. } => normal.length_squared() > 1e-12,
+            // Both bounds matter. Too short and there is no direction to
+            // normalise; long enough to overflow the square and `normalize`
+            // hands back the zero vector, which turns the half-space into the
+            // constant field `-offset`: everywhere solid or everywhere empty,
+            // and nothing on screen to say which.
+            Node::Plane { normal, .. } => {
+                let l2 = normal.length_squared();
+                l2 > 1e-12 && l2.is_finite()
+            }
             // Rejects the placeholder an unresolved asset deserializes to, so
             // a document referring to a missing sidecar fails at load instead
             // of rendering as a part with a hole where the import should be.
@@ -667,6 +635,133 @@ impl Node {
             Node::Extrude { .. } | Node::Prism { .. } => {
                 unreachable!("swept profiles are handled before the copy match")
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Node, NodeId};
+    use glam::Vec3;
+
+    /// A normal big enough that squaring it overflows `f32` normalises to the
+    /// zero vector, and the plane's field collapses to the constant `-offset`:
+    /// a half-space that is either everywhere solid or everywhere empty, with
+    /// nothing on screen to say so. Testing `length_squared() > 1e-12` alone
+    /// waves it through, because infinity is greater than 1e-12.
+    #[test]
+    fn a_plane_normal_too_large_to_normalise_is_rejected() {
+        let normal = Vec3::new(1.0e30, 0.0, 0.0);
+        assert!(
+            normal.is_finite() && !normal.length_squared().is_finite(),
+            "the premise of this test is that 1e30 is finite but its square is not"
+        );
+        assert_eq!(
+            normal.normalize_or_zero(),
+            Vec3::ZERO,
+            "such a normal has no direction left to give"
+        );
+        assert!(
+            !Node::Plane {
+                normal,
+                offset: 0.0
+            }
+            .is_valid(),
+            "a plane with no usable normal was accepted"
+        );
+    }
+
+    /// The bound above must not catch an ordinary small normal: a sketch drawn
+    /// in metres and a normal left unnormalised are both perfectly legal.
+    #[test]
+    fn an_ordinary_normal_is_still_accepted() {
+        for n in [Vec3::Z, Vec3::splat(1.0e-3), Vec3::new(0.0, 1.0e6, 0.0)] {
+            assert!(
+                Node::Plane {
+                    normal: n,
+                    offset: 2.0,
+                }
+                .is_valid(),
+                "{n:?} was refused"
+            );
+        }
+    }
+
+    /// Every kind that names a subtree has to report it. A child nothing can
+    /// see is not bounded, not emitted into the shader, not protected from
+    /// deletion and not checked for cycles.
+    #[test]
+    fn every_kind_that_holds_a_subtree_reports_it_as_a_child() {
+        let one = NodeId(7);
+        let two = NodeId(9);
+        let cases: Vec<(Node, Vec<NodeId>)> = vec![
+            (
+                Node::Union {
+                    a: one,
+                    b: two,
+                    smooth: 0.0,
+                },
+                vec![one, two],
+            ),
+            (
+                Node::Difference {
+                    a: one,
+                    b: two,
+                    smooth: 0.0,
+                },
+                vec![one, two],
+            ),
+            (
+                Node::Intersection {
+                    a: one,
+                    b: two,
+                    smooth: 0.0,
+                },
+                vec![one, two],
+            ),
+            (
+                Node::Transform {
+                    child: one,
+                    xform: crate::Transform::IDENTITY,
+                    on: Some(two),
+                },
+                vec![one],
+            ),
+            (
+                Node::Offset {
+                    child: one,
+                    distance: 1.0,
+                },
+                vec![one],
+            ),
+            (
+                Node::Shell {
+                    child: one,
+                    thickness: 1.0,
+                },
+                vec![one],
+            ),
+        ];
+
+        for (node, want) in cases {
+            let got: Vec<NodeId> = node.children().collect();
+            assert_eq!(got, want, "a {} lost a child", node.kind());
+
+            let mut rewired = node.clone();
+            rewired.map_children(|_| NodeId(0));
+            let after: Vec<NodeId> = rewired.children().collect();
+            assert_eq!(
+                after,
+                vec![NodeId(0); want.len()],
+                "a {} ignored map_children",
+                node.kind()
+            );
+            assert_eq!(
+                rewired.derived_from(),
+                node.derived_from(),
+                "map_children moved a {}'s derivation",
+                node.kind()
+            );
         }
     }
 }

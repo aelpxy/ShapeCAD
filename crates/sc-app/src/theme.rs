@@ -43,6 +43,9 @@ pub(crate) struct Palette {
     pub ink: Color32,
     /// Text on top of `ink`.
     pub on_ink: Color32,
+    /// X, Y and Z, for the axis legend. The one place the interface borrows the
+    /// scene's colours, so the legend reads as naming the lines behind it.
+    pub axis: [Color32; 3],
     /// Viewport sky, at the top of the sweep.
     pub sky: [f32; 3],
     /// Viewport sky, at the horizon.
@@ -80,6 +83,11 @@ const LIGHT: Palette = Palette {
     // most important action is the accent colour, and everything else is plain.
     ink: Color32::from_rgb(0x00, 0x7A, 0xFF),
     on_ink: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    axis: [
+        Color32::from_rgb(0xC7, 0x5C, 0x5C),
+        Color32::from_rgb(0x66, 0x9E, 0x66),
+        Color32::from_rgb(0x5C, 0x7F, 0xC7),
+    ],
     sky: [0.700, 0.735, 0.790],
     haze: [0.930, 0.943, 0.962],
     plate: [0.895, 0.910, 0.930],
@@ -107,6 +115,13 @@ const DARK: Palette = Palette {
     danger: Color32::from_rgb(0xFF, 0x45, 0x3A),
     ink: Color32::from_rgb(0x0A, 0x84, 0xFF),
     on_ink: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    // Lifted, like the accent and the red: the light tints carry too little
+    // against a dark surface to be read at eleven points.
+    axis: [
+        Color32::from_rgb(0xE8, 0x84, 0x84),
+        Color32::from_rgb(0x84, 0xC7, 0x84),
+        Color32::from_rgb(0x84, 0xA6, 0xE8),
+    ],
     // Linear, not sRGB: the shader writes into a linear target and the swapchain
     // encodes on the way out, so a value picked to look right as a hex colour
     // comes out roughly two and a half times too light. These are the zinc ramp
@@ -168,6 +183,9 @@ const CARD_RADIUS: u8 = 14;
 const WIDGET_RADIUS: u8 = 9;
 /// A pill: a segmented control's track and the indicator that slides along it.
 const PILL_RADIUS: u8 = 8;
+/// How wide a tooltip is allowed to run. A hover label the width of the screen
+/// is unreadable, so it is capped near the width of a sidebar card.
+const TOOLTIP_WIDTH: f32 = 250.0;
 /// A grouped list. Smaller than a card, because a group sits inside one.
 const GROUP_RADIUS: u8 = 10;
 /// Where a grouped row's label starts, measured from the group's edge.
@@ -290,11 +308,9 @@ pub(crate) fn apply(ctx: &egui::Context) {
     spacing.interact_size.y = 28.0;
     spacing.indent = 12.0;
     spacing.window_margin = Margin::ZERO;
-    // Tooltips and menus share this margin and this width. A hover label that
-    // runs the width of the screen is unreadable, so it is capped near the
-    // width of a sidebar card.
+    // Tooltips and menus share this margin.
     spacing.menu_margin = Margin::symmetric(10, 8);
-    spacing.tooltip_width = 270.0;
+    spacing.tooltip_width = TOOLTIP_WIDTH;
     // egui fades the edge of a scroll area towards the background colour it
     // finds on the Ui stack. Inside a white card that resolves to a mid grey,
     // so the fade paints a dull band over the last row instead of disappearing
@@ -351,13 +367,16 @@ pub(crate) fn apply(ctx: &egui::Context) {
     w.inactive.weak_bg_fill = palette().surface_alt;
     w.inactive.bg_stroke = Stroke::new(1.0, palette().border);
 
+    // Two steps along the same ramp the hairlines come from. Named colours here
+    // outlined every field in the property panel in light grey under the
+    // pointer once the dark palette was in force.
     w.hovered.bg_fill = palette().surface_alt;
     w.hovered.weak_bg_fill = palette().surface_alt;
-    w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xD4, 0xD4, 0xD8));
+    w.hovered.bg_stroke = Stroke::new(1.0, palette().border);
 
     w.active.bg_fill = palette().surface_alt;
     w.active.weak_bg_fill = palette().surface_alt;
-    w.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xA1, 0xA1, 0xAA));
+    w.active.bg_stroke = Stroke::new(1.0, palette().text_dim);
     // Not the accent: `Visuals::strong_text_color` reads this, so tinting it
     // would turn every bold label in the application blue.
     w.active.fg_stroke = Stroke::new(1.0, palette().text);
@@ -389,9 +408,12 @@ pub(crate) fn floating() -> egui::Frame {
     })
 }
 
-/// A flat bar with a hairline on one edge, for the top and bottom chrome.
-pub(crate) fn bar(bottom_border: bool) -> egui::Frame {
-    let _ = bottom_border;
+/// A flat bar for the top and bottom chrome.
+///
+/// No border of its own: the canvas gutter around the panels and the viewport
+/// between them are each a different colour in either scheme, and that edge is
+/// what separates the bar from what it sits against.
+pub(crate) fn bar() -> egui::Frame {
     egui::Frame::new()
         .fill(palette().surface)
         .inner_margin(Margin::symmetric(14, 0))
@@ -498,12 +520,17 @@ pub(crate) fn group_separator(ui: &mut egui::Ui) {
 ///
 /// Sits above its content at a size nothing else in the panel comes near, which
 /// is what makes a panel read as a place rather than as a region.
+/// Truncated rather than wrapped: a title is one line, and a node can be given
+/// a name longer than the panel it is shown in.
 pub(crate) fn large_title(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.label(
-        egui::RichText::new(text)
-            .size(21.0)
-            .family(semibold())
-            .color(palette().text),
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(21.0)
+                .family(semibold())
+                .color(palette().text),
+        )
+        .truncate(),
     )
 }
 
@@ -706,6 +733,39 @@ fn paint_button(
     }
 }
 
+/// A small toggle: the plane picker, and anything else that is a word rather
+/// than a glyph and too small to be a row.
+///
+/// No chrome until it is active, so a strip of them reads as one choice rather
+/// than as a row of buttons.
+pub(crate) fn chip(ui: &mut egui::Ui, label: &str, active: bool, enabled: bool) -> egui::Response {
+    let colour = if !enabled {
+        palette().text_dim.gamma_multiply(0.45)
+    } else if active {
+        palette().text
+    } else {
+        palette().text_dim
+    };
+    let button = egui::Button::new(egui::RichText::new(label).size(11.5).color(colour))
+        .fill(if active {
+            palette().surface_alt
+        } else {
+            Color32::TRANSPARENT
+        })
+        .stroke(Stroke::NONE)
+        .min_size(Vec2::new(38.0, 24.0));
+    ui.add(button)
+}
+
+/// One letter of the axis legend, tinted to match the line it names.
+pub(crate) fn axis_chip(ui: &mut egui::Ui, label: &str, tint: Color32) -> egui::Response {
+    let button = egui::Button::new(egui::RichText::new(label).size(11.5).strong().color(tint))
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::NONE)
+        .min_size(Vec2::new(26.0, 24.0));
+    ui.add(button)
+}
+
 /// A design tree row: indent guide, kind glyph, name, and a muted kind note.
 ///
 /// Selection is a filled ghost row rather than a highlighted label, so the whole
@@ -805,7 +865,6 @@ pub(crate) fn hint(
     shortcut: Option<&str>,
 ) -> egui::Response {
     response.on_hover_ui(|ui| {
-        ui.set_max_width(250.0);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(title).size(12.5).family(semibold()));
             if let Some(shortcut) = shortcut {
@@ -1000,7 +1059,9 @@ pub(crate) fn empty_state(ui: &mut egui::Ui, icon: crate::icon::Icon, title: &st
         ui.label(egui::RichText::new(title).size(13.0).family(semibold()));
         ui.add_space(4.0);
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-        ui.set_max_width(220.0);
+        // A panel is a share of the window, so this cannot insist on a width
+        // the card it sits in may not have.
+        ui.set_max_width(220.0_f32.min(ui.available_width()));
         ui.label(
             egui::RichText::new(hint)
                 .size(11.5)
@@ -1213,11 +1274,6 @@ pub(crate) fn segmented(ui: &mut egui::Ui, current: &mut usize, labels: &[(&str,
     }
 }
 
-/// Face tints for the mark, lightest first.
-const MARK_TOP: Color32 = Color32::from_rgb(0x86, 0xAD, 0xF8);
-const MARK_BODY: Color32 = Color32::from_rgb(0x2B, 0x6C, 0xF0);
-const MARK_RIGHT: Color32 = Color32::from_rgb(0x17, 0x3F, 0x9B);
-
 /// Replaces a sharp corner with an arc tangent to both edges.
 ///
 /// The corner is used as the control point of a quadratic, which is tangency by
@@ -1262,6 +1318,20 @@ fn rounded_polygon(points: &[egui::Pos2], radii: &[f32]) -> Vec<egui::Pos2> {
         .collect()
 }
 
+/// Face tints for the mark, lightest first.
+///
+/// Shaded from `ink`, the fill of the one primary button, rather than named
+/// here: those are the two places the interface is allowed to be loud, and they
+/// should be loud in the same hue.
+fn mark_faces() -> [Color32; 3] {
+    let ink = palette().ink;
+    [
+        ink.lerp_to_gamma(Color32::WHITE, 0.42),
+        ink,
+        ink.lerp_to_gamma(Color32::BLACK, 0.42),
+    ]
+}
+
 /// The application mark: an isometric solid with its corners filleted.
 ///
 /// A plain cube would say "3D" and nothing more. The rounding is the specific
@@ -1289,12 +1359,13 @@ pub(crate) fn logo(ui: &mut egui::Ui, size: f32) {
 
     let painter = ui.painter();
     let no_edge = Stroke::NONE;
+    let [top_face, body, right_face] = mark_faces();
 
     // Body: the whole silhouette, every outer corner rounded.
     let silhouette = [apex, upper_r, lower_r, base, lower_l, upper_l];
     painter.add(egui::Shape::convex_polygon(
         rounded_polygon(&silhouette, &[round; 6]),
-        MARK_BODY,
+        body,
         no_edge,
     ));
 
@@ -1303,14 +1374,14 @@ pub(crate) fn logo(ui: &mut egui::Ui, size: f32) {
     let top = [upper_l, apex, upper_r, middle];
     painter.add(egui::Shape::convex_polygon(
         rounded_polygon(&top, &[round, round, round, 0.0]),
-        MARK_TOP,
+        top_face,
         no_edge,
     ));
 
     let right = [middle, upper_r, lower_r, base];
     painter.add(egui::Shape::convex_polygon(
         rounded_polygon(&right, &[0.0, round, round, round]),
-        MARK_RIGHT,
+        right_face,
         no_edge,
     ));
 }
@@ -1424,8 +1495,52 @@ mod tests {
         const { assert!(LIGHT.grid[0] < LIGHT.plate[0]) }
     }
 
+    /// The scheme is one value for the whole process, so the tests that switch
+    /// it take turns rather than reading each other's half-applied palette.
+    static SCHEME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Every colour an egui widget is drawn with has to come from the scheme in
+    /// force. The two outline colours were named at this call site instead, so
+    /// in the dark scheme every field in the property panel was outlined in
+    /// light grey the moment the pointer went near it.
+    ///
+    /// The rule is that an outline is a hairline: it sits between the surface it
+    /// bounds and the quietest text in the palette, and never further from that
+    /// surface than the quietest text is.
+    #[test]
+    fn widget_outlines_follow_the_scheme() {
+        let _guard = SCHEME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ctx = egui::Context::default();
+
+        for (scheme, palette) in [(Scheme::Light, LIGHT), (Scheme::Dark, DARK)] {
+            set_scheme(scheme);
+            super::apply(&ctx);
+            let widgets = ctx.style_of(egui::Theme::Light).visuals.widgets.clone();
+            let room = (luma(palette.text_dim) - luma(palette.surface)).abs();
+            for (state, style) in [
+                ("inactive", &widgets.inactive),
+                ("hovered", &widgets.hovered),
+                ("active", &widgets.active),
+            ] {
+                let outline = style.bg_stroke.color;
+                let reach = (luma(outline) - luma(palette.surface)).abs();
+                assert!(
+                    reach <= room + 0.5,
+                    "the {state} outline {outline:?} is louder than the dimmest text in the \
+                     {scheme:?} scheme"
+                );
+            }
+        }
+        set_scheme(Scheme::Light);
+    }
+
     #[test]
     fn switching_scheme_switches_the_palette() {
+        let _guard = SCHEME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         set_scheme(Scheme::Dark);
         assert_eq!(scheme(), Scheme::Dark);
         assert_eq!(palette().canvas, DARK.canvas);

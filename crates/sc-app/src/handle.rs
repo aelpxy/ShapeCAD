@@ -87,6 +87,19 @@ pub(crate) fn handles(arena: &Arena, id: NodeId) -> Vec<Handle> {
             Handle::new("minor", Vec3::new(major + minor, 0.0, 0.0), Vec3::X, 1.0),
         ],
 
+        // A half-space is one face and one number saying how far along its own
+        // normal that face sits, so the grip goes on the face and points the
+        // way the face travels. The normal's three components are a direction
+        // rather than a dimension and stay in the panel; `offset` is the only
+        // parameter here that moves a surface, and it moves exactly one.
+        //
+        // `is_valid` refuses a degenerate normal, so anything reaching here
+        // through an arena has one that normalises, the same way `eval` does.
+        Node::Plane { normal, offset } => {
+            let along = normal.normalize();
+            vec![Handle::new("offset", along * *offset, along, 1.0)]
+        }
+
         // An extrusion runs from z = 0 to z = depth, so the depth grip sits on
         // the far face: the surface the user would push.
         Node::Extrude { profile, depth } => {
@@ -187,6 +200,10 @@ mod tests {
                     radius: 4.0,
                 },
             },
+            Node::Plane {
+                normal: Vec3::new(0.0, 0.0, 2.0),
+                offset: 3.0,
+            },
         ];
         for node in nodes {
             let names: Vec<&'static str> = node.params().into_iter().map(|(n, _)| n).collect();
@@ -228,6 +245,16 @@ mod tests {
                     round: 0.0,
                 },
                 "half_height",
+            ),
+            (
+                Node::Plane {
+                    // Deliberately not unit length: the kernel normalises on
+                    // evaluation, so a grip that does not would sit off the
+                    // face by whatever the normal's length happens to be.
+                    normal: Vec3::new(0.0, 3.0, 0.0),
+                    offset: 4.0,
+                },
+                "offset",
             ),
         ];
         for (node, param) in cases {
@@ -338,6 +365,35 @@ mod tests {
             "grips at {:?} and {:?}",
             major.at,
             minor.at
+        );
+    }
+
+    /// The gap in the coverage: a half-space has one number, `offset`, saying
+    /// how far its face sits along its own normal. That is the most literally
+    /// directional dimension in the kernel, and it had no grip, so a plane was
+    /// the one node you could select, see a dimension on, and not touch.
+    #[test]
+    fn a_plane_can_be_pushed_along_its_normal() {
+        let node = Node::Plane {
+            normal: Vec3::new(1.0, 1.0, 0.0),
+            offset: 5.0,
+        };
+        let (arena, id) = arena_with(node.clone());
+        let handle = grip(&node, "offset");
+
+        let d = sc_geom::eval(&arena, id, handle.at);
+        assert!(d.abs() < 1.0e-4, "the offset grip is {d}mm off the face");
+
+        let mut pushed = node.clone();
+        assert!(pushed.set_param("offset", 5.0 + 2.0 * handle.gain));
+        let (arena, id) = arena_with(pushed);
+        assert!(
+            sc_geom::eval(&arena, id, handle.at) < 0.0,
+            "pushing the grip outward moved the face the other way"
+        );
+        assert!(
+            sc_geom::eval(&arena, id, handle.at + handle.along * 2.0).abs() < 1.0e-4,
+            "the face did not travel as far as the grip was pushed"
         );
     }
 

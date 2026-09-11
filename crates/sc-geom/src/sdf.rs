@@ -176,17 +176,20 @@ impl Grid {
             && self.origin.is_finite()
     }
 
-    /// Whether the samples can be read at all: enough of them, and a spacing
-    /// that places them somewhere.
+    /// Whether the samples can be read at all: enough of them, and an origin and
+    /// spacing that place them somewhere.
     ///
     /// Weaker than [`Grid::is_valid`], which is the contract a node has to meet.
     /// This is only what the readers below need in order to return an answer
-    /// instead of a NaN, since they are reachable on a hand-built grid.
+    /// instead of a NaN, since they are reachable on a hand-built grid. The
+    /// origin counts towards that: every read is an offset from it, so a grid
+    /// placed at NaN or at infinity reads NaN everywhere.
     fn is_readable(&self) -> bool {
         !self.data.is_empty()
             && self.data.len() == self.voxel_count()
             && self.spacing.is_finite()
             && self.spacing > 0.0
+            && self.origin.is_finite()
     }
 
     /// The smallest sample anywhere on the six boundary faces, or
@@ -248,28 +251,32 @@ impl Grid {
     /// exact field is therefore approximate on a mesh node to within the
     /// spacing, which is the resolution the user chose at import.
     ///
-    /// Outside the lattice the result is
-    /// `hypot(distance to the lattice box, sample at the nearest point on it)`.
-    /// Neither term alone is good enough. The box distance on its own collapses
-    /// to zero at the face and says nothing about how far away the surface
-    /// actually is, which makes tracing crawl along the outside of every
-    /// imported part. The clamped edge sample on its own ignores the distance
-    /// travelled to get there and stops growing as the ray recedes. Combining
-    /// them in quadrature is not a compromise between the two but the exact
-    /// answer for the worst case: the nearest point on the box is the
-    /// orthogonal projection of `p`, so for any surface point `s` inside the box
-    /// the two legs are perpendicular and `|p - s|^2 >= box^2 + |c - s|^2`.
-    /// Since the surface is required to lie inside the box, that makes the
-    /// result a lower bound on the true distance, which is what sphere tracing
-    /// needs to avoid stepping through the surface. It is also continuous with
-    /// the interior, since the box distance is zero at the face.
+    /// Outside the lattice the result is `hypot(distance to the lattice box,
+    /// sample at the nearest point on it, shaded down by one voxel)`. Neither
+    /// term alone is good enough. The box distance on its own collapses to zero
+    /// at the face and says nothing about how far away the surface actually is,
+    /// which makes tracing crawl along the outside of every imported part. The
+    /// clamped edge sample on its own ignores the distance travelled to get
+    /// there and stops growing as the ray recedes. Combining them in quadrature
+    /// is not a compromise between the two but the exact answer for the worst
+    /// case: the nearest point on the box is the orthogonal projection of `p`,
+    /// so for any surface point `s` inside the box the two legs are
+    /// perpendicular and `|p - s|^2 >= box^2 + |c - s|^2`. Since the surface is
+    /// required to lie inside the box, that makes the result a lower bound on
+    /// the true distance, which is what sphere tracing needs to avoid stepping
+    /// through the surface.
     ///
-    /// The one qualification: the bound is exact in the value it is given, but
-    /// the value it is given is the interpolated boundary sample, which
-    /// over-reports a curved surface by a fraction of a voxel like any other
-    /// reading of the grid. So the exterior is conservative to within the
-    /// interior's own accuracy and no worse. Pinned by
-    /// `exterior_samples_never_exceed_the_true_distance`.
+    /// The shading is why it is a bound rather than an estimate. The value being
+    /// extrapolated from is an interpolated boundary sample, which over-reports
+    /// a curved surface by a fraction of a voxel like any other reading of the
+    /// grid, and outside the lattice is the one place where over-reporting is
+    /// unsafe. Taking a whole voxel off is far more slack than that error has
+    /// ever measured and costs almost nothing once either leg is longer than the
+    /// spacing. The price is that the reading steps down by up to one voxel on
+    /// the way out through the face rather than being continuous with the
+    /// interior, which is the safe direction to jump. Both halves are pinned, by
+    /// `exterior_samples_never_exceed_the_true_distance` and by
+    /// `the_exterior_reading_is_shaded_by_a_voxel_at_the_face`.
     ///
     /// A placeholder or a malformed grid evaluates as empty space rather than
     /// panicking, matching a missing node, though
@@ -497,6 +504,47 @@ mod tests {
             tightest > 0.5,
             "the bound collapsed to {tightest} of the true distance"
         );
+    }
+
+    /// A grid whose origin is not a position cannot be read at all: every
+    /// sample lands at a NaN offset from it. Returning empty space is what the
+    /// other unreadable grids do, and a NaN is the one answer that poisons every
+    /// `min` and `max` above it.
+    #[test]
+    fn a_grid_placed_nowhere_reads_as_empty_space() {
+        let mut lost = sphere_grid(2.0, 5, 1.0);
+        lost.origin.x = f32::NAN;
+        assert!(!lost.is_valid());
+        assert!(
+            lost.sample(Vec3::ZERO).is_infinite(),
+            "got {}",
+            lost.sample(Vec3::ZERO)
+        );
+        assert!(lost.bounds().is_empty(), "{:?}", lost.bounds());
+
+        let mut adrift = sphere_grid(2.0, 5, 1.0);
+        adrift.origin.z = f32::INFINITY;
+        assert!(adrift.sample(Vec3::ZERO).is_infinite());
+        assert!(adrift.bounds().is_empty());
+    }
+
+    /// The exterior reading is shaded down by a voxel before the two legs are
+    /// combined, which is what keeps it under the true distance rather than
+    /// merely near it. The price is a step down at the face, and it is deliberate:
+    /// out here a reading that is too large is a step a tracer takes through the
+    /// surface, while one that is too small only costs it an iteration.
+    #[test]
+    fn the_exterior_reading_is_shaded_by_a_voxel_at_the_face() {
+        let grid = sphere_grid(3.0, 25, 0.5);
+        let half = (25 - 1) as f32 * 0.5 * 0.5;
+        let face = Vec3::new(0.0, 0.0, half);
+        let inside = grid.sample(face);
+        let outside = grid.sample(face + Vec3::Z * 1e-4);
+        assert!(
+            inside - outside > grid.spacing * 0.9,
+            "the face reads {inside} inside and {outside} just outside"
+        );
+        assert!(outside >= 0.0, "the shading never goes negative: {outside}");
     }
 
     #[test]

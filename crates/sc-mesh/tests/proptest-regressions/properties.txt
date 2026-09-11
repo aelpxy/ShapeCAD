@@ -8,3 +8,4 @@ cc 94a4255514f9bd087079ce26e30f782719aaadec18dc2503cda24fe0539d23c0 # shrinks to
 cc fff94fcf142dcec7d2944b205e2a1a8fa92b26b72687d1b322188b3486c2d86d # shrinks to s = Union(Translate(Sphere(5.904276), [0.0, -3.216206, -2.9064112]), Difference(Cylinder(5.683753, 2.0), Cuboid([4.468588, 6.602638, 2.0]), 0.0), 0.646039)
 cc e44c08af852e966b43b78e740fede7873362cfadec6d5da14f7e6cba46b355df # shrinks to s = Shell(Shell(Translate(Sphere(2.0215945), [-2.8973744, -4.3568473, 5.0063667]), 1.0), 1.0)
 cc 5a280ea1766b0ee7122d06dd93ae73ab4f5180ce3b7edb69c4844f7cb6c001f3 # shrinks to s = Difference(Cylinder(5.7604814, 2.0), Union(Sphere(5.068574), Sphere(2.0), 0.0), 1.1795771)
+cc b168d48b9e1ec9424fd90daec56986fc2f8392db05b5e1c1ef4f1e3c2c4aa3f3 # shrinks to t = Triangle { a: Vec3(5.876067, 8.982255, -1.2098742), b: Vec3(-5.484787, 8.340086, -7.9948015), c: Vec3(-16.845642, 7.697917, -14.779729) }, p = Vec3(-7.1313415, -1.2139485, 2.2107794)

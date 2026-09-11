@@ -16,7 +16,7 @@
 
 use crate::asset::{AssetError, AssetStore};
 use crate::{AttachError, DocError, Document};
-use sc_geom::{Arena, NodeId};
+use sc_geom::{Arena, GeomError, NodeId};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -28,6 +28,10 @@ use std::path::{Path, PathBuf};
 /// Version 3 added mesh nodes, which name a voxel grid stored in the sidecar
 /// directory beside the document. An older build cannot evaluate one, and would
 /// not know to look for the directory either.
+///
+/// Version 4 added `Node::Prism`, the unbounded sweep a through cut is
+/// expressed with. An older build cannot evaluate one, and reading the file
+/// without it would turn a hole sized against the whole part into nothing.
 pub const FORMAT_VERSION: u32 = 4;
 
 /// Conventional file extension, without the dot.
@@ -106,10 +110,21 @@ impl std::error::Error for FileError {}
 
 impl Document {
     /// Captures the document as its serialisable form.
+    ///
+    /// Labels on tombstoned nodes are left out, for the same reason a
+    /// tombstoned node's grid is: nothing in the saved file can reach them.
+    /// Deleting a node deliberately keeps its label in memory so that undoing
+    /// the deletion brings the two back together, but writing that label out
+    /// produces a file this build's own loader refuses, because loading
+    /// requires every named id to be live.
     #[must_use]
     pub fn snapshot(&self) -> DocumentFile {
-        let mut names: Vec<(NodeId, String)> =
-            self.names.iter().map(|(id, n)| (*id, n.clone())).collect();
+        let mut names: Vec<(NodeId, String)> = self
+            .names
+            .iter()
+            .filter(|(id, _)| self.arena.is_alive(**id))
+            .map(|(id, n)| (*id, n.clone()))
+            .collect();
         names.sort_by_key(|(id, _)| *id);
 
         DocumentFile {
@@ -128,10 +143,13 @@ impl Document {
     /// continuation of whatever session produced it.
     ///
     /// # Errors
-    /// [`DocError::Geom`] if the root or any label refers to a node that is not
-    /// live, which would mean the file is internally inconsistent.
+    /// [`DocError::Geom`] if the arena breaks any rule [`Arena`] enforces on
+    /// every edit, or if the root or a label refers to a node that is not live.
+    /// A file that parses but describes an inconsistent model is an error, not a
+    /// partially loaded document.
     pub fn from_snapshot(file: DocumentFile) -> Result<Self, DocError> {
         let arena = file.arena;
+        validate(&arena)?;
         if let Some(root) = file.root {
             arena.try_get(root)?;
         }
@@ -155,6 +173,40 @@ impl Document {
             open: 0,
         })
     }
+}
+
+/// Holds a deserialised arena to the rules [`Arena`] enforces on every edit.
+///
+/// `Arena`'s `Deserialize` is derived: it takes the slots exactly as the file
+/// gives them, so a file is the one way into the kernel that nothing checks. A
+/// document this build wrote is always consistent, but a file is untrusted
+/// input, and each way it can be wrong fails late and far from the cause. A
+/// child pointing at a tombstone evaluates as empty space rather than as an
+/// error. An out-of-range parameter produces an inverted bound, which
+/// under-reports and clips the part out of an export. A cycle recurses until
+/// the stack runs out.
+fn validate(arena: &Arena) -> Result<(), DocError> {
+    // Structure is the arena's own invariant, so the arena checks it: children
+    // live, no cycles, derivations live and outside their own subtree. Keeping
+    // a second copy here would let the two drift, and the arena's is the one an
+    // edit already runs.
+    arena.check_structure()?;
+
+    // Parameters are the loader's business, because only the loader knows about
+    // assets. A mesh node is still the empty placeholder its `Deserialize`
+    // produced at this point; `attach_assets` fills it in and validates it
+    // then, and rejecting it here would stop every document with an import from
+    // opening at all.
+    for id in arena.live_ids() {
+        let node = arena.try_get(id)?;
+        if !crate::mesh::is_placeholder(node) && !node.is_valid() {
+            return Err(DocError::Geom(GeomError::InvalidNode {
+                kind: node.kind(),
+                reason: "parameters out of range or non-finite".to_string(),
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Writes a document to `path` as pretty-printed JSON, with its voxel grids in

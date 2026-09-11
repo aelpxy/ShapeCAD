@@ -11,7 +11,8 @@
 use crate::arena::Arena;
 use crate::bounds::bounds;
 use crate::eval::eval;
-use crate::node::NodeId;
+use crate::node::{Node, NodeId};
+use crate::profile::Profile;
 use glam::Vec3;
 use std::collections::HashMap;
 
@@ -185,16 +186,26 @@ fn structure_of(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, u64>) -> u
                 h.write_f32(value);
             }
             // Rotation is not exposed through `params`, so fold it in explicitly.
-            if let crate::node::Node::Transform { xform, .. } = node {
+            if let Node::Transform { xform, .. } = node {
                 for c in xform.rotation.to_array() {
                     h.write_f32(c);
                 }
             }
             // Nor is a voxel grid: a mesh has no parameters at all, so without
             // this every import would hash the same as every other one.
-            if let crate::node::Node::Mesh { asset, grid } = node {
+            if let Node::Mesh { asset, grid } = node {
                 h.write_u64(u64::from(asset.0));
                 h.write_u64(grid.digest());
+            }
+            // Nor are the vertices of a freehand path, for the same reason:
+            // `Profile::params` names the dimensions of a parametric profile,
+            // and a drawn one has none, so its shape is entirely in its points.
+            if let Some(Profile::Path { points }) = swept_profile(node) {
+                h.write_u64(points.len() as u64);
+                for p in points {
+                    h.write_f32(p.x);
+                    h.write_f32(p.y);
+                }
             }
             let child_hashes: Vec<u64> = node
                 .children()
@@ -210,6 +221,14 @@ fn structure_of(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, u64>) -> u
     let out = h.finish();
     memo.insert(id, out);
     out
+}
+
+/// The region a node sweeps, for the two node kinds built from one.
+fn swept_profile(node: &Node) -> Option<&Profile> {
+    match node {
+        Node::Extrude { profile, .. } | Node::Prism { profile } => Some(profile),
+        _ => None,
+    }
 }
 
 /// Digest of the model's quantised bounding box.
@@ -248,4 +267,141 @@ pub fn field_hash(arena: &Arena, root: NodeId, grid: u32) -> u64 {
         }
     }
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounds_hash, field_hash, geometry_hash, quantize, structure_hash};
+    use crate::node::Node;
+    use crate::ops::Builder;
+    use crate::profile::Profile;
+    use glam::{Quat, Vec2, Vec3};
+
+    /// Two paths with the same number of points and no named dimensions between
+    /// them. Nothing but the coordinates tells them apart, so a hash that does
+    /// not read the coordinates cannot tell them apart at all.
+    #[test]
+    fn two_different_drawn_paths_do_not_hash_alike() {
+        let triangle = |apex: Vec2| Profile::Path {
+            points: vec![Vec2::ZERO, Vec2::new(10.0, 0.0), apex],
+        };
+        let mut a = Builder::new();
+        let one = a.extrude(triangle(Vec2::new(10.0, 6.0)), 4.0).unwrap();
+        let mut b = Builder::new();
+        let other = b.extrude(triangle(Vec2::new(10.0, 9.0)), 4.0).unwrap();
+
+        assert_ne!(
+            structure_hash(&a.arena, one),
+            structure_hash(&b.arena, other),
+            "a redrawn path hashes as the same structure"
+        );
+    }
+
+    #[test]
+    fn a_through_cut_follows_the_path_it_was_drawn_from() {
+        let path = |points: Vec<Vec2>| Node::Prism {
+            profile: Profile::Path { points },
+        };
+        let square = vec![
+            Vec2::ZERO,
+            Vec2::new(4.0, 0.0),
+            Vec2::new(4.0, 4.0),
+            Vec2::new(0.0, 4.0),
+        ];
+        let mut clipped = square.clone();
+        clipped.pop();
+
+        let mut a = Builder::new();
+        let one = a.arena.insert(path(square)).unwrap();
+        let mut b = Builder::new();
+        let other = b.arena.insert(path(clipped)).unwrap();
+        assert_ne!(
+            structure_hash(&a.arena, one),
+            structure_hash(&b.arena, other),
+            "a prism has no parameters of its own, so its profile is all there is"
+        );
+    }
+
+    #[test]
+    fn the_same_path_drawn_twice_hashes_the_same() {
+        let points = vec![Vec2::ZERO, Vec2::new(3.0, 0.0), Vec2::new(0.0, 7.0)];
+        let mut a = Builder::new();
+        let one = a
+            .extrude(
+                Profile::Path {
+                    points: points.clone(),
+                },
+                2.0,
+            )
+            .unwrap();
+        let mut b = Builder::new();
+        let other = b.extrude(Profile::Path { points }, 2.0).unwrap();
+        assert_eq!(geometry_hash(&a.arena, one), geometry_hash(&b.arena, other));
+    }
+
+    /// A rotation is not one of a transform's named parameters, so it is folded
+    /// in by hand, and this is what says the hand is still there.
+    #[test]
+    fn turning_a_feature_changes_the_hash() {
+        let mut b = Builder::new();
+        let bar = b.cuboid(Vec3::new(10.0, 2.0, 2.0)).unwrap();
+        let placed = b.rotate(bar, Quat::IDENTITY).unwrap();
+        let before = structure_hash(&b.arena, placed);
+        b.arena
+            .replace(
+                placed,
+                Node::Transform {
+                    child: bar,
+                    xform: crate::Transform::from_rotation(Quat::from_rotation_z(0.4)),
+                    on: None,
+                },
+            )
+            .unwrap();
+        assert_ne!(before, structure_hash(&b.arena, placed));
+    }
+
+    /// The field grid spans the model's own bounds, and those used to be
+    /// clamped to a thousand millimetres. Anything further out than that was
+    /// never sampled, so a part with a feature beyond the clamp hashed exactly
+    /// like the same part without it.
+    #[test]
+    fn a_feature_beyond_the_sampling_fallback_is_still_sampled() {
+        let mut b = Builder::new();
+        let hub = b.sphere(1200.0).unwrap();
+        let outrigger = b.cube(50.0).unwrap();
+        let outrigger = b.translate(outrigger, Vec3::new(2500.0, 0.0, 0.0)).unwrap();
+        let whole = b.union(hub, outrigger).unwrap();
+        assert_ne!(field_hash(&b.arena, hub, 8), field_hash(&b.arena, whole, 8));
+    }
+
+    #[test]
+    fn the_three_digests_separate_what_moved() {
+        let mut b = Builder::new();
+        let s = b.sphere(5.0).unwrap();
+        let before = geometry_hash(&b.arena, s);
+        b.arena.replace(s, Node::Sphere { radius: 6.0 }).unwrap();
+        let after = geometry_hash(&b.arena, s);
+        assert_ne!(before.structure, after.structure);
+        assert_ne!(before.field, after.field);
+        assert_ne!(before.bounds, after.bounds);
+        assert_ne!(before.combined(), after.combined());
+        assert_eq!(after.short().len(), 16);
+    }
+
+    #[test]
+    fn an_unbounded_model_still_hashes() {
+        let mut b = Builder::new();
+        let cut = b.plane(Vec3::Z, 0.0).unwrap();
+        let h = geometry_hash(&b.arena, cut);
+        assert_eq!(h, geometry_hash(&b.arena, cut), "the same model twice");
+        assert_ne!(bounds_hash(&b.arena, cut), 0);
+    }
+
+    #[test]
+    fn quantization_keeps_the_non_finite_values_apart() {
+        assert_ne!(quantize(f32::INFINITY), quantize(f32::NEG_INFINITY));
+        assert_ne!(quantize(f32::NAN), quantize(f32::INFINITY));
+        assert_eq!(quantize(0.0), quantize(-0.0));
+        assert_eq!(quantize(1.0), 10_000);
+    }
 }

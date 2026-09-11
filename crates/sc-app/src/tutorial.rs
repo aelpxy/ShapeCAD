@@ -34,10 +34,35 @@ impl Mark {
             nodes: state.doc.arena().len(),
             log: state.doc.log_len(),
             cuts: cuts(state),
-            yaw: state.camera().yaw,
-            pitch: state.camera().pitch,
+            // The goal rather than the visible camera. The rig eases toward it,
+            // so a camera still in flight when the step began would go on
+            // turning by itself and tick the step off with nobody touching
+            // anything. The goal only moves when the user moves it.
+            yaw: state.rig.goal.yaw,
+            pitch: state.rig.goal.pitch,
             hash: state.doc.hash(),
         }
+    }
+
+    /// Keeps the mark reachable from where the document now is.
+    ///
+    /// A step asks for more nodes, or more cuts, than there were when it began.
+    /// The document underneath can be replaced while the card is showing: File
+    /// then New, opening a file, loading a sample. That leaves a mark describing
+    /// a document that no longer exists, and a beginner holding a card that can
+    /// never be ticked off, in the one part of the application they cannot
+    /// leave. Following the document down whenever it has fewer of something
+    /// than the mark does costs nothing when it has not, and can never skip a
+    /// step, because no condition asks for *fewer* than the mark.
+    ///
+    /// The log goes the other way: the last step asks for it to shrink, so the
+    /// mark follows it up instead, and a document loaded mid-step can still be
+    /// undone out of.
+    fn rebase(&mut self, state: &AppState) {
+        let now = Self::of(state);
+        self.nodes = self.nodes.min(now.nodes);
+        self.cuts = self.cuts.min(now.cuts);
+        self.log = self.log.max(now.log);
     }
 }
 
@@ -91,8 +116,8 @@ pub(crate) const STEPS: [Step; 5] = [
         title: "Look around it",
         body: "Drag in the viewport to orbit, scroll to zoom, and right-drag to pan. The X, Y and Z buttons above snap you back to a square-on view.",
         done: |mark, state| {
-            (state.camera().yaw - mark.yaw).abs() > TURNED
-                || (state.camera().pitch - mark.pitch).abs() > TURNED
+            (state.rig.goal.yaw - mark.yaw).abs() > TURNED
+                || (state.rig.goal.pitch - mark.pitch).abs() > TURNED
         },
     },
     Step {
@@ -108,7 +133,11 @@ pub(crate) const STEPS: [Step; 5] = [
     Step {
         title: "Take it back",
         body: "Press Ctrl+Z. One press undoes one thing you did, however many operations it took underneath.",
-        done: |mark, state| state.doc.log_len() < mark.log,
+        // A shorter log alone would also be true of a document that was
+        // replaced, which would tick this off without anything being undone.
+        // Undoing always leaves something to redo, and starting or opening a
+        // document never does, so the two together say an undo happened.
+        done: |mark, state| state.doc.log_len() < mark.log && state.doc.can_redo(),
     },
 ];
 
@@ -154,6 +183,7 @@ impl Tutorial {
         let Some(step) = self.step() else {
             return false;
         };
+        self.mark.rebase(state);
         if !(step.done)(self.mark, state) {
             return false;
         }
@@ -295,6 +325,115 @@ mod tests {
         tutorial.skip_step(&state);
         assert_eq!(tutorial.at, STEPS.len(), "skipping ran off the end");
         assert!(tutorial.finished());
+    }
+
+    /// Moves to the step at `index` the way a user who knows it all would.
+    fn at_step(state: &AppState, index: usize) -> Tutorial {
+        let mut tutorial = Tutorial::start(state);
+        for _ in 0..index {
+            tutorial.skip_step(state);
+        }
+        assert_eq!(tutorial.at, index);
+        tutorial
+    }
+
+    /// The document can be replaced while a card is showing: File then New,
+    /// opening a file, loading the sample. The mark then describes a document
+    /// that no longer exists, and "more nodes than there were" is a bar the new
+    /// one may never clear. That leaves a beginner holding a card that cannot be
+    /// ticked off, in the one part of the application they cannot leave.
+    #[test]
+    fn starting_a_new_document_cannot_strand_the_first_step() {
+        let mut state = AppState::new();
+        state.load_sample();
+        let mut tutorial = Tutorial::start(&state);
+
+        state.new_document();
+        assert!(!tutorial.advance(&state), "an empty document added nothing");
+
+        state.add_body(Node::Sphere { radius: 4.0 }, "Ball");
+        assert!(
+            tutorial.advance(&state),
+            "a solid was added and the step could not see it"
+        );
+    }
+
+    /// The same thing one card further on, where the bar is a count of cuts.
+    #[test]
+    fn starting_a_new_document_cannot_strand_the_cut_step() {
+        let mut state = AppState::new();
+        state.load_sample();
+        let mut tutorial = at_step(&state, 3);
+        assert_eq!(STEPS[3].title, "Cut a hole");
+
+        state.new_document();
+        state.add_body(
+            Node::Box {
+                half: Vec3::splat(10.0),
+                round: 0.0,
+            },
+            "Block",
+        );
+        assert!(!tutorial.advance(&state), "nothing has been cut yet");
+
+        state.arm(Armed {
+            kind: Placing::Pocket,
+            profile: sc_geom::Profile::Circle { radius: 3.0 },
+            label: "Hole",
+        });
+        state.place_armed(Vec2::ZERO);
+        assert!(
+            tutorial.advance(&state),
+            "a hole was cut and the step could not see it"
+        );
+    }
+
+    /// And on the last card, where the log is the measure. A document loaded
+    /// here has a log of its own, longer or shorter than the one the mark was
+    /// taken from, and neither may be undone out of.
+    #[test]
+    fn loading_a_document_neither_satisfies_nor_strands_the_undo_step() {
+        let mut state = AppState::new();
+        state.new_document();
+        let mut tutorial = at_step(&state, 4);
+        assert_eq!(STEPS[4].title, "Take it back");
+
+        state.load_sample();
+        assert!(
+            !tutorial.advance(&state),
+            "loading a document is not undoing anything"
+        );
+
+        state.undo();
+        assert!(
+            tutorial.advance(&state),
+            "the user undid something and the step could not see it"
+        );
+    }
+
+    /// The camera is a rig: input moves the goal and the visible camera eases
+    /// after it. A step that watches the visible camera ticks itself off while
+    /// the pointer is nowhere near, because a camera still in flight when the
+    /// card appeared goes on turning by itself.
+    #[test]
+    fn a_camera_still_easing_is_not_the_user_looking_around() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.rig.goal.yaw += 1.0;
+        let mut tutorial = at_step(&state, 1);
+        assert_eq!(STEPS[1].title, "Look around it");
+
+        // Two seconds of frames with nobody touching anything.
+        for _ in 0..120 {
+            state.rig.advance(1.0 / 60.0);
+        }
+        assert!(
+            !tutorial.advance(&state),
+            "the camera arrived on its own and the step counted it"
+        );
+
+        state.rig.goal.yaw += 1.0;
+        assert!(tutorial.advance(&state), "orbiting did not count");
     }
 
     /// Every card has something on it. An empty step is a dead end that looks
