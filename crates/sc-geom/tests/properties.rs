@@ -296,8 +296,15 @@ proptest! {
     #[test]
     fn every_tree_generates_valid_wgsl(s in arb_shape(true)) {
         let (arena, root) = build(&s);
-        let src = sc_geom::wgsl::generate(&arena, Some(root));
-        let module = naga::front::wgsl::parse_str(&src)
+        let generated = sc_geom::wgsl::generate(&arena, Some(root));
+        let src = &generated.source;
+        // No model value appears in the source, so a bad number cannot reach the
+        // shader as a literal. It has to be finite in the buffer instead.
+        prop_assert!(
+            generated.params.iter().all(|v| v.is_finite()),
+            "non-finite parameter for {s:?}"
+        );
+        let module = naga::front::wgsl::parse_str(src)
             .unwrap_or_else(|e| panic!("WGSL parse failed: {e:?}\n{src}"));
         let mut v = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),

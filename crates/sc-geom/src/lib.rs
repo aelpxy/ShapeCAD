@@ -20,6 +20,7 @@ pub mod hash;
 pub mod math;
 pub mod node;
 pub mod ops;
+pub mod pick;
 pub mod wgsl;
 
 pub use arena::Arena;
@@ -30,6 +31,7 @@ pub use hash::{geometry_hash, GeometryHash};
 pub use math::Transform;
 pub use node::{Node, NodeId};
 pub use ops::Builder;
+pub use pick::{pick, Hit};
 
 pub use glam;
 
@@ -344,20 +346,116 @@ mod tests {
         let joined = b.union(sh, ex).unwrap();
         let root = b.union(joined, pl).unwrap();
 
-        let src = wgsl::generate(&b.arena, Some(root));
-        assert!(src.contains("fn sc_sdf(p: vec3<f32>) -> f32"));
+        let generated = wgsl::generate(&b.arena, Some(root));
+        assert!(generated.source.contains("fn sc_sdf(p: vec3<f32>) -> f32"));
+        // Every model value lives in the buffer, so the source carries no
+        // numeric literal that could be a stray NaN or infinity.
+        assert!(!generated.params.is_empty(), "no parameters were bound");
         assert!(
-            !src.contains("NaN") && !src.contains("inf"),
-            "bad literal in:\n{src}"
+            generated.params.iter().all(|v| v.is_finite()),
+            "non-finite parameter in {:?}",
+            generated.params
+        );
+    }
+
+    #[test]
+    fn changing_a_value_does_not_change_the_shader() {
+        // The whole point of binding values to a buffer: a parameter edit must
+        // be an upload, never a recompile.
+        let mut b = Builder::new();
+        let s = b.sphere(5.0).unwrap();
+        let before = wgsl::generate(&b.arena, Some(s));
+
+        b.arena.replace(s, Node::Sphere { radius: 9.0 }).unwrap();
+        let after = wgsl::generate(&b.arena, Some(s));
+
+        assert_eq!(
+            before.source, after.source,
+            "a radius edit rebuilt the shader"
+        );
+        assert_ne!(
+            before.params, after.params,
+            "the new radius never reached the buffer"
+        );
+        assert!(after.params.contains(&9.0), "{:?}", after.params);
+    }
+
+    #[test]
+    fn moving_a_sketch_point_does_not_change_the_shader() {
+        let square = |x: f32| {
+            vec![
+                glam::Vec2::new(-5.0, -5.0),
+                glam::Vec2::new(x, -5.0),
+                glam::Vec2::new(x, 5.0),
+                glam::Vec2::new(-5.0, 5.0),
+            ]
+        };
+        let mut b = Builder::new();
+        let e = b.extrude(square(5.0), 10.0).unwrap();
+        let before = wgsl::generate(&b.arena, Some(e));
+
+        b.arena
+            .replace(
+                e,
+                Node::Extrude {
+                    profile: square(8.0),
+                    height: 10.0,
+                },
+            )
+            .unwrap();
+        let after = wgsl::generate(&b.arena, Some(e));
+
+        assert_eq!(
+            before.source, after.source,
+            "dragging a point rebuilt the shader"
+        );
+        assert!(after.params.contains(&8.0));
+    }
+
+    #[test]
+    fn changing_the_shape_of_the_model_does_change_the_shader() {
+        let mut b = Builder::new();
+        let s = b.sphere(5.0).unwrap();
+        let before = wgsl::generate(&b.arena, Some(s));
+
+        let c = b.cube(2.0).unwrap();
+        let u = b.union(s, c).unwrap();
+        let after = wgsl::generate(&b.arena, Some(u));
+        assert_ne!(before.source, after.source, "adding a node must rebuild");
+    }
+
+    #[test]
+    fn crossing_a_peephole_threshold_rebuilds() {
+        // An identity scale emits no multiply at all. Moving off 1.0 has to
+        // bring that arithmetic back, which is a source change, not a value one.
+        let mut b = Builder::new();
+        let s = b.sphere(1.0).unwrap();
+        let t = b.transform(s, Transform::from_scale(1.0)).unwrap();
+        let identity = wgsl::generate(&b.arena, Some(t));
+
+        b.arena
+            .replace(
+                t,
+                Node::Transform {
+                    child: s,
+                    xform: Transform::from_scale(2.0),
+                },
+            )
+            .unwrap();
+        let scaled = wgsl::generate(&b.arena, Some(t));
+
+        assert_ne!(
+            identity.source, scaled.source,
+            "the dropped multiply never came back"
         );
     }
 
     #[test]
     fn wgsl_handles_an_empty_document() {
         let arena = Arena::new();
-        let src = wgsl::generate(&arena, None);
-        assert!(src.contains("fn sc_sdf"));
-        validate_wgsl(&src);
+        let generated = wgsl::generate(&arena, None);
+        assert!(generated.source.contains("fn sc_sdf"));
+        validate_wgsl(&generated.source);
     }
 
     /// Parse and type-check generated WGSL the same way wgpu will at runtime.
@@ -412,7 +510,7 @@ mod tests {
     #[test]
     fn generated_wgsl_compiles() {
         let (b, root) = kitchen_sink();
-        validate_wgsl(&wgsl::generate(&b.arena, Some(root)));
+        validate_wgsl(&wgsl::generate(&b.arena, Some(root)).source);
     }
 
     #[test]
@@ -421,18 +519,23 @@ mod tests {
         let s = b.sphere(1.0).unwrap();
         // A pure translation: no rotation, no scale, no rounding.
         let t = b.translate(s, Vec3::new(5.0, 0.0, 0.0)).unwrap();
-        let src = wgsl::generate(&b.arena, Some(t));
+        let generated = wgsl::generate(&b.arena, Some(t));
+        let src = &generated.source;
 
         assert!(!src.contains("* 1.0"), "identity scale survived:\n{src}");
         assert!(
             !src.split("fn sc_sdf").nth(1).unwrap().contains("sc_qrot"),
             "identity rotation survived:\n{src}"
         );
+        // The translation is bound rather than inlined, so the source should only
+        // show the subtraction and the value should appear in the buffer.
+        assert!(src.contains(" - vec3<f32>("), "translation lost:\n{src}");
         assert!(
-            src.contains("vec3<f32>(5.0, 0.0, 0.0)"),
-            "translation lost:\n{src}"
+            generated.params.contains(&5.0),
+            "translation not bound: {:?}",
+            generated.params
         );
-        validate_wgsl(&src);
+        validate_wgsl(src);
     }
 
     #[test]
@@ -441,7 +544,7 @@ mod tests {
         // it does pin that both backends were handed the same tree and that the
         // shader is well-formed for every node kind the evaluator supports.
         let (b, root) = kitchen_sink();
-        let src = wgsl::generate(&b.arena, Some(root));
+        let src = wgsl::generate(&b.arena, Some(root)).source;
         for kind in ["length", "max", "min", "sc_smin", "sc_qrot"] {
             assert!(src.contains(kind), "codegen missing {kind}:\n{src}");
         }

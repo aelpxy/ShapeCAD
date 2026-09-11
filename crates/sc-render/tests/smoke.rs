@@ -31,11 +31,21 @@ fn the_reference_part_renders() {
     let centre = px(160, 100);
     assert_ne!(corner, centre, "nothing was rendered");
 
-    // The part is lit and pale; the background is dark. This catches a shader
-    // that compiles and runs but shades everything black.
+    // Deliberately not asserting which of the two is brighter. That depends on
+    // the palette, and an earlier version of this test hard-coded "the part is
+    // pale, the background is dark" and then silently failed for several
+    // sessions once the viewport moved to a light theme.
+    //
+    // What actually matters is that shading ran: the part is clearly separated
+    // from the background, and is neither black nor the background colour.
     let brightness = |c: [u8; 3]| u32::from(c[0]) + u32::from(c[1]) + u32::from(c[2]);
+    let separation = brightness(centre).abs_diff(brightness(corner));
     assert!(
-        brightness(centre) > brightness(corner),
-        "the part ({centre:?}) is not brighter than the background ({corner:?})"
+        separation > 60,
+        "part {centre:?} and background {corner:?} are too close to tell apart"
+    );
+    assert!(
+        brightness(centre) > 60,
+        "the part rendered essentially black: {centre:?}"
     );
 }

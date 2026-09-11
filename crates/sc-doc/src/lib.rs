@@ -82,7 +82,7 @@ impl Document {
 
     /// The generated shader source for the current model.
     #[must_use]
-    pub fn wgsl(&self) -> String {
+    pub fn wgsl(&self) -> wgsl::Generated {
         wgsl::generate(&self.arena, self.root)
     }
 

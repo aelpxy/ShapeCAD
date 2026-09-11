@@ -5,6 +5,7 @@
 //! top in a second pass. No intermediate texture, no copy.
 
 mod dialog;
+mod plane;
 mod settings;
 mod snapshot;
 mod state;
@@ -77,6 +78,10 @@ fn monitor_width(event_loop: &ActiveEventLoop, window: &Window) -> u32 {
         })
         .unwrap_or(0)
 }
+
+/// How far the pointer may move between press and release and still count as a
+/// click, in physical pixels.
+const CLICK_SLOP: f64 = 5.0;
 
 /// Whether a pointer position belongs to the 3D view rather than to chrome.
 ///
@@ -260,14 +265,15 @@ impl App {
         self.viewport = to_pixels(chrome.viewport);
         self.overlays = chrome.overlays.iter().map(|r| to_pixels(*r)).collect();
 
-        // 2. Regenerate the shader if the model changed. Parameters are compiled
-        //    in as literals today, so every edit pays this; the status bar shows
-        //    the cost, and moving the numeric leaves into a uniform buffer is the
-        //    fix when it starts to hurt.
+        // 2. Push the model to the GPU if it changed. Values live in a buffer,
+        //    so most edits are an upload; only a change to the generated source
+        //    costs a pipeline rebuild.
         if self.state.field_dirty {
             let started = std::time::Instant::now();
-            gpu.field.set_field(&gpu.device, &self.state.wgsl());
-            self.state.last_rebuild_ms = started.elapsed().as_secs_f32() * 1000.0;
+            let generated = self.state.wgsl();
+            let rebuilt = gpu.field.update(&gpu.device, &gpu.queue, &generated);
+            self.state.last_edit_ms = started.elapsed().as_secs_f32() * 1000.0;
+            self.state.last_edit_rebuilt = rebuilt;
             self.state.field_dirty = false;
         }
 
@@ -381,6 +387,29 @@ impl App {
         self.state.status = "Focused".to_string();
     }
 
+    /// How far the pointer travelled since the button went down.
+    ///
+    /// A press and release in the same place is a click; anything further was a
+    /// drag, and the camera has already acted on it.
+    fn drag_distance(&self) -> f64 {
+        match (self.press_at, self.cursor) {
+            (Some(a), Some(b)) => ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt(),
+            _ => f64::MAX,
+        }
+    }
+
+    /// Selects whatever is under the pointer, or clears the selection.
+    fn select_under_pointer(&mut self) {
+        let Some((ndc, aspect)) = self.pointer_ndc() else {
+            return;
+        };
+        let [_, _, _, height] = self.viewport;
+        // A few pixels' worth of world units, so a click near an edge reads as
+        // the seam rather than demanding sub-millimetre accuracy.
+        let tolerance = (self.state.camera().world_per_pixel(height) * 4.0).max(0.01);
+        self.state.select_at(ndc, aspect, tolerance);
+    }
+
     /// Places a sketch point where the pointer meets the build plate.
     fn place_sketch_point(&mut self) {
         let Some(cursor) = self.cursor else { return };
@@ -390,9 +419,17 @@ impl App {
             1.0 - ((cursor.y as f32 - top) / height) * 2.0,
         );
         let aspect = width / height.max(1.0);
-        match self.state.camera().plate_hit(ndc, aspect) {
-            Some(hit) => self.state.add_sketch_point(Vec2::new(hit.x, hit.y)),
-            None => self.state.status = "That is not on the build plate".to_string(),
+        let plane = self.state.plane;
+        match self
+            .state
+            .camera()
+            .plane_hit(ndc, aspect, sc_geom::glam::Vec3::ZERO, plane.normal())
+        {
+            Some(hit) => {
+                let snapped = self.state.snap(plane.to_plane(hit));
+                self.state.add_sketch_point(snapped);
+            }
+            None => self.state.status = format!("That is not on the {} plane", plane.name()),
         }
     }
 
@@ -409,12 +446,15 @@ impl App {
                     self.press_at = self.cursor;
                 } else if self.state.sketch.is_some() {
                     // A click places a point; a drag orbited instead.
-                    let moved = match (self.press_at, self.cursor) {
-                        (Some(a), Some(b)) => ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt(),
-                        _ => f64::MAX,
-                    };
-                    if moved < 5.0 {
+                    if self.drag_distance() < CLICK_SLOP {
                         self.place_sketch_point();
+                        self.request_redraw();
+                    }
+                } else if !down {
+                    // A click rather than a drag, with the pointer tool armed:
+                    // select whatever is under it.
+                    if self.drag_distance() < CLICK_SLOP && self.pointer_in_viewport() {
+                        self.select_under_pointer();
                         self.request_redraw();
                     }
                 }
@@ -496,7 +536,7 @@ impl ApplicationHandler for App {
         config.present_mode = wgpu::PresentMode::Fifo;
         surface.configure(&device, &config);
 
-        let field = Renderer::new(&device, config.format, &self.state.wgsl());
+        let field = Renderer::new(&device, &queue, config.format, &self.state.wgsl());
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
             config.format,

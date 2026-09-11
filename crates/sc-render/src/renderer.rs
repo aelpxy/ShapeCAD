@@ -7,6 +7,7 @@
 use crate::camera::OrbitCamera;
 use crate::shader;
 use bytemuck::{Pod, Zeroable};
+use sc_geom::wgsl::Generated;
 
 /// Camera parameters in the layout the shader consumes.
 ///
@@ -45,17 +46,34 @@ impl CameraUniform {
 pub struct Renderer {
     format: wgpu::TextureFormat,
     uniform: wgpu::Buffer,
+    /// Model values, read by the generated shader.
+    params: wgpu::Buffer,
+    /// Floats the parameter buffer can hold before it must be reallocated.
+    params_capacity: usize,
+    bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     pipeline_layout: wgpu::PipelineLayout,
     pipeline: wgpu::RenderPipeline,
+    /// The source the current pipeline was built from.
+    ///
+    /// Model values live in the buffer, so identical source means only values
+    /// moved and the pipeline can stand.
+    source: String,
 }
 
 impl Renderer {
-    /// Builds a renderer for a given surface format and field.
+    /// Builds a renderer for a given surface format and generated field.
     ///
-    /// `field_wgsl` is the output of `sc_geom::wgsl::generate`.
+    /// Uploads the field's values as part of construction. Leaving that to the
+    /// caller meant a renderer that compiled the right shader and then drew
+    /// nothing, because every parameter was still zero.
     #[must_use]
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, field_wgsl: &str) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        field: &Generated,
+    ) -> Self {
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sc-render camera"),
             size: std::mem::size_of::<CameraUniform>() as u64,
@@ -63,28 +81,36 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let params_capacity = field.params.len().max(1);
+        let params = new_param_buffer(device, params_capacity);
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sc-render bind group layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sc-render bind group"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }],
-        });
+        let bind_group = make_bind_group(device, &bind_group_layout, &uniform, &params);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sc-render pipeline layout"),
@@ -92,24 +118,57 @@ impl Renderer {
             immediate_size: 0,
         });
 
-        let pipeline = build_pipeline(device, &pipeline_layout, format, field_wgsl);
+        if !field.params.is_empty() {
+            queue.write_buffer(&params, 0, bytemuck::cast_slice(&field.params));
+        }
+
+        let pipeline = build_pipeline(device, &pipeline_layout, format, &field.source);
 
         Self {
             format,
             uniform,
+            params,
+            params_capacity,
+            bind_group_layout,
             bind_group,
             pipeline_layout,
             pipeline,
+            source: field.source.clone(),
         }
     }
 
-    /// Recompiles the pipeline for a new field.
+    /// Applies a newly generated field.
     ///
-    /// Called whenever the document's topology changes. Numeric edits will
-    /// eventually go through a uniform buffer instead, since recompiling a
-    /// shader per frame is far too slow for dragging a value.
-    pub fn set_field(&mut self, device: &wgpu::Device, field_wgsl: &str) {
-        self.pipeline = build_pipeline(device, &self.pipeline_layout, self.format, field_wgsl);
+    /// Recompiles only when the source actually changed. Because no model value
+    /// appears in the source, editing a radius or dragging a sketch point is a
+    /// buffer write; adding a node, or a value crossing a threshold that changes
+    /// which peepholes apply, is a rebuild.
+    ///
+    /// Returns true if the pipeline was rebuilt, which callers report as the
+    /// cost of the edit.
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        field: &Generated,
+    ) -> bool {
+        if field.params.len() > self.params_capacity {
+            // Grow generously; profiles tend to gain a point at a time.
+            self.params_capacity = field.params.len().next_power_of_two();
+            self.params = new_param_buffer(device, self.params_capacity);
+            self.bind_group =
+                make_bind_group(device, &self.bind_group_layout, &self.uniform, &self.params);
+        }
+        if !field.params.is_empty() {
+            queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&field.params));
+        }
+
+        if self.source == field.source {
+            return false;
+        }
+        self.pipeline = build_pipeline(device, &self.pipeline_layout, self.format, &field.source);
+        self.source.clone_from(&field.source);
+        true
     }
 
     /// Records a draw covering the whole target.
@@ -182,6 +241,38 @@ impl Renderer {
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
+}
+
+/// A storage buffer able to hold `capacity` floats.
+fn new_param_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sc-render parameters"),
+        size: (capacity.max(1) * std::mem::size_of::<f32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn make_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform: &wgpu::Buffer,
+    params: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sc-render bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: params.as_entire_binding(),
+            },
+        ],
+    })
 }
 
 fn build_pipeline(

@@ -62,7 +62,9 @@ fn demo(show_wgsl: bool) {
 
     if show_wgsl {
         println!("\n=== wgsl ===");
-        print!("{}", d.wgsl());
+        let generated = d.wgsl();
+        print!("{}", generated.source);
+        println!("// {} bound parameters", generated.params.len());
     }
 }
 

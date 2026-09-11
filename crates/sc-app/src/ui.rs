@@ -6,6 +6,7 @@
 //! intermediate texture.
 
 use crate::dialog::{Outcome, Purpose};
+use crate::plane::SketchPlane;
 use crate::state::{AppState, TOOL_SELECT, TOOL_SKETCH};
 use crate::theme;
 use egui::{Align, Layout, Margin, RichText, Vec2};
@@ -61,6 +62,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, state: &mut AppState) -> Chrome {
                 viewport: rect,
                 overlays: Vec::new(),
             };
+            datum_planes(ui, state, rect, &mut layout.overlays);
             overlays(ui, state, rect, &mut layout.overlays);
             sketch_overlay(ui, state, rect, &mut layout.overlays);
             layout
@@ -240,8 +242,13 @@ fn status_bar(ui: &mut egui::Ui, state: &AppState) {
                         );
                         ui.add_space(10.0);
                     }
+                    let how = if state.last_edit_rebuilt {
+                        "rebuild"
+                    } else {
+                        "upload"
+                    };
                     ui.label(
-                        RichText::new(format!("shader {:.0} ms", state.last_rebuild_ms))
+                        RichText::new(format!("{how} {:.1} ms", state.last_edit_ms))
                             .size(11.5)
                             .color(theme::TEXT_DIM),
                     );
@@ -356,6 +363,30 @@ fn tool_grid(ui: &mut egui::Ui, state: &mut AppState, primitives: bool) {
     let size = Vec2::new(width, 34.0);
 
     if primitives {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Plane").size(12.0).color(theme::TEXT_DIM));
+            for plane in SketchPlane::ALL {
+                let active = state.plane == plane;
+                let text = RichText::new(plane.name()).size(12.5).color(if active {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT_DIM
+                });
+                let button = egui::Button::new(text)
+                    .fill(if active {
+                        theme::ACCENT_SOFT
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .min_size(Vec2::new(40.0, 26.0));
+                if ui.add(button).clicked() {
+                    state.set_plane(plane);
+                }
+            }
+        });
+        ui.add_space(4.0);
+
         // Sketching is the main way to make something, so it gets its own row
         // rather than competing with the primitives for space.
         let full = Vec2::new(ui.available_width(), 34.0);
@@ -605,6 +636,137 @@ fn overlays(
     });
 }
 
+/// Half-width of a datum plane as drawn, in millimetres.
+const PLANE_EXTENT: f32 = 45.0;
+
+/// Draws the three origin planes and lets one be picked.
+///
+/// Shown while the document is empty or a sketch is in progress, which is when
+/// the choice is live. Once there is a model they would only be in the way, and
+/// the panel still offers them.
+fn datum_planes(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    viewport: egui::Rect,
+    claimed: &mut Vec<egui::Rect>,
+) {
+    if state.doc.root().is_some() && state.sketch.is_none() {
+        return;
+    }
+
+    let aspect = viewport.width() / viewport.height().max(1.0);
+    let camera = state.camera();
+    let painter = ui.painter_at(viewport);
+    let mut picked = None;
+
+    for plane in SketchPlane::ALL {
+        let corners: Option<Vec<egui::Pos2>> = [
+            GVec2::new(-PLANE_EXTENT, -PLANE_EXTENT),
+            GVec2::new(PLANE_EXTENT, -PLANE_EXTENT),
+            GVec2::new(PLANE_EXTENT, PLANE_EXTENT),
+            GVec2::new(-PLANE_EXTENT, PLANE_EXTENT),
+        ]
+        .iter()
+        .map(|c| {
+            camera.project(plane.to_world(*c), aspect).map(|ndc| {
+                egui::pos2(
+                    viewport.min.x + (ndc.x * 0.5 + 0.5) * viewport.width(),
+                    viewport.min.y + (0.5 - ndc.y * 0.5) * viewport.height(),
+                )
+            })
+        })
+        .collect();
+        let Some(corners) = corners else { continue };
+
+        let active = state.plane == plane;
+        let hovered = ui
+            .ctx()
+            .pointer_latest_pos()
+            .is_some_and(|p| viewport.contains(p) && contains(&corners, p));
+
+        let fill = if active {
+            theme::ACCENT.gamma_multiply(0.16)
+        } else if hovered {
+            theme::ACCENT.gamma_multiply(0.10)
+        } else {
+            theme::TEXT_DIM.gamma_multiply(0.05)
+        };
+        let edge = if active || hovered {
+            theme::ACCENT
+        } else {
+            theme::BORDER
+        };
+        painter.add(egui::Shape::convex_polygon(
+            corners.clone(),
+            fill,
+            egui::Stroke::new(if active { 2.0 } else { 1.0 }, edge),
+        ));
+
+        // Label the corner nearest the top left of its own quad.
+        let anchor = corners
+            .iter()
+            .copied()
+            .min_by(|a, b| (a.x + a.y).total_cmp(&(b.x + b.y)))
+            .unwrap_or(viewport.center());
+        label(&painter, anchor + Vec2::new(18.0, 12.0), plane.name());
+
+        if hovered {
+            let bbox = egui::Rect::from_points(&corners);
+            claimed.push(bbox);
+            let response = ui.interact(
+                bbox,
+                egui::Id::new(("datum", plane.name())),
+                egui::Sense::click(),
+            );
+            if response.clicked() {
+                picked = Some(plane);
+            }
+        }
+    }
+
+    if let Some(plane) = picked {
+        state.set_plane(plane);
+    }
+}
+
+/// Point in convex polygon, by consistent turn direction.
+fn contains(polygon: &[egui::Pos2], point: egui::Pos2) -> bool {
+    let mut positive = false;
+    let mut negative = false;
+    for i in 0..polygon.len() {
+        let a = polygon[i];
+        let b = polygon[(i + 1) % polygon.len()];
+        let cross = (b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x);
+        if cross > 0.0 {
+            positive = true;
+        } else if cross < 0.0 {
+            negative = true;
+        }
+        if positive && negative {
+            return false;
+        }
+    }
+    true
+}
+
+/// A small readout chip, legible over whatever the viewport is showing.
+fn label(painter: &egui::Painter, at: egui::Pos2, text: &str) {
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(11.0),
+        theme::TEXT,
+    );
+    let rect = egui::Rect::from_center_size(at, galley.size() + Vec2::new(10.0, 6.0));
+    painter.rect_filled(rect, egui::CornerRadius::same(5), theme::SURFACE);
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(5),
+        egui::Stroke::new(1.0, theme::BORDER),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.center() - galley.size() * 0.5, galley, theme::TEXT);
+}
+
 /// Maps a point in the viewport to normalised device coordinates.
 pub(crate) fn ndc_of(pos: egui::Pos2, viewport: egui::Rect) -> GVec2 {
     GVec2::new(
@@ -635,9 +797,13 @@ fn sketch_overlay(
 
     let painter = ui.painter_at(viewport);
     let stroke = egui::Stroke::new(2.0, theme::ACCENT);
+    // Sketch coordinates are in the plane's own frame, not always on XY. Lifting
+    // them with `Vec3::new(p.x, p.y, 0.0)` draws a profile on XZ or YZ in
+    // entirely the wrong place.
+    let plane = state.plane;
     let screen: Vec<egui::Pos2> = points
         .iter()
-        .filter_map(|p| to_screen(Vec3::new(p.x, p.y, 0.0)))
+        .filter_map(|p| to_screen(plane.to_world(*p)))
         .collect();
 
     for pair in screen.windows(2) {
@@ -651,14 +817,44 @@ fn sketch_overlay(
         );
     }
 
-    // Rubber band to wherever the pointer is on the plate.
-    if let (Some(&last), Some(cursor)) = (screen.last(), ui.ctx().pointer_latest_pos()) {
+    // Rubber band to wherever the pointer is on the plate, labelled with the
+    // length it would add. A profile is only dimensioned if you can see the
+    // dimension while you place it.
+    if let Some(cursor) = ui.ctx().pointer_latest_pos() {
         if viewport.contains(cursor) {
-            if let Some(hit) = state.camera().plate_hit(ndc_of(cursor, viewport), aspect) {
-                if let Some(preview) = to_screen(hit) {
-                    painter.line_segment(
-                        [last, preview],
-                        egui::Stroke::new(1.5, theme::ACCENT.gamma_multiply(0.45)),
+            if let Some(hit) = state.camera().plane_hit(
+                ndc_of(cursor, viewport),
+                aspect,
+                Vec3::ZERO,
+                plane.normal(),
+            ) {
+                let snapped = state.snap(plane.to_plane(hit));
+                let world = plane.to_world(snapped);
+                if let Some(preview) = to_screen(world) {
+                    if let Some(&last) = screen.last() {
+                        painter.line_segment(
+                            [last, preview],
+                            egui::Stroke::new(1.5, theme::ACCENT.gamma_multiply(0.45)),
+                        );
+                        let length =
+                            (snapped - *points.last().expect("screen is non-empty")).length();
+                        label(
+                            &painter,
+                            last.lerp(preview, 0.5),
+                            &format!("{length:.1} mm"),
+                        );
+                    }
+                    // The snapped position itself, so a point can be placed at a
+                    // known coordinate rather than wherever the pixel landed.
+                    painter.circle_stroke(
+                        preview,
+                        3.5,
+                        egui::Stroke::new(1.5, theme::ACCENT.gamma_multiply(0.7)),
+                    );
+                    label(
+                        &painter,
+                        preview + Vec2::new(12.0, 14.0),
+                        &format!("{:.0}, {:.0}", snapped.x, snapped.y),
                     );
                 }
             }
@@ -690,9 +886,12 @@ fn sketch_overlay(
                         .family(theme::semibold()),
                 );
                 ui.label(
-                    RichText::new("Enter to extrude · Backspace undo · Esc cancel")
-                        .size(11.5)
-                        .color(theme::TEXT_DIM),
+                    RichText::new(format!(
+                        "{:.0} mm grid · Enter to extrude · Backspace undo · Esc cancel",
+                        state.grid
+                    ))
+                    .size(11.5)
+                    .color(theme::TEXT_DIM),
                 );
             });
         });

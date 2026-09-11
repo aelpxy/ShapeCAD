@@ -178,12 +178,43 @@ impl OrbitCamera {
     /// which is what happens when the user clicks the sky.
     #[must_use]
     pub fn plate_hit(&self, ndc: Vec2, aspect: f32) -> Option<Vec3> {
-        let (origin, dir) = self.ray(ndc, aspect);
-        if dir.z.abs() < 1.0e-6 {
+        self.plane_hit(ndc, aspect, Vec3::ZERO, Vec3::Z)
+    }
+
+    /// Where a ray through `ndc` meets an arbitrary plane.
+    ///
+    /// `None` when the ray runs parallel to the plane or meets it behind the
+    /// camera. Sketching on a datum plane is this, with the plane's own normal.
+    #[must_use]
+    pub fn plane_hit(&self, ndc: Vec2, aspect: f32, origin: Vec3, normal: Vec3) -> Option<Vec3> {
+        let (eye, dir) = self.ray(ndc, aspect);
+        let denom = dir.dot(normal);
+        if denom.abs() < 1.0e-6 {
             return None;
         }
-        let t = -origin.z / dir.z;
-        (t > 0.0).then(|| origin + dir * t)
+        let t = (origin - eye).dot(normal) / denom;
+        (t > 0.0).then(|| eye + dir * t)
+    }
+
+    /// Points the camera straight down `normal`, keeping its distance.
+    ///
+    /// Used when a sketch begins: drawing in two dimensions only makes sense if
+    /// the plane is facing you.
+    pub fn look_along(&mut self, normal: Vec3) {
+        let dir = normal.normalize_or_zero();
+        if dir == Vec3::ZERO {
+            return;
+        }
+        self.pitch = dir
+            .z
+            .clamp(-1.0, 1.0)
+            .asin()
+            .clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        // A normal along Z leaves the yaw undetermined; keep the current one
+        // rather than snapping to an arbitrary direction.
+        if dir.x.abs() > 1.0e-4 || dir.y.abs() > 1.0e-4 {
+            self.yaw = dir.y.atan2(dir.x);
+        }
     }
 
     /// How far a ray may travel before being treated as a miss.
@@ -386,6 +417,36 @@ mod tests {
         }
         assert!((rig.current.distance - 250.0).abs() < f32::EPSILON);
         assert!((rig.current.yaw - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_ray_meets_an_arbitrary_plane() {
+        let cam = OrbitCamera {
+            target: Vec3::ZERO,
+            ..OrbitCamera::default()
+        };
+        // The YZ plane through the origin, seen from the default viewpoint.
+        let hit = cam
+            .plane_hit(Vec2::ZERO, 1.5, Vec3::ZERO, Vec3::X)
+            .expect("plane is in view");
+        assert!(hit.x.abs() < 1.0e-3, "not on the plane: {hit:?}");
+    }
+
+    #[test]
+    fn looking_along_a_normal_faces_the_plane() {
+        let mut cam = OrbitCamera {
+            target: Vec3::ZERO,
+            ..OrbitCamera::default()
+        };
+        for normal in [Vec3::X, Vec3::Y, -Vec3::X, -Vec3::Y] {
+            cam.look_along(normal);
+            // The eye should sit on the normal, so the plane is face-on.
+            let toward_eye = (cam.eye() - cam.target).normalize();
+            assert!(
+                toward_eye.dot(normal) > 0.999,
+                "looking along {normal:?} put the eye at {toward_eye:?}"
+            );
+        }
     }
 
     #[test]

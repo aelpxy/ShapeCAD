@@ -22,11 +22,11 @@ pub struct Image {
 /// staging buffer is usually wider than the image and has to be unpadded.
 const COPY_ALIGNMENT: u32 = 256;
 
-/// Renders `field_wgsl` from `camera` into an image, or `None` if the machine
+/// Renders `field` from `camera` into an image, or `None` if the machine
 /// has no usable GPU.
 #[must_use]
 pub fn try_render(
-    field_wgsl: &str,
+    field: &sc_geom::wgsl::Generated,
     camera: &OrbitCamera,
     width: u32,
     height: u32,
@@ -35,19 +35,22 @@ pub fn try_render(
     let instance = crate::gpu::instance();
     let adapter = crate::gpu::try_adapter(&instance, None, preference)?;
     let (device, queue) = crate::gpu::device(&adapter);
-    Some(render_with(
-        &device, &queue, field_wgsl, camera, width, height,
-    ))
+    Some(render_with(&device, &queue, field, camera, width, height))
 }
 
-/// Renders `field_wgsl` from `camera` into an image.
+/// Renders `field` from `camera` into an image.
 ///
 /// # Panics
 /// If no GPU adapter is available.
 #[must_use]
-pub fn render(field_wgsl: &str, camera: &OrbitCamera, width: u32, height: u32) -> Image {
+pub fn render(
+    field: &sc_geom::wgsl::Generated,
+    camera: &OrbitCamera,
+    width: u32,
+    height: u32,
+) -> Image {
     try_render(
-        field_wgsl,
+        field,
         camera,
         width,
         height,
@@ -70,12 +73,12 @@ pub fn render(field_wgsl: &str, camera: &OrbitCamera, width: u32, height: u32) -
 pub fn render_with(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    field_wgsl: &str,
+    field: &sc_geom::wgsl::Generated,
     camera: &OrbitCamera,
     width: u32,
     height: u32,
 ) -> Image {
-    let renderer = Renderer::new(device, FORMAT, field_wgsl);
+    let renderer = Renderer::new(device, queue, FORMAT, field);
     capture(device, queue, width, height, |encoder, view| {
         renderer.draw(queue, encoder, view, camera, width, height);
     })

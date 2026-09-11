@@ -37,7 +37,8 @@ pub(crate) fn write(path: &std::path::Path, width: u32, height: u32, dialog: boo
         ..Default::default()
     };
 
-    let field = Renderer::new(&device, capture::FORMAT, &state.wgsl());
+    let generated = state.wgsl();
+    let field = Renderer::new(&device, &queue, capture::FORMAT, &generated);
     let mut egui_renderer = egui_wgpu::Renderer::new(
         &device,
         capture::FORMAT,
