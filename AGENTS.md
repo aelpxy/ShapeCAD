@@ -131,6 +131,17 @@ an editor for free.
   every frame.
 - **Under WSL the only hardware GPU path reports itself as non-conformant** and
   crashes if driven off the main thread. See [docs/building.md](docs/building.md).
+- **Putting a new node where an old one sat means rewiring every parent.** The
+  arena is a DAG, so `Arena::parents_of` can return more than one, and read it
+  before creating the new node or the new node rewires itself into a loop. Miss
+  this and the edit fails silently: the node exists, the tree shows it, and the
+  model hashes exactly as it did before.
+- **A user action is usually several commands.** Bracket it with
+  `Document::begin_step` and `end_step`, or `AppState::as_one_step`, so one press
+  of undo takes back the whole thing. A hash check alone will not catch a missing
+  bracket, because reversing the last `SetRoot` restores the visible shape while
+  leaving the rest of the feature orphaned in the arena. Assert on liveness and
+  `log_len` as well.
 
 ## Style
 

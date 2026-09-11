@@ -430,6 +430,34 @@ impl AppState {
         }
     }
 
+    /// Runs `f` as a single undo step, however many commands it applies.
+    ///
+    /// Nearly every tool is several commands underneath. A pad is an extrusion,
+    /// a placement, a name and a boolean, and a user who wants it gone should
+    /// press undo once, not four times.
+    fn as_one_step<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.doc.begin_step();
+        let out = f(self);
+        self.doc.end_step();
+        out
+    }
+
+    /// Unions a new body onto the model, or makes it the model if there is none.
+    fn join_to_model(&mut self, id: NodeId) {
+        let Some(root) = self.doc.root() else {
+            self.apply(Command::SetRoot { root: Some(id) });
+            return;
+        };
+        let join = Node::Union {
+            a: root,
+            b: id,
+            smooth: 0.0,
+        };
+        if let Some(union) = self.apply(Command::Add { node: join }) {
+            self.apply(Command::SetRoot { root: Some(union) });
+        }
+    }
+
     pub(crate) fn undo(&mut self) {
         if self.doc.undo().unwrap_or(false) {
             self.field_dirty = true;
@@ -464,48 +492,27 @@ impl AppState {
     /// the profile stays parametric: a rectangle is a width and a height for as
     /// long as it exists.
     pub(crate) fn add_pad(&mut self, profile: sc_geom::Profile, label: &str) {
-        let plane = self.plane;
-        let node = Node::Extrude {
-            profile,
-            depth: self.extrude_height,
-        };
-        let Some(extrude) = self.apply(Command::Add { node }) else {
-            return;
-        };
-
-        let id = if plane == SketchPlane::Xy {
-            extrude
-        } else {
-            let placed = Command::Add {
-                node: Node::Transform {
-                    child: extrude,
-                    xform: plane.placement(),
-                },
+        self.as_one_step(|s| {
+            let plane = s.plane;
+            let node = Node::Extrude {
+                profile,
+                depth: s.extrude_height,
             };
-            match self.apply(placed) {
-                Some(id) => id,
-                None => return,
-            }
-        };
-        self.apply(Command::SetName {
-            id,
-            name: Some(label.to_string()),
+            let Some(extrude) = s.apply(Command::Add { node }) else {
+                return;
+            };
+
+            let Some(id) = s.place(extrude, plane.placement()) else {
+                return;
+            };
+            s.apply(Command::SetName {
+                id,
+                name: Some(label.to_string()),
+            });
+            s.join_to_model(id);
+            s.select(Some(extrude));
+            s.status = format!("Added {label}, set its dimensions on the right");
         });
-
-        if let Some(root) = self.doc.root() {
-            let join = Node::Union {
-                a: root,
-                b: id,
-                smooth: 0.0,
-            };
-            if let Some(union) = self.apply(Command::Add { node: join }) {
-                self.apply(Command::SetRoot { root: Some(union) });
-            }
-        } else {
-            self.apply(Command::SetRoot { root: Some(id) });
-        }
-        self.select(Some(extrude));
-        self.status = format!("Added {label}, set its dimensions on the right");
     }
 
     /// Cuts a profile through the model from the current plane.
@@ -533,79 +540,90 @@ impl AppState {
         let start = near - MARGIN;
         let depth = (far - near) + 2.0 * MARGIN;
 
-        let node = Node::Extrude { profile, depth };
-        let Some(cut) = self.apply(Command::Add { node }) else {
-            return;
-        };
-        // Shift the cut back along the normal so it begins outside the material.
-        let frame =
-            Transform::from_translation(Vec3::new(0.0, 0.0, start)).then(&self.sketch_frame());
-        let Some(placed) = self.place(cut, frame) else {
-            return;
-        };
+        self.as_one_step(|s| {
+            let node = Node::Extrude { profile, depth };
+            let Some(cut) = s.apply(Command::Add { node }) else {
+                return;
+            };
+            // Shift the cut back along the normal so it begins outside the
+            // material.
+            let frame =
+                Transform::from_translation(Vec3::new(0.0, 0.0, start)).then(&s.sketch_frame());
+            let Some(placed) = s.place(cut, frame) else {
+                return;
+            };
 
-        let carve = Node::Difference {
-            a: root,
-            b: placed,
-            smooth: 0.0,
-        };
-        let Some(result) = self.apply(Command::Add { node: carve }) else {
-            return;
-        };
-        self.apply(Command::SetRoot { root: Some(result) });
-        self.apply(Command::SetName {
-            id: cut,
-            name: Some(label.to_string()),
-        });
-
-        self.select(Some(cut));
-        self.status = format!("Cut {label} through the part");
-    }
-
-    /// Adds a primitive and unions it onto the current root, so a new body shows
-    /// up immediately instead of sitting orphaned in the tree.
-    pub(crate) fn add_body(&mut self, node: Node, label: &str) {
-        let Some(id) = self.apply(Command::Add { node }) else {
-            return;
-        };
-        self.apply(Command::SetName {
-            id,
-            name: Some(label.to_string()),
-        });
-
-        if let Some(root) = self.doc.root() {
-            let join = Node::Union {
+            let carve = Node::Difference {
                 a: root,
-                b: id,
+                b: placed,
                 smooth: 0.0,
             };
-            if let Some(union) = self.apply(Command::Add { node: join }) {
-                self.apply(Command::SetRoot { root: Some(union) });
-            }
-        } else {
-            self.apply(Command::SetRoot { root: Some(id) });
-        }
-        self.select(Some(id));
-        self.status = format!("Added {label}");
+            let Some(result) = s.apply(Command::Add { node: carve }) else {
+                return;
+            };
+            s.apply(Command::SetRoot { root: Some(result) });
+            s.apply(Command::SetName {
+                id: cut,
+                name: Some(label.to_string()),
+            });
+
+            s.select(Some(cut));
+            s.status = format!("Cut {label} through the part");
+        });
     }
 
-    /// Wraps the selection in a modifier, rerouting the root if needed.
+    /// Wraps the selection in a modifier and puts the wrapper where the
+    /// selection used to sit.
+    ///
+    /// Rerouting is the whole job. Creating the modifier node is not enough:
+    /// until every parent points at the wrapper instead of at the original, the
+    /// model still evaluates the unmodified node and the tool looks like it did
+    /// nothing at all.
     pub(crate) fn wrap_selection(&mut self, make: impl FnOnce(NodeId) -> Node, label: &str) {
         let Some(target) = self.selected else {
             self.status = "Nothing selected".to_string();
             return;
         };
-        let was_root = self.doc.root() == Some(target);
-        let Some(wrapped) = self.apply(Command::Add { node: make(target) }) else {
-            return;
-        };
-        if was_root {
-            self.apply(Command::SetRoot {
-                root: Some(wrapped),
+        self.as_one_step(|s| {
+            let was_root = s.doc.root() == Some(target);
+            // Read the parents before the wrapper exists, otherwise it is found
+            // as one of them and rewired into a loop.
+            let parents = s.doc.arena().parents_of(target);
+            let Some(wrapped) = s.apply(Command::Add { node: make(target) }) else {
+                return;
+            };
+            for parent in parents {
+                let Some(mut node) = s.doc.arena().get(parent).cloned() else {
+                    continue;
+                };
+                node.map_children(|c| if c == target { wrapped } else { c });
+                s.apply(Command::Replace { id: parent, node });
+            }
+            if was_root {
+                s.apply(Command::SetRoot {
+                    root: Some(wrapped),
+                });
+            }
+            s.select(Some(wrapped));
+            s.status = format!("Applied {label}");
+        });
+    }
+
+    /// Adds a primitive and unions it onto the current root, so a new body shows
+    /// up immediately instead of sitting orphaned in the tree.
+    pub(crate) fn add_body(&mut self, node: Node, label: &str) {
+        self.as_one_step(|s| {
+            let Some(id) = s.apply(Command::Add { node }) else {
+                return;
+            };
+            s.apply(Command::SetName {
+                id,
+                name: Some(label.to_string()),
             });
-        }
-        self.select(Some(wrapped));
-        self.status = format!("Applied {label}");
+            s.join_to_model(id);
+            s.select(Some(id));
+            s.status = format!("Added {label}");
+        });
     }
 
     pub(crate) fn wgsl(&self) -> sc_geom::wgsl::Generated {
@@ -783,44 +801,34 @@ impl AppState {
             return;
         }
 
-        let Some(extrude) = self.apply(Command::Add { node }) else {
-            return;
-        };
-
-        // An extrusion is defined in its own XY plane sweeping along +Z, so
-        // placing it on a datum plane is exactly the rotation between the two
-        // frames. The build plate needs none, and an identity transform in the
-        // tree is just noise.
-        let Some(id) = self.place(extrude, frame) else {
-            return;
-        };
-
-        let where_ = if self.attached_to.is_some() {
-            "face".to_string()
-        } else {
-            self.plane.name().to_string()
-        };
-        self.apply(Command::SetName {
-            id,
-            name: Some(format!("Pad on {where_}")),
-        });
-
-        if let Some(root) = self.doc.root() {
-            let join = Node::Union {
-                a: root,
-                b: id,
-                smooth: 0.0,
+        self.as_one_step(|s| {
+            let Some(extrude) = s.apply(Command::Add { node }) else {
+                return;
             };
-            if let Some(union) = self.apply(Command::Add { node: join }) {
-                self.apply(Command::SetRoot { root: Some(union) });
-            }
-        } else {
-            self.apply(Command::SetRoot { root: Some(id) });
-        }
 
-        self.select(Some(id));
-        self.tool = TOOL_SELECT;
-        self.status = format!("Extruded {height:.1} mm - adjust the height on the right");
+            // An extrusion is defined in its own XY plane sweeping along +Z, so
+            // placing it on a datum plane is exactly the rotation between the
+            // two frames. The build plate needs none, and an identity transform
+            // in the tree is just noise.
+            let Some(id) = s.place(extrude, frame) else {
+                return;
+            };
+
+            let where_ = if s.attached_to.is_some() {
+                "face".to_string()
+            } else {
+                s.plane.name().to_string()
+            };
+            s.apply(Command::SetName {
+                id,
+                name: Some(format!("Pad on {where_}")),
+            });
+            s.join_to_model(id);
+
+            s.select(Some(id));
+            s.tool = TOOL_SELECT;
+            s.status = format!("Extruded {height:.1} mm - adjust the height on the right");
+        });
     }
 
     /// Selects a node and refreshes the viewport highlight.
@@ -1577,6 +1585,227 @@ mod tests {
         assert!(
             (moved_away.x - 100.0).abs() < 1.0,
             "the transformed sphere sits 100mm along X, got {moved_away}"
+        );
+    }
+
+    /// A modifier applied to a node buried in the tree has to take effect. The
+    /// wrapper node existing is not enough: unless its parent is rerouted to it,
+    /// the model still evaluates the original and the tool silently does
+    /// nothing.
+    #[test]
+    fn a_modifier_applied_below_the_root_changes_the_model() {
+        let mut state = AppState::new();
+        state.add_body(Node::Sphere { radius: 20.0 }, "Ball");
+        state.add_body(
+            Node::Box {
+                half: Vec3::splat(10.0),
+                round: 0.0,
+            },
+            "Block",
+        );
+        let block = state.selected.expect("the new body is selected");
+        let root = state.doc.root().expect("the union became the root");
+        assert_ne!(block, root, "the block has to sit below the root");
+        let before = state.doc.hash().expect("a rooted model hashes");
+
+        state.wrap_selection(
+            |child| Node::Shell {
+                child,
+                thickness: 2.0,
+            },
+            "Shell",
+        );
+
+        assert_eq!(
+            state.doc.root(),
+            Some(root),
+            "wrapping a child must not move the root"
+        );
+        assert_ne!(
+            state.doc.hash().expect("still rooted"),
+            before,
+            "the shell was created but nothing points at it"
+        );
+        let shell = state.selected.expect("the wrapper is selected");
+        assert_eq!(
+            state.doc.arena().parents_of(block),
+            vec![shell],
+            "the block is still reachable around the shell"
+        );
+    }
+
+    /// The same tool applied to the root reroutes the root instead.
+    #[test]
+    fn a_modifier_applied_to_the_root_reroutes_the_root() {
+        let mut state = AppState::new();
+        state.add_body(Node::Sphere { radius: 20.0 }, "Ball");
+        let ball = state.doc.root().expect("the body became the root");
+
+        state.wrap_selection(
+            |child| Node::Shell {
+                child,
+                thickness: 2.0,
+            },
+            "Shell",
+        );
+
+        let root = state.doc.root().expect("still rooted");
+        assert_ne!(root, ball, "the root was left pointing at the bare body");
+        assert!(matches!(
+            state.doc.arena().get(root),
+            Some(Node::Shell { .. })
+        ));
+    }
+
+    /// One thing the user did should take one press of undo to take back, even
+    /// though a pad is an extrusion, a placement, a name and a boolean.
+    #[test]
+    fn one_undo_takes_back_a_whole_feature() {
+        let mut state = AppState::new();
+        state.add_body(Node::Sphere { radius: 20.0 }, "Ball");
+        let before = state.doc.hash().expect("a rooted model hashes");
+        let steps = state.doc.log_len();
+
+        state.plane = SketchPlane::Xz;
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 8.0,
+                height: 8.0,
+            },
+            "Pad",
+        );
+        let pad = state.selected.expect("the new pad is selected");
+        assert_ne!(
+            state.doc.hash().expect("still rooted"),
+            before,
+            "the pad did not reach the model"
+        );
+
+        state.undo();
+
+        assert_eq!(
+            state.doc.hash().expect("still rooted"),
+            before,
+            "undo left part of the pad in the model"
+        );
+        // Checking the hash alone is not enough: reversing the last command on
+        // its own repoints the root, which restores the shape while leaving the
+        // pad, its placement and its boolean orphaned in the arena.
+        assert!(
+            !state.doc.arena().is_alive(pad),
+            "the pad was orphaned rather than undone"
+        );
+        assert_eq!(
+            state.doc.log_len(),
+            steps,
+            "undo took back only part of the action"
+        );
+    }
+
+    /// Every tool has to be one undo step, not only the ones that got a test of
+    /// their own. A pocket and a finished sketch are three or four commands each,
+    /// exactly like a pad.
+    #[test]
+    fn every_tool_is_a_single_undo_step() {
+        /// A named tool, driven end to end the way the interface drives it.
+        type Action = (&'static str, fn(&mut AppState));
+
+        let actions: [Action; 3] = [
+            ("pocket", |s| {
+                s.add_pocket(sc_geom::Profile::Circle { radius: 3.0 }, "Hole");
+            }),
+            ("sketch", |s| {
+                s.start_sketch();
+                for (x, y) in [(-8.0, -8.0), (8.0, -8.0), (8.0, 8.0)] {
+                    s.add_sketch_point(Vec2::new(x, y));
+                }
+                s.finish_sketch();
+            }),
+            ("modifier", |s| {
+                s.wrap_selection(
+                    |child| Node::Shell {
+                        child,
+                        thickness: 1.0,
+                    },
+                    "Shell",
+                );
+            }),
+        ];
+
+        for (name, run) in actions {
+            let mut state = AppState::new();
+            state.add_body(
+                Node::Box {
+                    half: Vec3::splat(20.0),
+                    round: 0.0,
+                },
+                "Block",
+            );
+            let before = state.doc.hash().expect("a rooted model hashes");
+            let live = state.doc.arena().live_ids().count();
+            let steps = state.doc.log_len();
+
+            run(&mut state);
+            assert_ne!(
+                state.doc.hash().expect("still rooted"),
+                before,
+                "{name} changed nothing"
+            );
+
+            state.undo();
+
+            assert_eq!(
+                state.doc.hash().expect("still rooted"),
+                before,
+                "{name}: one undo left it half applied"
+            );
+            assert_eq!(
+                state.doc.arena().live_ids().count(),
+                live,
+                "{name}: one undo left nodes orphaned in the arena"
+            );
+            assert_eq!(
+                state.doc.log_len(),
+                steps,
+                "{name}: one undo took back only part of the action"
+            );
+        }
+    }
+
+    /// And one press of redo has to put all of it back.
+    #[test]
+    fn one_redo_rebuilds_a_whole_feature() {
+        let mut state = AppState::new();
+        state.add_body(Node::Sphere { radius: 20.0 }, "Ball");
+        state.add_body(
+            Node::Box {
+                half: Vec3::splat(10.0),
+                round: 0.0,
+            },
+            "Block",
+        );
+        let block = state.selected.expect("the new body is selected");
+        let after = state.doc.hash().expect("a rooted model hashes");
+        let steps = state.doc.log_len();
+
+        state.undo();
+        assert!(
+            !state.doc.arena().is_alive(block),
+            "undo left the body behind"
+        );
+
+        state.redo();
+
+        assert_eq!(
+            state.doc.hash().expect("still rooted"),
+            after,
+            "redo rebuilt only part of the body"
+        );
+        assert_eq!(state.doc.name(block), Some("Block"), "the label came back");
+        assert_eq!(
+            state.doc.log_len(),
+            steps,
+            "redo replayed only part of the action"
         );
     }
 

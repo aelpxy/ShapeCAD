@@ -15,28 +15,46 @@
 
 ---
 
-It's still early. Basic modeling works, but selection, sketching and meshing
-need more work before I'd trust it for everyday use.
+ShapeCAD is an early prototype and isn't usable yet. Basic modeling tools are
+in place, but sketching, feature dependencies and mesh export still need work.
 
 The code was written with OpenAI Codex and Claude Code, with me directing and
 reviewing the work. I haven't hand-written the code.
 
 ## What you can do
 
-- Draw a closed polygon on the build plate and extrude it.
-- Add spheres, boxes, cylinders, tori and planes.
-- Combine or subtract shapes, adjust blend radii, and apply shells, offsets
-  and transforms.
-- Edit objects through the design tree and property panel, with undo and redo.
+- Draw a closed polygon on the XY, XZ or YZ plane, snap points to a grid,
+  and extrude it.
+- Add rectangular, circular or hexagonal pads and edit their dimensions.
+  Change the hexagon's side count to make other regular polygons.
+- Add spheres, boxes and cylinders, or cut rectangular, circular and hexagonal
+  pockets through a part.
+- Start a polygon sketch or a pocket on an existing pad's top surface.
+- Select bodies and boolean joints in the viewport or design tree, then edit
+  dimensions and blend radii in the property panel.
 - Save and open designs as readable JSON, and export meshes as STL.
 
-Selection is currently through the tree. You can't click a body in the viewport
-to select or move it yet. Sketches only support polygons on the build plate;
-there are no constraints, arcs, circles or snapping.
+Numeric edits update the viewport through a GPU parameter buffer. They don't
+recompile the shader unless the generated shader code changes.
 
-Parameter edits recompile the viewport shader, so dragging values can be choppy.
-The mesher can also produce non-manifold edges on some models. See
-[the meshing notes](docs/meshing.md) for the details.
+## What's still rough
+
+- Sketches have no constraint solver or arc tools. The shape buttons create
+  pads immediately; there's no separate sketch editor for dimensioning a
+  profile before using it in several features.
+- There are no push/pull handles or direct movement tools in the viewport.
+  Dimensions are edited in the side panel.
+- Completed features keep a fixed placement. Changing the depth of a supporting
+  pad won't move a sketch extrusion built on its top surface, and a through-cut
+  won't automatically extend to follow a thicker part.
+- Shell, offset and move currently affect the visible model only when applied
+  to its root. Applying them to a child creates a modifier without reconnecting
+  it to the model.
+- Undo and redo work per command. Creating a feature or dragging a value can
+  leave several undo steps for one action.
+- Some exports have non-manifold edges. The CLI can still report these as
+  manifold, so its success message isn't a guarantee. See
+  [the meshing notes](docs/meshing.md).
 
 ## Run it
 
@@ -50,9 +68,17 @@ cargo run --release -p sc-app
 
 Use a release build for the viewport and mesh export.
 
-Drag to orbit, right-drag or Shift-drag to pan, and scroll to zoom. Double-click
-to focus, or press `F` to fit the model. To draw a profile, press **Sketch a
-profile**, click points on the plate, then press Enter.
+Click to select, drag to orbit, right-drag or Shift-drag to pan, and scroll to
+zoom. Right-click for actions on the item under the pointer. Double-click to
+focus, or press `F` to fit the model.
+
+To try a simple part, choose **XY**, add a **Rectangle**, and set its width,
+height and depth in the right panel. Use **Hole** to cut through it, then change
+the hole's radius in the same panel.
+
+To draw your own outline, choose a plane and press **Sketch a profile**. Click
+points, then press Enter to close and extrude it. Backspace removes the last
+point; Escape cancels.
 
 The app has been tested on Linux, including WSL. Windows and macOS are untested.
 
@@ -66,7 +92,7 @@ cargo run -p sc-cli -- selftest
 
 ## How it works
 
-ShapeCAD stores geometry as a tree of signed distance functions. The viewport
+ShapeCAD stores geometry as a directed acyclic graph of implicit operations. The viewport
 evaluates that tree on the GPU, and a dual contouring mesher turns it into
 triangles for export.
 
@@ -95,8 +121,9 @@ support.
 
 ```sh
 cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
+cargo run -p sc-cli -- selftest
 ```
 
 Tests cover geometry evaluation, bounds, undo, meshing and rendering. Property

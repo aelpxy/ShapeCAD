@@ -170,13 +170,31 @@ impl Arena {
         Ok(self.slots[id.0 as usize].take().expect("checked live"))
     }
 
+    /// Every live node that names `id` as a direct child.
+    ///
+    /// The store is a DAG rather than a tree, so a node can have more than one
+    /// parent. Anything that reroutes a node has to rewire all of them: leaving
+    /// one behind splits the model in two, with the edit visible down one path
+    /// and the original still standing down the other.
+    ///
+    /// Linear in the size of the arena. Callers that need this per frame should
+    /// cache it; the editing commands run it once per action.
+    #[must_use]
+    pub fn parents_of(&self, id: NodeId) -> Vec<NodeId> {
+        self.live_ids()
+            .filter(|&other| self.is_parent(other, id))
+            .collect()
+    }
+
     fn referrer_of(&self, id: NodeId) -> Option<NodeId> {
-        self.live_ids().find(|&other| {
-            other != id
-                && self
-                    .get(other)
-                    .is_some_and(|n| n.children().any(|c| c == id))
-        })
+        self.live_ids().find(|&other| self.is_parent(other, id))
+    }
+
+    fn is_parent(&self, parent: NodeId, child: NodeId) -> bool {
+        parent != child
+            && self
+                .get(parent)
+                .is_some_and(|n| n.children().any(|c| c == child))
     }
 
     /// Whether `target` is reachable by walking children from `from`.
@@ -212,5 +230,94 @@ impl Arena {
             }
         }
         seen
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Node;
+
+    fn sphere(arena: &mut Arena, radius: f32) -> NodeId {
+        arena.insert(Node::Sphere { radius }).expect("valid sphere")
+    }
+
+    #[test]
+    fn a_node_nothing_points_at_has_no_parents() {
+        let mut arena = Arena::new();
+        let a = sphere(&mut arena, 1.0);
+        assert_eq!(arena.parents_of(a), Vec::new());
+    }
+
+    #[test]
+    fn both_sides_of_a_boolean_name_it_as_their_parent() {
+        let mut arena = Arena::new();
+        let a = sphere(&mut arena, 1.0);
+        let b = sphere(&mut arena, 2.0);
+        let union = arena
+            .insert(Node::Union { a, b, smooth: 0.0 })
+            .expect("valid union");
+
+        assert_eq!(arena.parents_of(a), vec![union]);
+        assert_eq!(arena.parents_of(b), vec![union]);
+        assert_eq!(arena.parents_of(union), Vec::new());
+    }
+
+    /// The store is a DAG, so one node can be reached down two paths. Reporting
+    /// only the first is what lets an edit rewire half a model and leave the
+    /// other half pointing at the original.
+    #[test]
+    fn a_shared_node_reports_every_parent() {
+        let mut arena = Arena::new();
+        let shared = sphere(&mut arena, 1.0);
+        let other = sphere(&mut arena, 2.0);
+        let left = arena
+            .insert(Node::Union {
+                a: shared,
+                b: other,
+                smooth: 0.0,
+            })
+            .expect("valid union");
+        let right = arena
+            .insert(Node::Difference {
+                a: other,
+                b: shared,
+                smooth: 0.0,
+            })
+            .expect("valid difference");
+
+        let mut parents = arena.parents_of(shared);
+        parents.sort_by_key(|id| id.0);
+        assert_eq!(parents, vec![left, right]);
+    }
+
+    /// A union of a node with itself names it twice. Callers rewrite children by
+    /// mapping over them, so the parent must appear once, not once per edge.
+    #[test]
+    fn a_parent_that_names_a_node_twice_is_reported_once() {
+        let mut arena = Arena::new();
+        let a = sphere(&mut arena, 1.0);
+        let twice = arena
+            .insert(Node::Union {
+                a,
+                b: a,
+                smooth: 0.0,
+            })
+            .expect("valid union");
+
+        assert_eq!(arena.parents_of(a), vec![twice]);
+    }
+
+    #[test]
+    fn a_tombstoned_parent_is_forgotten() {
+        let mut arena = Arena::new();
+        let a = sphere(&mut arena, 1.0);
+        let b = sphere(&mut arena, 2.0);
+        let union = arena
+            .insert(Node::Union { a, b, smooth: 0.0 })
+            .expect("valid union");
+        arena.remove(union).expect("nothing points at the union");
+
+        assert_eq!(arena.parents_of(a), Vec::new());
     }
 }

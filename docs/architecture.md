@@ -69,6 +69,22 @@ agent. Reaching into `Arena` from application code defeats all three.
 rejected edit leaves the document byte-identical and unlogged. Anything that can
 fail halfway breaks undo, replay, and any caller that edits speculatively.
 
+## Editing a node that something else points at
+
+The arena is a DAG, not a tree: a node can be reached down more than one path.
+Anything that puts a new node where an old one used to sit has to rewire every
+parent, which is what `Arena::parents_of` is for.
+
+Forgetting is a quiet failure rather than a loud one. Creating the node succeeds,
+the design tree shows it, and the model renders exactly as before, because the
+root still reaches the original. `AppState::wrap_selection` had this bug: a
+modifier applied to anything below the root produced a byte-identical model.
+`a_modifier_applied_below_the_root_changes_the_model` pins it, by hash rather
+than by inspecting the tree.
+
+Read the parents before creating the wrapper. Afterwards the wrapper is one of
+them, and rewiring it points it at itself.
+
 ## Why there is no scene graph
 
 The node DAG *is* the scene. There is no separate render representation to keep

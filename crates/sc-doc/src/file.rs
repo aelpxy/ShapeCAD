@@ -115,6 +115,8 @@ impl Document {
             names,
             entries: Vec::new(),
             cursor: 0,
+            step: 0,
+            open: 0,
         })
     }
 }
