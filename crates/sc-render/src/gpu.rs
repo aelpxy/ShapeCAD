@@ -8,7 +8,7 @@
 ///
 /// Enables non-conformant adapters. On WSL the only hardware path is Mesa's
 /// Dozen driver (Vulkan over D3D12), which self-reports as non-conformant, so
-/// wgpu hides it by default — leaving nothing but a software rasteriser. That is
+/// wgpu hides it by default, leaving nothing but a software rasteriser. That is
 /// a 100x performance difference for a sphere-traced viewport.
 #[must_use]
 pub fn instance() -> wgpu::Instance {
@@ -31,7 +31,7 @@ pub enum Preference {
     ///
     /// This deliberately restricts itself to the GL backend. On WSL, merely
     /// enumerating Vulkan adapters loads Mesa's Dozen driver, which then
-    /// segfaults when its adapter is dropped from a thread other than main —
+    /// segfaults when its adapter is dropped from a thread other than main,
     /// and Rust's test harness runs every test on a spawned thread. Selecting a
     /// software adapter is not enough; the Vulkan ICD must never be loaded at
     /// all.

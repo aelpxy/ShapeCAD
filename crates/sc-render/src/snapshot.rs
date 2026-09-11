@@ -62,8 +62,8 @@ pub fn render(
 /// Renders using a caller-supplied device.
 ///
 /// Creating a second wgpu instance while one is already live is not reliable on
-/// every driver, so anything that already owns a device — the viewport, or a
-/// test that probed for an adapter — must come through here rather than through
+/// every driver, so anything that already owns a device (the viewport, or a
+/// test that probed for an adapter) must come through here rather than through
 /// [`render`].
 ///
 /// # Panics
@@ -89,8 +89,8 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// Renders whatever `record` draws into an offscreen target and reads it back.
 ///
-/// Separated from [`render_with`] so callers that compose several passes — the
-/// application draws the field and then its chrome over it — can capture the
+/// Separated from [`render_with`] so callers that compose several passes (the
+/// application draws the field and then its chrome over it) can capture the
 /// composite rather than just the 3D view.
 ///
 /// # Panics

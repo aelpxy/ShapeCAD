@@ -104,7 +104,7 @@ impl Document {
     /// Rebuilds a document by replaying a log produced by [`Document::log`].
     ///
     /// Because effects name every id explicitly, the result is identical to the
-    /// original — including id assignment, which abstract commands cannot
+    /// original, including id assignment, which abstract commands cannot
     /// guarantee once undo has left tombstones in the arena.
     ///
     /// # Errors

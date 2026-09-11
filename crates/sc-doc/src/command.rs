@@ -1,7 +1,7 @@
 //! The command vocabulary.
 //!
 //! Every mutation of a document goes through exactly one of these. The UI, the
-//! CLI and the AI agent layer all speak this same vocabulary — there is no
+//! CLI and the AI agent layer all speak this same vocabulary, so there is no
 //! second, parallel path into the geometry. That is deliberate: an agent can
 //! only ever do things a user could also do, and anything a user does is
 //! automatically replayable, undoable and visible to an agent.
@@ -60,7 +60,7 @@ pub enum Command {
 /// The distinction is not academic. [`Command::Add`] does not name an id, so it
 /// gets one at apply time. Undo leaves a tombstone behind, which advances the id
 /// counter, so replaying a sequence of abstract commands can allocate different
-/// ids than the original run did — and every later reference by id then points
+/// ids than the original run did, and every later reference by id then points
 /// at the wrong node or at nothing. The log therefore stores effects, and
 /// [`crate::Document::replay`] reproduces a model exactly.
 #[derive(Clone, Debug, PartialEq)]

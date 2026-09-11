@@ -32,7 +32,7 @@ impl Topology {
     ///
     /// These are the two defects that actually stop a slicer: a hole leaves the
     /// solid undefined, and inconsistent winding inverts it. Non-manifold edges
-    /// are deliberately not included — see [`Topology::is_manifold`].
+    /// are deliberately not included. See [`Topology::is_manifold`].
     #[must_use]
     pub fn is_printable(&self) -> bool {
         self.boundary_edges == 0 && self.inconsistent_edges == 0
@@ -41,8 +41,8 @@ impl Topology {
     /// Additionally free of edges shared by more than two triangles.
     ///
     /// Uniform dual contouring places exactly one vertex per cell. Where two
-    /// separate sheets of the surface pass through the same cell — a thin gap,
-    /// or two bodies almost touching, relative to the grid — that single vertex
+    /// separate sheets of the surface pass through the same cell (a thin gap,
+    /// or two bodies almost touching, relative to the grid) that single vertex
     /// has to serve both, and the edges around it end up shared by four
     /// triangles rather than two.
     ///

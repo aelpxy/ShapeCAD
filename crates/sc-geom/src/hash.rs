@@ -1,7 +1,7 @@
 //! Deterministic geometry hashing.
 //!
 //! This is the verification primitive the whole project leans on. It lets a test
-//! — or an AI agent that just edited a model — ask "is this still the same
+//! (or an AI agent that just edited a model) ask "is this still the same
 //! shape?" without rendering pixels or diffing meshes.
 //!
 //! FNV-1a is used rather than [`std::hash::DefaultHasher`] because the standard
@@ -143,7 +143,7 @@ impl std::fmt::Display for GeometryHash {
     }
 }
 
-/// Default sampling resolution per axis. 24^3 is 13,824 evaluations — cheap
+/// Default sampling resolution per axis. 24^3 is 13,824 evaluations, cheap
 /// enough to run on every test, dense enough to catch a sub-millimetre edit.
 pub const DEFAULT_GRID: u32 = 24;
 

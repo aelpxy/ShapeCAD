@@ -13,7 +13,7 @@ use sc_geom::glam::{Mat3, Vec3};
 /// Note the hand-written [`Default`]: deriving it would initialise `ata` with
 /// `Mat3::default()`, which in glam is the *identity*, not zero. That seeds every
 /// cell with a phantom unit constraint pulling its vertex toward the origin, and
-/// the resulting meshes come out uniformly undersized — a bias small enough to
+/// the resulting meshes come out uniformly undersized, a bias small enough to
 /// look plausible in a render and quite wrong in a printed part.
 #[derive(Clone, Copy, Debug)]
 pub struct Qef {
@@ -27,8 +27,8 @@ pub struct Qef {
 }
 
 /// Pull toward the mass point. Without it the normal equations are singular
-/// whenever the constraints are degenerate — a flat face, or an edge, where the
-/// surface does not pin down all three axes — and the solution runs off to
+/// whenever the constraints are degenerate (a flat face, or an edge, where the
+/// surface does not pin down all three axes) and the solution runs off to
 /// infinity.
 const REGULARISATION: f32 = 1.0e-3;
 
@@ -82,7 +82,7 @@ impl Qef {
     ///
     /// Clamping is not cosmetic. An ill-conditioned system can put the minimiser
     /// far outside its own cell, which produces long spikes and self-intersecting
-    /// triangles — geometry a slicer will reject.
+    /// triangles, geometry a slicer will reject.
     #[must_use]
     pub fn solve(&self, min: Vec3, max: Vec3) -> Vec3 {
         let mass = self.mass_point();

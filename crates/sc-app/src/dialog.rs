@@ -1,8 +1,8 @@
 //! An in-application file browser.
 //!
 //! Deliberately not a native dialog. Those go through the XDG desktop portal on
-//! Linux, which is frequently absent — under WSL, for instance, there is no
-//! portal and no GTK — and a file dialog that silently fails to appear is worse
+//! Linux, which is frequently absent (under WSL, for instance, there is no
+//! portal and no GTK), and a file dialog that silently fails to appear is worse
 //! than a plain one that always works. This also keeps the chrome consistent.
 
 use crate::theme;

@@ -171,7 +171,7 @@ fn an_empty_region_meshes_to_nothing_rather_than_panicking() {
 /// Uniform dual contouring places one vertex per cell. Where two sheets of the
 /// surface pass through the same cell, that vertex serves both and the edges
 /// around it end up shared by four triangles. On this model at this resolution
-/// roughly four percent of edges are affected — not a stray cell, a structural
+/// roughly four percent of edges are affected, which is not a stray cell but a structural
 /// property of the algorithm.
 ///
 /// The mesh is still closed and consistently wound, so it slices; most tools
@@ -180,7 +180,7 @@ fn an_empty_region_meshes_to_nothing_rather_than_panicking() {
 /// vertex per component.
 ///
 /// If this test starts failing because the count reached zero, that work has
-/// landed — delete the test and tighten `assert_printable` to `is_manifold`.
+/// landed, delete the test and tighten `assert_printable` to `is_manifold`.
 #[test]
 fn known_limitation_two_sheets_in_one_cell_are_non_manifold() {
     let mesh = mesh_of(

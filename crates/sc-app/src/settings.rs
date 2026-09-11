@@ -51,7 +51,7 @@ impl Settings {
 
 /// Interface zoom to use when the user has not chosen one.
 ///
-/// Many Linux compositors — `WSLg` among them — report a scale factor of 1.0 even
+/// Many Linux compositors, `WSLg` among them, report a scale factor of 1.0 even
 /// on a 4K panel, which leaves every control about half the size it should be.
 /// Where the display has already been accounted for, this trusts it and returns
 /// 1.0; otherwise it derives a factor from the panel's width, treating 1920

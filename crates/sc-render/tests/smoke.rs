@@ -2,7 +2,7 @@
 //!
 //! Skips rather than fails where there is no GPU, so a headless build machine
 //! without even a software rasteriser does not turn the suite red. Where a GPU
-//! does exist — including llvmpipe — this exercises shader compilation, the
+//! does exist (including llvmpipe) this exercises shader compilation, the
 //! pipeline, the render pass and the readback in one go.
 
 use sc_doc::samples::bracket;
