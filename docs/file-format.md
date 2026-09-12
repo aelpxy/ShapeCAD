@@ -178,6 +178,8 @@ bump. Adding an *optional* field with a serde default does not.
 | 2 | Parametric extrusion profiles. A rectangle became a width and a height rather than four points, which an older build cannot read |
 | 3 | Mesh nodes, and with them the sidecar directory. An older build cannot evaluate a mesh node and would not know to look for the directory either |
 | 4 | `Node::Prism`, an unbounded sweep. It is how a through cut is expressed, so that a hole sized against the part as it stood cannot silently become a blind recess when the part grows |
+| 5 | `Node::Pattern`, the same subtree repeated in a line or about an axis. The count is one number rather than a copy per instance, so an older build would read four holes where the file says six |
+| 6 | `Node::Revolve`, a profile spun about the Z axis. An older build cannot evaluate it, and a turning it dropped would leave a part that looks finished and is not |
 
 Older files still load unchanged. A version 2 or 3 file cannot contain a prism,
 and a version 2 file cannot contain a mesh node either, so it asks for no assets

@@ -94,6 +94,7 @@ scene:
 | `--tutorial` | The guided tour on its first card. |
 | `--pattern` | A boss repeated six times around a full circle, with the pattern selected. |
 | `--snap` | A boss mid-drag, latched onto a plate's centreline, with its guide showing. |
+| `--turned` | A knob turned on the lathe, drawn as a revolved profile. |
 
 `--dark` captures any of these in the dark palette. Both schemes are worth
 looking at after a change to the interface: they are two sets of colours over one

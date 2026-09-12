@@ -20,6 +20,11 @@ enum Shape {
     Cuboid([f32; 3]),
     Cylinder(f32, f32),
     Extrude(usize, f32, f32),
+    /// A profile spun about the Z axis: a ring when the distance clears the
+    /// axis, a solid turning when it does not. Both are generated, because the
+    /// field just inside the axis is a lower bound rather than an exact
+    /// distance and the mesher has to stay watertight over it either way.
+    Revolve(usize, f32, f32),
     Union(Box<Shape>, Box<Shape>, f32),
     Difference(Box<Shape>, Box<Shape>, f32),
     Translate(Box<Shape>, [f32; 3]),
@@ -42,6 +47,16 @@ fn build(s: &Shape, b: &mut Builder) -> NodeId {
                 },
                 *height,
             )
+            .unwrap(),
+        Shape::Revolve(sides, radius, major) => b
+            .arena
+            .insert(sc_geom::Node::Revolve {
+                profile: sc_geom::Profile::RegularPolygon {
+                    sides: *sides as u32,
+                    radius: *radius,
+                },
+                major: *major,
+            })
             .unwrap(),
         Shape::Union(x, y, k) => {
             let (a, c) = (build(x, b), build(y, b));
@@ -81,6 +96,7 @@ fn arb_leaf() -> impl Strategy<Value = Shape> {
         (2.0f32..8.0, 2.0f32..8.0, 2.0f32..8.0).prop_map(|(x, y, z)| Shape::Cuboid([x, y, z])),
         (2.0f32..6.0, 2.0f32..8.0).prop_map(|(r, h)| Shape::Cylinder(r, h)),
         ((3usize..9), 2.0f32..6.0, 2.0f32..8.0).prop_map(|(n, r, h)| Shape::Extrude(n, r, h)),
+        ((3usize..9), 2.0f32..6.0, 0.0f32..9.0).prop_map(|(n, r, m)| Shape::Revolve(n, r, m)),
     ]
 }
 

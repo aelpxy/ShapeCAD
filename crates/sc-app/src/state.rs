@@ -2069,6 +2069,68 @@ impl AppState {
     }
 
     /// Turns the profile in progress into an extruded solid.
+    /// Turns the profile in progress on the lathe instead of padding it.
+    ///
+    /// The sketch plane's own vertical is the axis and its horizontal is the
+    /// radius, which is how a lathe profile is drawn everywhere: a shape to the
+    /// side of a line, spun about that line. A profile crossing the axis makes a
+    /// solid turning and one clear of it makes a ring, with no mode to choose
+    /// between them.
+    pub(crate) fn revolve_sketch(&mut self) {
+        let Some(points) = self.sketch.take() else {
+            return;
+        };
+        if points.len() < 3 {
+            self.status = "A profile needs at least 3 points".to_string();
+            self.sketch = Some(points);
+            return;
+        }
+
+        let frame = self.sketch_frame();
+        // The profile's points are already measured from the plane origin, so
+        // the distance from the axis is in the points themselves and the node
+        // needs none of its own.
+        let node = Node::Revolve {
+            profile: sc_geom::Profile::Path { points },
+            major: 0.0,
+        };
+        if !node.is_valid() {
+            self.status = "That profile encloses no area".to_string();
+            return;
+        }
+
+        self.as_one_step(|s| {
+            let Some(revolve) = s.apply(Command::Add { node }) else {
+                return;
+            };
+            // A revolve spins about its own Z and reads its profile as a radius
+            // against a height, so a quarter turn about X is what lines those up
+            // with the sketch plane's horizontal and vertical.
+            let spin = Transform::from_rotation(sc_geom::glam::Quat::from_rotation_x(
+                -std::f32::consts::FRAC_PI_2,
+            ))
+            .then(&frame);
+            let Some(id) = s.place(revolve, spin) else {
+                return;
+            };
+
+            let where_ = if s.attached_to.is_some() {
+                "face".to_string()
+            } else {
+                s.plane.name().to_string()
+            };
+            s.apply(Command::SetName {
+                id,
+                name: Some(format!("Turned on {where_}")),
+            });
+            s.join_to_model(id);
+
+            s.select(Some(id));
+            s.tool = TOOL_SELECT;
+            s.status = "Turned about the plane's vertical axis".to_string();
+        });
+    }
+
     pub(crate) fn finish_sketch(&mut self) {
         let Some(points) = self.sketch.take() else {
             return;
@@ -4021,6 +4083,48 @@ mod tests {
 
         state.add_body(Node::Sphere { radius: 6.0 }, "Second");
         state.begin_move(Vec3::ZERO, 940.0).expect("movable")
+    }
+
+    /// A turned profile has to spin about the sketch plane's vertical, not about
+    /// its normal. Getting that wrong sweeps the profile out of its own plane
+    /// and makes a shape with no relationship to what was drawn.
+    #[test]
+    fn a_sketch_turns_about_the_planes_vertical() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.set_plane(crate::plane::SketchPlane::Xz);
+        state.start_sketch();
+        // A 4 wide by 6 tall rectangle sitting between 10 and 14 out from the
+        // axis. Spun, it is a ring: solid at radius 12, open at the middle.
+        for (u, v) in [(10.0, 0.0), (14.0, 0.0), (14.0, 6.0), (10.0, 6.0)] {
+            state.add_sketch_point(Vec2::new(u, v));
+        }
+        state.revolve_sketch();
+        assert!(state.sketch.is_none(), "the sketch was not consumed");
+
+        let plane = crate::plane::SketchPlane::Xz;
+        // The plane's horizontal is the radius and its vertical is the axis, so
+        // a point 12 out and 3 up is inside, and so is the same radius taken a
+        // quarter turn round.
+        let across = plane.to_world(Vec2::new(12.0, 3.0));
+        assert!(
+            solid_at_point(&state, across),
+            "not solid where it was drawn"
+        );
+
+        let axis = plane.to_world(Vec2::new(0.0, 1.0)) - plane.to_world(Vec2::ZERO);
+        let radial = plane.to_world(Vec2::new(1.0, 0.0)) - plane.to_world(Vec2::ZERO);
+        let round = axis.cross(radial).normalize() * 12.0 + axis * 3.0;
+        assert!(
+            solid_at_point(&state, round),
+            "it did not sweep a full turn, {round:?} is empty"
+        );
+
+        // Hollow in the middle, or it swept about the wrong axis.
+        assert!(
+            !solid_at_point(&state, axis * 3.0),
+            "the axis came out solid, so the profile spun about the wrong line"
+        );
     }
 
     /// The gizmo has to sit on the thing it moves. Dragging a feature makes the

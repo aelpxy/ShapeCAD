@@ -24,12 +24,14 @@ always an enclosing `Transform`, so there is exactly one way to express it.
 | `Mesh` | none | An imported triangle mesh, voxelized to a signed distance grid at import |
 | `Extrude` | `profile`, `height` | Closed polygon in local XY swept from z = 0 to z = `height` |
 | `Prism` | `profile` | The same profile swept without end along Z. Unbounded, so only meaningful as the tool of a difference or an intersection. How a through cut is expressed: an end condition rather than a measurement, so growing the part cannot close the hole |
+| `Revolve` | `profile`, `major` | The profile spun a full turn about Z, read as a radius against a height. `major` offsets it from the axis. Drawn across the axis it makes a solid turning, clear of it a ring. Exact: spinning a point about the axis changes neither of the two coordinates the profile is measured in |
 | `Union` | `a`, `b`, `smooth` | `smooth` is a blend radius in millimetres |
 | `Difference` | `a`, `b`, `smooth` | `a` minus `b` |
 | `Intersection` | `a`, `b`, `smooth` | |
 | `Transform` | `child`, `xform` | Rigid plus *uniform* scale |
 | `Offset` | `child`, `distance` | Grows or shrinks the solid. How clearance fits are expressed |
 | `Shell` | `child`, `thickness` | Hollows inward, keeping the outer surface |
+| `Pattern` | `child`, `kind`, `count` | The same subtree repeated in a line or about an axis. Evaluated as a minimum over instances, so the count is one number rather than a copy per instance |
 
 ### A fillet is a parameter
 

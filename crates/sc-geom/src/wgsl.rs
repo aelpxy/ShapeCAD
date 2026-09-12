@@ -266,7 +266,20 @@ impl Emitter<'_> {
             | Node::Cylinder { .. }
             | Node::Torus { .. }
             | Node::Plane { .. } => self.emit_primitive(&node, p),
-            _ => self.emit_composite(id, &node, p),
+            // Listed rather than caught by a wildcard. A node kind added
+            // without an arm in `emit_composite` used to reach its
+            // `unreachable!` and take the renderer down at run time; now it does
+            // not compile.
+            Node::Union { .. }
+            | Node::Difference { .. }
+            | Node::Intersection { .. }
+            | Node::Transform { .. }
+            | Node::Offset { .. }
+            | Node::Extrude { .. }
+            | Node::Pattern { .. }
+            | Node::Prism { .. }
+            | Node::Revolve { .. }
+            | Node::Shell { .. } => self.emit_composite(id, &node, p),
         };
 
         self.memo.insert(key, d.clone());
@@ -527,6 +540,15 @@ impl Emitter<'_> {
                 d
             }
 
+            Node::Revolve { ref profile, major } => {
+                let name = self.helper_for(id, "sc_revolve_", |e, name| {
+                    e.emit_revolve_fn(name, profile, major);
+                });
+                let d = self.fresh("d");
+                self.line(&format!("let {d} = {name}({p});"));
+                d
+            }
+
             Node::Shell { child, thickness } => {
                 let dc = self.emit(child, p);
                 let d = self.fresh("d");
@@ -546,7 +568,7 @@ impl Emitter<'_> {
     /// bound, while the vertices come from the parameter buffer, so dragging a
     /// dimension does not recompile anything.
     fn emit_extrude_fn(&mut self, name: &str, profile: &crate::Profile, depth: f32) {
-        let plane = self.emit_profile_block(profile);
+        let plane = self.emit_profile_block(profile, "p.xy");
         let h = self.p(depth);
         let _ = write!(
             self.helpers,
@@ -560,7 +582,7 @@ impl Emitter<'_> {
     /// A prism is the profile distance and nothing else: no slab term, because
     /// the sweep has no end to be inside or outside of.
     fn emit_prism_fn(&mut self, name: &str, profile: &crate::Profile) {
-        let plane = self.emit_profile_block(profile);
+        let plane = self.emit_profile_block(profile, "p.xy");
         let _ = write!(
             self.helpers,
             "\nfn {name}(p: vec3<f32>) -> f32 {{
@@ -569,23 +591,53 @@ impl Emitter<'_> {
         );
     }
 
+    /// A revolve is the same profile distance read in a different plane: the
+    /// radius from the Z axis against the height along it. Spinning a point
+    /// about the axis changes neither, which is why this is exact rather than a
+    /// sampled approximation.
+    fn emit_revolve_fn(&mut self, name: &str, profile: &crate::Profile, major: f32) {
+        // The profile goes in a function of its own because a revolve reads it
+        // twice, at the positive and the negative radius, and the block binds
+        // names that cannot be emitted twice into one scope.
+        let inner = format!("{name}_profile");
+        let plane = self.emit_profile_block(profile, "qp");
+        let _ = write!(
+            self.helpers,
+            "\nfn {inner}(qp: vec2<f32>) -> f32 {{
+{plane}    return plane;
+}}\n"
+        );
+        let m = self.p(major);
+        let _ = write!(
+            self.helpers,
+            "\nfn {name}(p: vec3<f32>) -> f32 {{
+    let r = length(p.xy);
+    return min({inner}(vec2<f32>(r - {m}, p.z)), {inner}(vec2<f32>(-r - {m}, p.z)));
+}}\n"
+        );
+    }
+
     /// WGSL binding `plane` to the signed distance from `p.xy` to the profile.
     ///
-    /// Shared by the two swept nodes, so a fix to the polygon crossing rule or
-    /// to either closed form lands in both.
-    fn emit_profile_block(&mut self, profile: &crate::Profile) -> String {
+    /// Shared by every node that sweeps a profile, so a fix to the polygon
+    /// crossing rule or to either closed form lands in all of them.
+    ///
+    /// `q` names the `vec2<f32>` the profile is measured against. An extrusion
+    /// and a prism read `p.xy`; a revolve reads the radius against the height,
+    /// which is the whole of the difference between them.
+    fn emit_profile_block(&mut self, profile: &crate::Profile, q: &str) -> String {
         match profile {
             crate::Profile::Rect { width, height } => {
                 let (hw, hh) = (self.p(width * 0.5), self.p(height * 0.5));
                 format!(
-                    "    let q = abs(p.xy) - vec2<f32>({hw}, {hh});
+                    "    let q = abs({q}) - vec2<f32>({hw}, {hh});
     let plane = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
 "
                 )
             }
             crate::Profile::Circle { radius } => {
                 let r = self.p(*radius);
-                format!("    let plane = length(p.xy) - {r};\n")
+                format!("    let plane = length({q}) - {r};\n")
             }
             other => {
                 let poly = other.polygon();
@@ -593,7 +645,7 @@ impl Emitter<'_> {
                 let base = self.p_run(poly.iter().flat_map(|v| [v.x, v.y]));
                 let last = base + n.saturating_sub(1) * 2;
                 format!(
-                    "    let q = p.xy;
+                    "    let q = {q};
     var d = 1e30;
     var s = 1.0;
     // The previous vertex is carried rather than indexed. The wrapping

@@ -211,6 +211,19 @@ fn bounds_memo(arena: &Arena, id: NodeId, memo: &mut HashMap<NodeId, Aabb>) -> A
         // be bound by the surrounding match on `*node`.
         Node::Prism { .. } | Node::Extrude { .. } => sweep_bounds(node),
 
+        Node::Revolve { ref profile, major } => {
+            // Spinning reaches the profile's furthest radius in every
+            // direction across the plate. Whichever end of the profile is
+            // further from the axis sets that radius, since the profile is
+            // swept on both sides of it.
+            let (lo, hi) = profile.bounds();
+            let r = (major + hi.x).abs().max((major + lo.x).abs());
+            Aabb {
+                min: Vec3::new(-r, -r, lo.y),
+                max: Vec3::new(r, r, hi.y),
+            }
+        }
+
         // A smooth blend bulges outward near the seam. Expanding by the full
         // blend radius over-estimates (the true bulge is at most a quarter of
         // it) but stays on the safe side of never under-reporting.

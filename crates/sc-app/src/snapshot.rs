@@ -40,6 +40,9 @@ pub(crate) enum Scene {
     Pattern,
     /// A move mid-drag, latched onto another feature, with its guide showing.
     Snap,
+    /// A turned part: a profile spun about the axis, which no stack of
+    /// primitives can express.
+    Turned,
     /// The guided tour on its first card.
     Tutorial,
     /// A selected box with its dimension grips showing.
@@ -66,7 +69,7 @@ impl Scene {
     /// `every_scene_can_be_asked_for`. Keeping the flags in a chain of `if`s
     /// somewhere else is how [`Scene::Pattern`] came to exist with no way to ask
     /// for it, which looks exactly like a scene that renders nothing.
-    const FLAGS: [(&'static str, Self); 10] = [
+    const FLAGS: [(&'static str, Self); 11] = [
         ("--dialog", Self::Dialog),
         ("--sample", Self::Sample),
         ("--hover", Self::Hover),
@@ -76,6 +79,7 @@ impl Scene {
         ("--engine", Self::Engine),
         ("--pattern", Self::Pattern),
         ("--snap", Self::Snap),
+        ("--turned", Self::Turned),
         ("--showcase", Self::Showcase),
     ];
 
@@ -171,6 +175,39 @@ fn snap_scene(mut state: AppState) -> AppState {
     state
 }
 
+/// A knob, turned on the lathe.
+///
+/// Drawn as a lathe profile rather than assembled from primitives, because a
+/// waisted stem and a domed top are exactly what a stack of cylinders cannot
+/// express and what the node exists for.
+fn turned_scene(mut state: AppState) -> AppState {
+    state.new_document();
+    state.set_plane(crate::plane::SketchPlane::Xz);
+    state.start_sketch();
+    // The outline of a knob, drawn as a lathe profile: a wide base, a
+    // waisted stem and a domed top. Nothing in it is a cylinder, which
+    // is the point of having the node at all.
+    for (r, h) in [
+        (0.0, 0.0),
+        (16.0, 0.0),
+        (16.0, 3.0),
+        (11.0, 6.0),
+        (9.0, 14.0),
+        (12.0, 20.0),
+        (11.0, 25.0),
+        (6.0, 28.0),
+        (0.0, 29.0),
+    ] {
+        state.add_sketch_point(sc_geom::glam::Vec2::new(r, h));
+    }
+    state.revolve_sketch();
+    state.frame_model();
+    state.rig.goal.yaw = -0.9;
+    state.rig.goal.pitch = 0.35;
+    state.rig.snap_to(state.rig.goal);
+    state
+}
+
 /// Builds the document and camera a scene asks for.
 fn pose(scene: Scene) -> AppState {
     let mut state = AppState::new();
@@ -220,6 +257,7 @@ fn pose(scene: Scene) -> AppState {
             state.status = "Ready".to_string();
         }
         Scene::Snap => return snap_scene(state),
+        Scene::Turned => return turned_scene(state),
         Scene::Grips => {
             state.new_document();
             state.add_body(
@@ -463,6 +501,7 @@ mod tests {
             Scene::Engine,
             Scene::Pattern,
             Scene::Snap,
+            Scene::Turned,
             Scene::Tutorial,
             Scene::Grips,
             Scene::Empty,
@@ -480,6 +519,7 @@ mod tests {
                 Scene::Engine
                 | Scene::Pattern
                 | Scene::Snap
+                | Scene::Turned
                 | Scene::Tutorial
                 | Scene::Grips
                 | Scene::Dialog

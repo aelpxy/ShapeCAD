@@ -110,6 +110,22 @@ pub fn eval(arena: &Arena, id: NodeId, p: Vec3) -> f32 {
         // prism the cheapest node in the kernel rather than the dearest.
         Node::Prism { ref profile } => profile.distance(Vec2::new(p.x, p.y)),
 
+        // Exact, not an approximation. The distance to a surface of revolution
+        // is the profile's own 2D distance measured in the half plane where the
+        // first coordinate is the radius and the second is the height, because
+        // spinning a point about the axis does not change either of them.
+        Node::Revolve { ref profile, major } => {
+            // Both radii, not just the positive one. The solid a lathe makes is
+            // the revolution of the profile together with its mirror image in
+            // the axis, and measuring against that mirrored pair is what keeps
+            // this an exact distance rather than one that collapses to zero
+            // wherever the profile meets the axis.
+            let r = Vec2::new(p.x, p.y).length();
+            let out = profile.distance(Vec2::new(r - major, p.z));
+            let back = profile.distance(Vec2::new(-r - major, p.z));
+            out.min(back)
+        }
+
         Node::Extrude { ref profile, depth } => {
             let plane = profile.distance(Vec2::new(p.x, p.y));
             let slab = (-p.z).max(p.z - depth);

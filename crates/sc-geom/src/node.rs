@@ -203,6 +203,51 @@ pub enum Node {
         /// The region swept.
         profile: Profile,
     },
+    /// A closed profile spun a full turn about the Z axis.
+    ///
+    /// The lathe. Every round part is one of these: a knob, a spacer, a bottle
+    /// cap, a pulley, a funnel. Stacking cylinders and tori approximates a few
+    /// of them and cannot express a curved wall at all, so until this existed
+    /// the kernel simply could not make most round things.
+    ///
+    /// The profile is read in the half plane where the first coordinate is the
+    /// distance from the Z axis and the second is height along it, which is how
+    /// a lathe profile is drawn everywhere else. Exact, not an approximation:
+    /// spinning a point about the axis changes neither of those two numbers, so
+    /// the distance to the surface of revolution is the profile's own 2D
+    /// distance measured in that plane.
+    ///
+    /// `major` is how far the profile's own origin sits from the axis, which is
+    /// the same quantity [`Node::Torus`] calls by that name: revolving a circle
+    /// at a major distance is a torus. Profiles are canonically centred on their
+    /// own origin, here as everywhere else in the kernel, so without it a
+    /// revolve could only ever be a solid centred on the axis.
+    ///
+    /// The profile is read at both the positive and the negative radius, so a
+    /// profile that crosses the axis sweeps both of its halves. That is what
+    /// makes a solid turning: a knob is a profile drawn across the axis, a ring
+    /// is one drawn clear of it.
+    ///
+    /// Reading only the positive side would be cheaper and wrong. The profile
+    /// edge sitting on the axis is not a surface of the solid, so the field
+    /// would report zero along the whole axis, and the mesher would believe
+    /// that sign change and put a pinhole up the middle of every turning.
+    ///
+    /// Like a union, this reads as a minimum, so the depth it reports just
+    /// inside the axis is a lower bound rather than the exact distance. The
+    /// surface is exactly where it should be, which is what meshing and tracing
+    /// depend on. A profile whose edge lands precisely on the axis is the one
+    /// case that still reports zero there, and
+    /// `a_profile_exactly_on_the_axis_still_meshes_closed` over in `sc-mesh` is
+    /// what says that costs nothing: the mesh comes out closed anyway. Crossing
+    /// the axis by any amount, which is the usual way to draw a turning, does
+    /// not reach the case at all.
+    Revolve {
+        /// The region spun.
+        profile: Profile,
+        /// Distance from the axis to the profile's origin.
+        major: f32,
+    },
     /// The same subtree repeated, in a line or about an axis.
     ///
     /// A part with four bolt holes is four holes, and until this existed the
@@ -311,6 +356,10 @@ impl PartialEq for Node {
             Node::Prism { profile } => {
                 matches!(other, Node::Prism { profile: p } if profile == p)
             }
+            Node::Revolve { profile, major } => matches!(
+                other,
+                Node::Revolve { profile: p, major: m } if profile == p && major == m
+            ),
             Node::Shell { child, thickness } => matches!(
                 other,
                 Node::Shell { child: c, thickness: t } if child == c && thickness == t
@@ -419,6 +468,7 @@ impl Node {
             | Node::Offset { .. }
             | Node::Extrude { .. }
             | Node::Prism { .. }
+            | Node::Revolve { .. }
             | Node::Shell { .. } => None,
         }
     }
@@ -452,6 +502,7 @@ impl Node {
             Node::Offset { .. } => "offset",
             Node::Extrude { .. } => "extrude",
             Node::Prism { .. } => "prism",
+            Node::Revolve { .. } => "revolve",
             Node::Pattern { .. } => "pattern",
             Node::Shell { .. } => "shell",
         }
@@ -478,6 +529,7 @@ impl Node {
             | Node::Offset { .. }
             | Node::Extrude { .. }
             | Node::Prism { .. }
+            | Node::Revolve { .. }
             | Node::Shell { .. } => None,
         }
     }
@@ -508,7 +560,8 @@ impl Node {
             | Node::Plane { .. }
             | Node::Mesh { .. }
             | Node::Extrude { .. }
-            | Node::Prism { .. } => (None, None),
+            | Node::Prism { .. }
+            | Node::Revolve { .. } => (None, None),
         };
         a.into_iter().chain(b)
     }
@@ -541,7 +594,8 @@ impl Node {
             | Node::Plane { .. }
             | Node::Mesh { .. }
             | Node::Extrude { .. }
-            | Node::Prism { .. } => {}
+            | Node::Prism { .. }
+            | Node::Revolve { .. } => {}
         }
     }
 
@@ -562,10 +616,17 @@ impl Node {
         if let Node::Prism { profile } = self {
             return profile.params();
         }
+        // A revolve has no depth either, since it closes on itself, but it does
+        // have the distance from the axis that puts the profile where it is.
+        if let Node::Revolve { profile, major } = self {
+            let mut out = profile.params();
+            out.push(("major", *major));
+            return out;
+        }
         match *self {
             // Handled above; it cannot be bound here because a profile is not
             // `Copy`.
-            Node::Extrude { .. } | Node::Prism { .. } => {
+            Node::Extrude { .. } | Node::Prism { .. } | Node::Revolve { .. } => {
                 unreachable!("swept profiles are handled before the copy match")
             }
             Node::Sphere { radius } => vec![("radius", radius)],
@@ -630,6 +691,13 @@ impl Node {
     /// node kind, leaving the node untouched.
     pub fn set_param(&mut self, name: &str, v: f32) -> bool {
         if let Node::Prism { profile } = self {
+            return profile.set_param(name, v);
+        }
+        if let Node::Revolve { profile, major } = self {
+            if name == "major" {
+                *major = v;
+                return true;
+            }
             return profile.set_param(name, v);
         }
         if let Node::Extrude { profile, depth } = self {
@@ -727,6 +795,9 @@ impl Node {
         if let Node::Prism { profile } = self {
             return profile.is_valid();
         }
+        if let Node::Revolve { profile, major } = self {
+            return profile.is_valid() && major.is_finite();
+        }
         match *self {
             Node::Sphere { radius } => radius > 0.0,
             Node::Box { half, round } => {
@@ -773,7 +844,7 @@ impl Node {
             Node::Offset { .. } => true,
             Node::Shell { thickness, .. } => thickness > 0.0,
             // Matched by reference: the profile is not `Copy`.
-            Node::Extrude { .. } | Node::Prism { .. } => {
+            Node::Extrude { .. } | Node::Prism { .. } | Node::Revolve { .. } => {
                 unreachable!("swept profiles are handled before the copy match")
             }
         }
@@ -1045,6 +1116,210 @@ mod pattern_tests {
         assert!(
             b.max.x >= 31.0 - 1.0e-3,
             "the last instance is outside {b:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod revolve_tests {
+    use super::Node;
+    use crate::glam::{Vec2, Vec3};
+    use crate::profile::Profile;
+    use crate::{bounds, eval, Arena, NodeId};
+
+    /// A circle of radius `minor` spun at `major`: a torus, by another route.
+    fn ring(major: f32, minor: f32) -> (Arena, NodeId) {
+        let mut arena = Arena::new();
+        let id = arena
+            .insert(Node::Revolve {
+                profile: Profile::Circle { radius: minor },
+                major,
+            })
+            .expect("valid");
+        (arena, id)
+    }
+
+    /// The reference the whole node is checked against. Revolving a circle is a
+    /// torus, and the kernel already has an exact torus, so any disagreement
+    /// between them is this node being wrong rather than a judgement call.
+    #[test]
+    fn revolving_a_circle_agrees_with_the_torus() {
+        let (arena, revolved) = ring(10.0, 3.0);
+        let mut other = Arena::new();
+        let torus = other
+            .insert(Node::Torus {
+                major: 10.0,
+                minor: 3.0,
+            })
+            .expect("valid");
+
+        // Points spread across the inside, the tube and well outside it.
+        for p in [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(10.0, 0.0, 0.0),
+            Vec3::new(7.5, 0.0, 0.0),
+            Vec3::new(0.0, 13.0, 0.0),
+            Vec3::new(6.0, 6.0, 2.0),
+            Vec3::new(0.0, 0.0, 9.0),
+            Vec3::new(-11.0, 4.0, -1.5),
+        ] {
+            let a = eval(&arena, revolved, p);
+            let b = eval(&other, torus, p);
+            assert!(
+                (a - b).abs() < 1.0e-4,
+                "at {p:?} the revolve gave {a} and the torus {b}"
+            );
+        }
+    }
+
+    /// A solid turning, not a ring: crossing the axis is what makes the
+    /// difference, and the centre has to come out solid.
+    #[test]
+    fn a_profile_across_the_axis_makes_a_solid() {
+        let mut arena = Arena::new();
+        // A 4 by 2 rectangle pushed out by 1 reaches from one millimetre past
+        // the axis to three past it, so this is a disc of radius 3 and height 2.
+        let id = arena
+            .insert(Node::Revolve {
+                profile: Profile::Rect {
+                    width: 4.0,
+                    height: 2.0,
+                },
+                major: 1.0,
+            })
+            .expect("valid");
+
+        assert!(
+            eval(&arena, id, Vec3::ZERO) < 0.0,
+            "the axis came out hollow"
+        );
+        assert!(
+            eval(&arena, id, Vec3::new(2.9, 0.0, 0.0)) < 0.0,
+            "not solid"
+        );
+        assert!(eval(&arena, id, Vec3::new(3.1, 0.0, 0.0)) > 0.0, "too wide");
+        assert!(eval(&arena, id, Vec3::new(0.0, 0.0, 1.1)) > 0.0, "too tall");
+    }
+
+    /// The field has to be a true distance, not merely the right sign, or sphere
+    /// tracing overshoots the surface and the mesher cuts in the wrong place.
+    #[test]
+    fn the_field_is_an_exact_distance() {
+        let (arena, id) = ring(10.0, 3.0);
+        for p in [
+            Vec3::new(20.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 8.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(6.0, 8.0, 5.0),
+        ] {
+            // The distance from a point to a torus, worked out directly: reduce
+            // to the half plane, then measure to the tube's centre circle.
+            let q = Vec2::new(Vec2::new(p.x, p.y).length() - 10.0, p.z);
+            let want = q.length() - 3.0;
+            let got = eval(&arena, id, p);
+            assert!((got - want).abs() < 1.0e-4, "at {p:?}: {got} not {want}");
+        }
+    }
+
+    /// The far half of a straddling profile is swept too, rather than being
+    /// quietly dropped. Reading only the positive radius would make the solid
+    /// smaller than the profile drawn, with nothing to say why.
+    #[test]
+    fn the_far_half_of_a_straddling_profile_is_swept() {
+        let mut arena = Arena::new();
+        // A circle of radius 3 pushed out by 1 reaches from two millimetres on
+        // the far side of the axis to four on the near side. Swept on both
+        // sides, the widest point of the solid is four.
+        let id = arena
+            .insert(Node::Revolve {
+                profile: Profile::Circle { radius: 3.0 },
+                major: 1.0,
+            })
+            .expect("valid");
+
+        assert!(
+            eval(&arena, id, Vec3::new(3.9, 0.0, 0.0)) < 0.0,
+            "cut short"
+        );
+        assert!(eval(&arena, id, Vec3::new(4.1, 0.0, 0.0)) > 0.0, "too wide");
+        let b = bounds(&arena, id);
+        assert!((b.max.x - 4.0).abs() < 1.0e-4, "{b:?}");
+    }
+
+    /// Just inside the axis the depth is a lower bound rather than the exact
+    /// distance, exactly as a union's is at its own seam. The sign has to be
+    /// right and the magnitude must never overshoot, because sphere tracing
+    /// steps by this number.
+    #[test]
+    fn near_the_axis_the_depth_never_overshoots() {
+        let mut arena = Arena::new();
+        let id = arena
+            .insert(Node::Revolve {
+                profile: Profile::Rect {
+                    width: 4.0,
+                    height: 2.0,
+                },
+                major: 1.0,
+            })
+            .expect("valid");
+
+        for z in [0.0_f32, 0.4, -0.6] {
+            for r in [0.0_f32, 0.05, 0.2, 0.9] {
+                let got = eval(&arena, id, Vec3::new(r, 0.0, z));
+                // The disc is radius 3 and half height 1, so the true depth is
+                // whichever surface is nearer.
+                let truth = -(3.0 - r).min(1.0 - z.abs());
+                assert!(got < 0.0, "at r {r}, z {z} the inside read as outside");
+                assert!(
+                    got >= truth - 1.0e-4,
+                    "at r {r}, z {z} it overshot: {got} past {truth}"
+                );
+            }
+        }
+    }
+
+    /// Bounds have to contain the solid, and a revolve reaches its outer radius
+    /// in every direction across the plate rather than only along the profile.
+    #[test]
+    fn bounds_cover_the_whole_turn() {
+        let (arena, id) = ring(10.0, 3.0);
+        let b = bounds(&arena, id);
+        assert!(b.is_finite(), "{b:?}");
+        for p in [
+            Vec3::new(13.0, 0.0, 0.0),
+            Vec3::new(0.0, 13.0, 0.0),
+            Vec3::new(-13.0, 0.0, 0.0),
+            Vec3::new(0.0, -13.0, 0.0),
+        ] {
+            assert!(
+                p.cmpge(b.min).all() && p.cmple(b.max).all(),
+                "{p:?} is on the surface but outside {b:?}"
+            );
+        }
+        assert!((b.max.z - 3.0).abs() < 1.0e-4, "{b:?}");
+    }
+
+    /// `major` is editable like any other dimension, and the profile's own
+    /// parameters still come through beside it.
+    #[test]
+    fn major_is_an_editable_parameter() {
+        let mut node = Node::Revolve {
+            profile: Profile::Circle { radius: 3.0 },
+            major: 10.0,
+        };
+        let names: Vec<&str> = node.params().iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"major"), "{names:?}");
+        assert!(names.contains(&"radius"), "{names:?}");
+
+        assert!(node.set_param("major", 12.0));
+        assert!(node.set_param("radius", 2.0));
+        assert!(!node.set_param("depth", 1.0), "a revolve grew a depth");
+        assert_eq!(
+            node,
+            Node::Revolve {
+                profile: Profile::Circle { radius: 2.0 },
+                major: 12.0,
+            }
         );
     }
 }

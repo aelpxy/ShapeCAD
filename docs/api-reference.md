@@ -260,6 +260,7 @@ Validation happens when the document or arena accepts that node.
 | Transform with `on` set | Reported but not settable | Position is regenerated from the attached face; `set_param` returns `false` |
 | Mesh | None | The grid is fixed at import; resolution is read-only via `Node::mesh_resolution` |
 | Prism | Profile keys only | No depth: an unbounded sweep has none. This is how "through all" is expressed |
+| Revolve | Profile keys plus `major` | No depth either, since it closes on itself. `major` is the distance from the axis to the profile's origin, the same quantity a torus calls by that name |
 | Pattern, linear | `count`, `step_x`, `step_y`, `step_z` | Copies and the vector between neighbours |
 | Pattern, circular | `count`, `sweep` | Copies and the total swept angle, in degrees |
 | Offset | `distance` | Positive grows; negative shrinks |
@@ -747,6 +748,10 @@ pub enum Node {
     Prism {
         profile: Profile,    // swept without end along Z
     },
+    Revolve {
+        profile: Profile,    // spun about Z, read as a radius against a height
+        major: f32,          // distance from the axis to the profile's origin
+    },
     Pattern {
         child: NodeId,
         kind: Repeat,        // how one instance is placed relative to the last
@@ -779,6 +784,7 @@ degrees while a 90 degree pattern of 3 places them at 0, 45 and 90.
 
 | Item | Signature | Behavior / failure conditions |
 | --- | --- | --- |
+| `Node::Revolve` (semantics) | | The profile is read at both the positive and the negative radius, so one drawn across the axis makes a solid turning and one clear of it makes a ring, with no mode to choose between. Reading only the positive side would report zero along the whole axis, because the profile edge sitting on the axis is not a surface of the solid. Like a union this reads as a minimum, so the depth just inside the axis is a lower bound rather than exact; the surface is exact, which is what meshing and tracing need. |
 | `polygon_area` | `pub fn polygon_area(points: &[Vec2]) -> f32` | Twice the signed area of a polygon, by the shoelace formula. |
 | `Node::kind` | `pub fn kind(&self) -> &'static str` | Stable machine-readable tag. Part of the agent-facing vocabulary, so treat these strings as API. |
 | `Node::derived_from` | `pub fn derived_from(&self) -> Option<NodeId>` | The node this one's placement was derived from, if any. Separate from `children()` on purpose: a reference to protect, not an operand to evaluate. |
@@ -1513,6 +1519,7 @@ pub(crate) struct AppState {
 | `AppState::add_sketch_point` | `pub(crate) fn add_sketch_point(&mut self, point: Vec2)` | Adds a point to the profile in progress. |
 | `AppState::undo_sketch_point` | `pub(crate) fn undo_sketch_point(&mut self)` | Internal helper; see source for behavior. |
 | `AppState::finish_sketch` | `pub(crate) fn finish_sketch(&mut self)` | Turns the profile in progress into an extruded solid. |
+| `AppState::revolve_sketch` | `pub(crate) fn revolve_sketch(&mut self)` | Turns the profile in progress on the lathe instead. The sketch plane's vertical is the axis and its horizontal is the radius, which is how a lathe profile is drawn everywhere. The points already carry their distance from the plane origin, so the node's own `major` is zero. |
 | `AppState::select` | `pub(crate) fn select(&mut self, id: Option<NodeId>)` | Selects a node and refreshes the viewport highlight. |
 | `AppState::export_stl` | `pub(crate) fn export_stl(&mut self, path: &Path, resolution: u32)` | Meshes the model and writes it as STL. |
 

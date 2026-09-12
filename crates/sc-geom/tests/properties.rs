@@ -61,6 +61,12 @@ enum Shape {
     /// doing exactly the job it exists for, and the bounds come from the solid
     /// being cut.
     ThroughCut(Box<Shape>, Profile),
+    /// A closed profile spun about the Z axis, at a given distance from it.
+    ///
+    /// A revolve reads its profile twice, at the positive and the negative
+    /// radius, which is a path no other node takes, so leaving it out would
+    /// leave that whole piece of the emitter to the unit tests alone.
+    Revolved(Profile, f32),
     /// The same shape repeated along a line.
     ///
     /// A pattern is the only node whose shader is a loop calling a function
@@ -88,6 +94,10 @@ fn materialize_leaf(s: &Shape, b: &mut Builder) -> Option<sc_geom::Result<NodeId
         }
         Shape::Torus(major, minor) => b.torus(*major, minor.min(major * 0.9)),
         Shape::Extrude(profile, depth) => b.extrude(profile.clone(), *depth),
+        Shape::Revolved(profile, major) => b.arena.insert(sc_geom::Node::Revolve {
+            profile: profile.clone(),
+            major: *major,
+        }),
         Shape::Mesh(radius, dims, boxy) => {
             let (radius, dims) = (*radius, *dims);
             // Spacing is derived from the radius so that every generated grid
@@ -187,6 +197,7 @@ fn materialize(s: &Shape, b: &mut Builder) -> sc_geom::Result<NodeId> {
         | Shape::Cylinder(..)
         | Shape::Torus(..)
         | Shape::Extrude(..)
+        | Shape::Revolved(..)
         | Shape::Mesh(..) => unreachable!("a leaf reached the composite match"),
         Shape::On(x, base, t) => {
             let under = materialize(base, b)?;
@@ -226,7 +237,8 @@ fn contains_mesh(s: &Shape) -> bool {
         | Shape::Cuboid(..)
         | Shape::Cylinder(..)
         | Shape::Torus(..)
-        | Shape::Extrude(..) => false,
+        | Shape::Extrude(..)
+        | Shape::Revolved(..) => false,
     }
 }
 
@@ -291,6 +303,10 @@ fn arb_leaf(inexact: bool) -> impl Strategy<Value = Shape> {
         (0.5f32..8.0, 0.5f32..8.0, 0.0f32..1.0).prop_map(|(r, h, o)| Shape::Cylinder(r, h, o)),
         (1.0f32..8.0, 0.2f32..3.0).prop_map(|(a, b)| Shape::Torus(a, b)),
         (arb_profile(), 1.0f32..8.0).prop_map(|(profile, depth)| Shape::Extrude(profile, depth)),
+        // The distance from the axis spans both cases on purpose: small values
+        // put the profile across the axis, which makes a solid turning, and
+        // large ones clear it, which makes a ring.
+        (arb_profile(), 0.0f32..12.0).prop_map(|(profile, major)| Shape::Revolved(profile, major)),
     ];
     if !inexact {
         return exact.boxed();

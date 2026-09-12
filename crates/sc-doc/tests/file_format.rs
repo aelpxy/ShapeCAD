@@ -99,9 +99,9 @@ fn a_version_2_document_still_loads() {
 }
 
 #[test]
-fn version_5_is_what_this_build_writes() {
-    assert_eq!(FORMAT_VERSION, 5);
-    assert_eq!(samples::bracket().snapshot().format, 5);
+fn version_6_is_what_this_build_writes() {
+    assert_eq!(FORMAT_VERSION, 6);
+    assert_eq!(samples::bracket().snapshot().format, 6);
 }
 
 #[test]

@@ -227,6 +227,19 @@ fn sketch_menu(ui: &mut egui::Ui, state: &mut AppState) {
     }
     if theme::menu_item(
         ui,
+        Icon::Cylinder,
+        "Finish and turn",
+        Some("R"),
+        points >= 3,
+        false,
+    )
+    .clicked()
+    {
+        state.revolve_sketch();
+        state.close_menu();
+    }
+    if theme::menu_item(
+        ui,
         Icon::Undo,
         "Remove last point",
         Some("Backspace"),
@@ -503,15 +516,18 @@ fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
     }
 
     if state.sketch.is_some() {
-        let (finish, cancel, back) = ctx.input_mut(|i| {
+        let (finish, turn, cancel, back) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::Enter),
+                i.consume_key(Modifiers::NONE, Key::R),
                 i.consume_key(Modifiers::NONE, Key::Escape),
                 i.consume_key(Modifiers::NONE, Key::Backspace),
             )
         });
         if finish {
             state.finish_sketch();
+        } else if turn {
+            state.revolve_sketch();
         } else if cancel {
             state.cancel_sketch();
             state.tool = TOOL_SELECT;
@@ -2587,7 +2603,7 @@ fn sketch_overlay(
             );
             ui.label(
                 RichText::new(format!(
-                    "{:.0} mm grid · Enter to extrude · Backspace undo · Esc cancel",
+                    "{:.0} mm grid · Enter to pad · R to turn · Backspace undo · Esc cancel",
                     state.grid
                 ))
                 .size(11.5)
@@ -2615,6 +2631,10 @@ fn describe_node(node: &Node) -> &'static str {
         Node::Prism { .. } => {
             "A profile swept without end, used to cut all the way through. It has no depth to \
              go stale, so the hole stays open however the part around it changes."
+        }
+        Node::Revolve { .. } => {
+            "A profile spun a full turn about the Z axis, the way a lathe cuts. The profile is \
+             read as a radius against a height."
         }
         Node::Mesh { .. } => {
             "An imported mesh, resampled onto a voxel grid so it can be cut and joined like \

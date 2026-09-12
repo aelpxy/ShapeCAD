@@ -356,3 +356,87 @@ fn a_feature_thinner_than_a_cell_is_absent_rather_than_noise() {
         );
     }
 }
+
+/// A solid turning has to come out solid all the way to the axis.
+///
+/// The axis is where a revolve's field is weakest: the profile is read on both
+/// sides of it and combined with a minimum, so just inside the axis the depth
+/// reported is a lower bound rather than the exact distance. A mesher that
+/// believed a zero there would put a pinhole up the middle of every knob.
+#[test]
+fn a_solid_turning_has_no_hole_up_the_axis() {
+    // A rectangle reaching across the axis: a disc of radius 6, height 4.
+    let mesh = mesh_of(
+        |b| {
+            b.arena
+                .insert(Node::Revolve {
+                    profile: Profile::Rect {
+                        width: 8.0,
+                        height: 4.0,
+                    },
+                    major: 2.0,
+                })
+                .unwrap()
+        },
+        64,
+    );
+    assert!(mesh.triangle_count() > 0, "nothing was meshed");
+    assert_printable(&mesh, "solid turning");
+
+    let expected = std::f32::consts::PI * 36.0 * 4.0;
+    let actual = mesh.volume();
+    assert!(
+        (actual - expected).abs() / expected < 0.02,
+        "turning volume {actual} differs from {expected} by more than 2%"
+    );
+}
+
+/// The profile edge landing exactly on the axis is the one case the field
+/// reports as zero there. Meshing it is what says whether that zero becomes a
+/// hole in an exported part or is harmless.
+#[test]
+fn a_profile_exactly_on_the_axis_still_meshes_closed() {
+    let mesh = mesh_of(
+        |b| {
+            b.arena
+                .insert(Node::Revolve {
+                    profile: Profile::Rect {
+                        width: 8.0,
+                        height: 4.0,
+                    },
+                    // Half the width, so the inner edge is exactly on the axis.
+                    major: 4.0,
+                })
+                .unwrap()
+        },
+        64,
+    );
+    assert!(mesh.triangle_count() > 0, "nothing was meshed");
+    assert_printable(&mesh, "turning with its profile on the axis");
+}
+
+/// A ring is the other half of what a revolve is for, and it is a shape with a
+/// hole that is meant to be there.
+#[test]
+fn a_revolved_ring_is_watertight() {
+    let mesh = mesh_of(
+        |b| {
+            b.arena
+                .insert(Node::Revolve {
+                    profile: Profile::Circle { radius: 3.0 },
+                    major: 10.0,
+                })
+                .unwrap()
+        },
+        72,
+    );
+    assert_printable(&mesh, "revolved ring");
+
+    // The volume of a torus, which is what revolving a circle makes.
+    let expected = 2.0 * std::f32::consts::PI * std::f32::consts::PI * 10.0 * 9.0;
+    let actual = mesh.volume();
+    assert!(
+        (actual - expected).abs() / expected < 0.02,
+        "ring volume {actual} differs from {expected} by more than 2%"
+    );
+}
