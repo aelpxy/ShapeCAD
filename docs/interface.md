@@ -116,6 +116,41 @@ on the plate, is something people deliberately want and then verify by reading
 the number back, so landing on 0.4 when aiming at 0 is a worse answer than the
 grid spacing alone suggests. Everything else rounds normally.
 
+## Editing a sketch after you drew it
+
+A profile used to be set the moment Enter was pressed. Draw a shape slightly
+wrong and the only way out was to delete it and draw the whole thing again,
+which is the kind of thing that makes somebody stop using a modeller.
+
+Select a feature and press **E**, or use Edit outline, and its corners come back
+over the part. Drag one to move it, click elsewhere to add one, Enter to apply,
+Escape to leave it as it was.
+
+Four decisions:
+
+**Rewritten in place, not rebuilt.** The node keeps its id, so every hole cut
+into the feature and every placement derived from its face stays attached. A new
+id would leave anything built on it pointing at a node that no longer exists,
+which is a broken model rather than an edited one.
+
+**The outline is drawn in the feature's own frame**, not on whichever datum
+plane the picker happens to show. A pad made on XZ has its corners over the pad,
+wherever the picker has since been moved to.
+
+**A corner takes the press before the plane does.** While an outline is open,
+the press nearest a corner grabs it; anywhere else adds a point. The other way
+round, trying to move a corner drops a new one on top of it, which looks exactly
+like the corner refusing to move.
+
+**A bad outline is handed back, not thrown away.** Pull a corner through its
+neighbour and the shape encloses nothing; the editor stays open with the points
+as they are, because somebody who has dragged a corner too far wants to drag it
+back.
+
+Rectangles, circles and polygons are not lists of corners. They are a width and
+a height, or a radius, already editable in the property panel, and Edit outline
+says so rather than refusing without a reason.
+
 ## Precision
 
 A grid is the floor of precision, not the whole of it. Most of the numbers

@@ -442,6 +442,42 @@ fn typed_number(ctx: &egui::Context, state: &mut AppState) {
     }
 }
 
+/// The shortcuts that are a single letter with nothing held down.
+///
+/// Split out from the rest because they are the ones that have to give way to a
+/// field being typed into: a dimension can be edited by typing as well as by
+/// dragging, and f there means f, not fit.
+fn unmodified_letters(ctx: &egui::Context, state: &mut AppState) {
+    use egui::{Key, KeyboardShortcut, Modifiers};
+
+    const FIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F);
+    const SKETCH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::S);
+    const EDIT_OUTLINE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::E);
+
+    if ctx.egui_wants_keyboard_input() {
+        return;
+    }
+    let (fit, sketch, edit) = ctx.input_mut(|i| {
+        (
+            i.consume_shortcut(&FIT),
+            i.consume_shortcut(&SKETCH),
+            i.consume_shortcut(&EDIT_OUTLINE),
+        )
+    });
+    if fit {
+        state.frame_model();
+    }
+    // Both are no-ops mid-sketch: S would throw away the outline being drawn and
+    // E would reopen a feature on top of it.
+    if state.sketch.is_none() {
+        if sketch {
+            state.start_sketch();
+        } else if edit {
+            state.reopen_sketch();
+        }
+    }
+}
+
 fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
     use egui::{Key, KeyboardShortcut, Modifiers};
 
@@ -457,7 +493,6 @@ fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
     const ZOOM_IN_EQ: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Equals);
     const ZOOM_OUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
     const ZOOM_RESET: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Num0);
-    const FIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F);
     const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::D);
 
     // A modal owns the keyboard. These are taken out of the queue before any
@@ -561,12 +596,7 @@ fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
         }
     });
 
-    // The one unmodified letter, so it is the one that has to give way to a
-    // field being typed into. A dimension can be edited by typing as well as by
-    // dragging, and f there means f, not fit.
-    if !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_shortcut(&FIT)) {
-        state.frame_model();
-    }
+    unmodified_letters(ctx, state);
 }
 
 fn file_browser(ctx: &egui::Context, state: &mut AppState) {
@@ -1188,6 +1218,18 @@ fn sketch_tools(ui: &mut egui::Ui, state: &mut AppState) {
         .clicked()
         {
             state.start_sketch();
+        }
+        let editable = state.selection_has_outline();
+        let row = rows.row(Icon::Cursor, "Edit outline", false, editable && !drawing);
+        if theme::hint(
+            row,
+            "Edit outline",
+            "Brings the selected feature's outline back so it can be changed. Drag a corner to move it, click elsewhere to add one, Enter to apply. The feature keeps its place in the model, so anything built on it stays attached.",
+            Some("E"),
+        )
+        .clicked()
+        {
+            state.reopen_sketch();
         }
         rows.custom(|ui| plane_row(ui, state));
     });
@@ -2574,14 +2616,20 @@ fn sketch_overlay(
         );
     }
 
-    rubber_band(ui, state, viewport, &painter, &screen, points);
+    // Only while the outline is being drawn. On a reopened one the next click
+    // inserts a point rather than continuing a line, and a line chasing the
+    // cursor would say otherwise.
+    if state.reopened.is_none() {
+        rubber_band(ui, state, viewport, &painter, &screen, points);
+    }
 
     for (i, point) in screen.iter().enumerate() {
         let first = i == 0;
+        let held = state.grabbed_point == Some(i);
         painter.circle(
             *point,
-            if first { 5.0 } else { 4.0 },
-            if first {
+            if held || first { 5.5 } else { 4.0 },
+            if first || held {
                 theme::palette().accent
             } else {
                 theme::palette().surface
@@ -2601,13 +2649,15 @@ fn sketch_overlay(
                     .size(12.0)
                     .family(theme::semibold()),
             );
+            let keys = if state.reopened.is_some() {
+                "Drag a corner · Enter to apply · Esc to leave it as it was"
+            } else {
+                "Enter to pad · R to turn · Backspace undo · Esc cancel"
+            };
             ui.label(
-                RichText::new(format!(
-                    "{:.0} mm grid · Enter to pad · R to turn · Backspace undo · Esc cancel",
-                    state.grid
-                ))
-                .size(11.5)
-                .color(theme::palette().text_dim),
+                RichText::new(format!("{:.0} mm grid · {keys}", state.grid))
+                    .size(11.5)
+                    .color(theme::palette().text_dim),
             );
         });
     });

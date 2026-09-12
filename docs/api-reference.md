@@ -1428,6 +1428,11 @@ pub(crate) struct ContextMenu {
 ```
 
 ```rust,ignore
+pub(crate) struct Reopened {
+    pub node: NodeId,       // the swept node whose profile is being rewritten
+    pub frame: Transform,   // the frame it sits in, so the outline draws over it
+}
+
 pub(crate) struct AppState {
     pub doc: Document,
     pub rig: CameraRig,
@@ -1453,6 +1458,8 @@ pub(crate) struct AppState {
     pub snap_lines: [Vec<snap::Line>; 3], // what the move in flight can latch onto
     pub guides: [Option<Vec3>; 3],      // where to draw a guide, per axis
     pub entry: Option<entry::Entry>,    // a number being typed
+    pub reopened: Option<Reopened>,     // the feature whose outline is open
+    pub grabbed_point: Option<usize>,   // the corner being dragged
     pub armed: Option<Armed>,
     pub tutorial: Option<Tutorial>,
 }
@@ -1518,7 +1525,11 @@ pub(crate) struct AppState {
 | `AppState::snap` | `pub(crate) fn snap(&self, point: Vec2) -> Vec2` | Rounds a plate position to the sketch grid. |
 | `AppState::add_sketch_point` | `pub(crate) fn add_sketch_point(&mut self, point: Vec2)` | Adds a point to the profile in progress. |
 | `AppState::undo_sketch_point` | `pub(crate) fn undo_sketch_point(&mut self)` | Internal helper; see source for behavior. |
-| `AppState::finish_sketch` | `pub(crate) fn finish_sketch(&mut self)` | Turns the profile in progress into an extruded solid. |
+| `AppState::finish_sketch` | `pub(crate) fn finish_sketch(&mut self)` | Turns the profile in progress into an extruded solid, or writes it back into the feature it was reopened from. A reopened feature is replaced in place, keeping its id, so everything built on it stays attached; an outline that encloses no area is handed back rather than thrown away. |
+| `AppState::reopen_sketch` | `pub(crate) fn reopen_sketch(&mut self)` | Brings the selected feature's outline back for editing, looking through the wrappers a finished feature wears. Refuses a parametric profile by naming where it *is* edited, since a rectangle is a width and a height rather than four corners. |
+| `AppState::selection_has_outline` | `pub(crate) fn selection_has_outline(&self) -> bool` | Whether there is an outline to reopen. Gates the action so a row that can do nothing says so before it is pressed. |
+| `AppState::move_sketch_point` | `pub(crate) fn move_sketch_point(&mut self, index: usize, to: Vec2)` | Moves one corner of the outline in flight. |
+| `AppState::point_near` | `pub(crate) fn point_near(&self, at: Vec2, reach: f32) -> Option<usize>` | The nearest corner within `reach`, in sketch coordinates. The caller converts a screen distance once and passes it in. |
 | `AppState::revolve_sketch` | `pub(crate) fn revolve_sketch(&mut self)` | Turns the profile in progress on the lathe instead. The sketch plane's vertical is the axis and its horizontal is the radius, which is how a lathe profile is drawn everywhere. The points already carry their distance from the plane origin, so the node's own `major` is zero. |
 | `AppState::select` | `pub(crate) fn select(&mut self, id: Option<NodeId>)` | Selects a node and refreshes the viewport highlight. |
 | `AppState::export_stl` | `pub(crate) fn export_stl(&mut self, path: &Path, resolution: u32)` | Meshes the model and writes it as STL. |

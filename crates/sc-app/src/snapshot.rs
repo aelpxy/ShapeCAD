@@ -18,7 +18,7 @@ use sc_render::{gpu, snapshot as capture, Renderer};
 /// on the ADD heading and no tooltip appeared, which looks exactly like a
 /// tooltip that stopped working. `the_hover_scene_shows_a_tooltip` is what
 /// notices next time.
-const HOVER_POINT: egui::Pos2 = egui::pos2(100.0, 358.0);
+const HOVER_POINT: egui::Pos2 = egui::pos2(100.0, 387.0);
 
 /// How [`Scene::Showcase`] poses the camera: a three quarter view from the open
 /// side, so the filleted joint, both drilled holes and the upright face are all
@@ -43,6 +43,8 @@ pub(crate) enum Scene {
     /// A turned part: a profile spun about the axis, which no stack of
     /// primitives can express.
     Turned,
+    /// A finished pad with its outline reopened, one corner in hand.
+    Outline,
     /// The guided tour on its first card.
     Tutorial,
     /// A selected box with its dimension grips showing.
@@ -69,7 +71,7 @@ impl Scene {
     /// `every_scene_can_be_asked_for`. Keeping the flags in a chain of `if`s
     /// somewhere else is how [`Scene::Pattern`] came to exist with no way to ask
     /// for it, which looks exactly like a scene that renders nothing.
-    const FLAGS: [(&'static str, Self); 11] = [
+    const FLAGS: [(&'static str, Self); 12] = [
         ("--dialog", Self::Dialog),
         ("--sample", Self::Sample),
         ("--hover", Self::Hover),
@@ -80,6 +82,7 @@ impl Scene {
         ("--pattern", Self::Pattern),
         ("--snap", Self::Snap),
         ("--turned", Self::Turned),
+        ("--outline", Self::Outline),
         ("--showcase", Self::Showcase),
     ];
 
@@ -208,6 +211,41 @@ fn turned_scene(mut state: AppState) -> AppState {
     state
 }
 
+/// A pad whose outline has been reopened, with a corner in hand.
+///
+/// Left mid-edit on purpose. The corners only exist while an outline is open, so
+/// a capture taken after Enter would show an ordinary pad and say nothing about
+/// how it got there.
+fn outline_scene(mut state: AppState) -> AppState {
+    state.new_document();
+    state.start_sketch();
+    for (x, y) in [
+        (0.0, 0.0),
+        (30.0, 0.0),
+        (30.0, 12.0),
+        (14.0, 12.0),
+        (14.0, 24.0),
+        (0.0, 24.0),
+    ] {
+        state.add_sketch_point(sc_geom::glam::Vec2::new(x, y));
+    }
+    state.finish_sketch();
+    state.frame_model();
+    state.rig.goal.yaw = -0.85;
+    state.rig.goal.pitch = 0.62;
+    // Pulled back from the fit, so the corner dragged out past the pad is still
+    // in frame. Framing is done on the pad, which no longer covers the outline.
+    state.rig.goal.distance *= 1.5;
+    state.rig.snap_to(state.rig.goal);
+
+    state.reopen_sketch();
+    // A corner part way through being dragged, which is the state the feature
+    // exists for and the only one in which the highlight means anything.
+    state.grabbed_point = Some(2);
+    state.move_sketch_point(2, sc_geom::glam::Vec2::new(38.0, 12.0));
+    state
+}
+
 /// Builds the document and camera a scene asks for.
 fn pose(scene: Scene) -> AppState {
     let mut state = AppState::new();
@@ -258,6 +296,7 @@ fn pose(scene: Scene) -> AppState {
         }
         Scene::Snap => return snap_scene(state),
         Scene::Turned => return turned_scene(state),
+        Scene::Outline => return outline_scene(state),
         Scene::Grips => {
             state.new_document();
             state.add_body(
@@ -502,6 +541,7 @@ mod tests {
             Scene::Pattern,
             Scene::Snap,
             Scene::Turned,
+            Scene::Outline,
             Scene::Tutorial,
             Scene::Grips,
             Scene::Empty,
@@ -520,6 +560,7 @@ mod tests {
                 | Scene::Pattern
                 | Scene::Snap
                 | Scene::Turned
+                | Scene::Outline
                 | Scene::Tutorial
                 | Scene::Grips
                 | Scene::Dialog

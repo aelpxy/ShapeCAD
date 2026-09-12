@@ -230,6 +230,14 @@ fn viewport_ndc(viewport: [f32; 4], cursor: PhysicalPosition<f64>) -> Option<(Ve
 /// click, in physical pixels.
 const CLICK_SLOP: f64 = 5.0;
 
+/// How close the pointer has to be to an outline corner to take hold of it, in
+/// interface points.
+///
+/// Wider than a dimension grip, because a corner is drawn small and there is
+/// nothing else nearby to grab by mistake: the only alternative reading of the
+/// press is adding a point, which the rest of the plane is for.
+const POINT_REACH: f32 = 14.0;
+
 /// How long after a click a second one still pairs with it.
 const DOUBLE_CLICK_MS: u128 = 350;
 
@@ -899,6 +907,17 @@ impl App {
     /// Everything the pointer moving can mean: a free drag, a push/pull, a
     /// hover that lights a grip, or a camera gesture.
     fn pointer_moved(&mut self, position: PhysicalPosition<f64>) {
+        // A corner being dragged owns the pointer, the same way every other
+        // drag does.
+        if let Some(index) = self.state.grabbed_point {
+            self.cursor = Some(position);
+            if let Some(at) = self.sketch_plane_hit() {
+                let snapped = self.state.snap(at);
+                self.state.move_sketch_point(index, snapped);
+            }
+            self.request_redraw();
+            return;
+        }
         // A drag in progress owns the pointer outright: no orbit, no
         // pan, and no selection change underneath it.
         if self.state.moving.is_some() {
@@ -1050,14 +1069,9 @@ impl App {
 
     /// Places a sketch point where the pointer meets the build plate.
     fn place_sketch_point(&mut self) {
-        let Some((ndc, aspect)) = self.pointer_ndc() else {
-            return;
-        };
-        let origin = self.state.plane_origin();
-        let normal = self.state.plane_normal();
-        match self.state.camera().plane_hit(ndc, aspect, origin, normal) {
+        match self.sketch_plane_hit() {
             Some(hit) => {
-                let snapped = self.state.snap(self.state.to_plane(hit));
+                let snapped = self.state.snap(hit);
                 self.state.add_sketch_point(snapped);
             }
             None => self.state.status = "That is not on the sketch plane".to_string(),
@@ -1073,15 +1087,60 @@ impl App {
     /// be picked without being moved by accident.
     fn left_press(&mut self) {
         self.press_at = self.cursor;
-        if self.grab_grip() || self.grab_selection() {
+        if self.grab_sketch_point() || self.grab_grip() || self.grab_selection() {
             self.request_redraw();
             return;
         }
         self.input.gesture = Gesture::Orbit;
     }
 
+    /// Takes hold of an outline corner, if the press landed on one.
+    ///
+    /// Checked before everything else while a sketch is in flight, because the
+    /// alternative is that trying to move a corner adds another one on top of
+    /// it, which is the opposite of what was meant and looks like the corner
+    /// refusing to move.
+    fn grab_sketch_point(&mut self) -> bool {
+        if self.state.sketch.is_none() {
+            return false;
+        }
+        let Some(at) = self.sketch_plane_hit() else {
+            return false;
+        };
+        let [_, _, _, height] = self.viewport;
+        // A screen distance, converted once, so a corner is as easy to grab
+        // zoomed out as zoomed in.
+        let reach = self.state.camera().world_per_pixel(height) * POINT_REACH;
+        let Some(index) = self.state.point_near(at, reach) else {
+            return false;
+        };
+        self.state.grabbed_point = Some(index);
+        self.input.gesture = Gesture::None;
+        true
+    }
+
+    /// Where the pointer meets the plane the sketch is drawn on.
+    fn sketch_plane_hit(&self) -> Option<Vec2> {
+        let (ndc, aspect) = self.pointer_ndc()?;
+        let origin = self.state.plane_origin();
+        let normal = self.state.plane_normal();
+        let hit = self.state.camera().plane_hit(ndc, aspect, origin, normal)?;
+        Some(self.state.to_plane(hit))
+    }
+
     /// A left release: whatever the press started, finished.
     fn left_up(&mut self) {
+        // A corner that was being dragged has arrived. Answered here rather than
+        // through `left_release`, because letting the release fall through would
+        // add a point on top of the one just moved.
+        if self.state.grabbed_point.take().is_some() {
+            self.press_at = None;
+            self.input.gesture = Gesture::None;
+            self.state.status =
+                "Drag a corner to move it, click to add one, Enter to apply".to_string();
+            self.request_redraw();
+            return;
+        }
         let in_flight = InFlight {
             started: if self.state.drag.is_some() {
                 Started::Drag

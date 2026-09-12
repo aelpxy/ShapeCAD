@@ -166,6 +166,22 @@ pub(crate) struct MoveArm {
     pub head: Vec3,
 }
 
+/// A feature whose outline has been reopened for editing.
+///
+/// Until a sketch could be reopened, the points were set the moment Enter was
+/// pressed and the only way to fix a shape drawn slightly wrong was to delete it
+/// and draw the whole thing again. That is the kind of thing that makes somebody
+/// stop using a modeller.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Reopened {
+    /// The swept node whose profile is being rewritten. Rewritten in place,
+    /// keeping its id, so everything built on it stays attached.
+    pub node: NodeId,
+    /// The frame it sits in, so the outline is drawn over the feature itself
+    /// rather than back on whichever datum plane happens to be selected.
+    pub frame: Transform,
+}
+
 /// A push/pull drag in progress.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Drag {
@@ -202,6 +218,11 @@ pub(crate) struct AppState {
     /// `Some` means a sketch is in progress; the viewport draws it and the
     /// next click extends it.
     pub sketch: Option<Vec<Vec2>>,
+    /// The feature the sketch in flight came out of, if it was reopened rather
+    /// than drawn from scratch.
+    pub reopened: Option<Reopened>,
+    /// The outline point being dragged, as an index into `sketch`.
+    pub grabbed_point: Option<usize>,
     /// Depth the next feature will be given, in millimetres.
     pub extrude_height: f32,
     /// The datum plane the next sketch uses when nothing is attached.
@@ -282,6 +303,8 @@ impl AppState {
             plane: SketchPlane::default(),
             attached_to: None,
             sketch: None,
+            reopened: None,
+            grabbed_point: None,
             extrude_height: 10.0,
             grid: 1.0,
             path: None,
@@ -833,6 +856,7 @@ impl AppState {
             self.doc.end_step();
         }
         self.clear_snap();
+        self.end_outline_edit();
         self.armed = None;
         // A profile in progress is drawn in the old plane's coordinates, and
         // `attached_to` is another id belonging to the document being replaced.
@@ -1754,6 +1778,11 @@ impl AppState {
     /// The frame a sketch is drawn in: datum, or the face it is attached to.
     #[must_use]
     pub(crate) fn sketch_frame(&self) -> Transform {
+        // A reopened outline belongs to the feature it came from, wherever the
+        // plane picker happens to be pointing now.
+        if let Some(edit) = self.reopened {
+            return edit.frame;
+        }
         let attached = self.attached_to.and_then(|id| {
             let root = self.doc.root()?;
             sc_geom::pick::face_placement(self.doc.arena(), root, id)
@@ -2024,9 +2053,125 @@ impl AppState {
     }
 
     pub(crate) fn cancel_sketch(&mut self) {
+        let reopened = self.reopened.take().is_some();
+        self.grabbed_point = None;
         if self.sketch.take().is_some() {
-            self.status = "Sketch cancelled".to_string();
+            self.status = if reopened {
+                "Left the outline as it was".to_string()
+            } else {
+                "Sketch cancelled".to_string()
+            };
         }
+    }
+
+    /// Brings a feature's outline back so it can be changed.
+    ///
+    /// Looks through the wrappers a finished feature wears, the same way
+    /// attaching a plane does, because what somebody selects is the pad rather
+    /// than the bare sweep inside it.
+    pub(crate) fn reopen_sketch(&mut self) {
+        let Some(selected) = self.selected else {
+            self.status = "Select a feature to edit its outline".to_string();
+            return;
+        };
+        let Some(node) = self.sketched_node(selected) else {
+            self.status = "That feature has no outline to edit".to_string();
+            return;
+        };
+        let Some(points) = self.outline_of(node) else {
+            // A rectangle or a circle is a width and a height, not a list of
+            // corners, and those are already editable on the right. Saying so is
+            // more use than refusing without a reason.
+            self.status = "This shape is edited by its dimensions on the right".to_string();
+            return;
+        };
+        let frame = self
+            .doc
+            .root()
+            .and_then(|root| sc_geom::pick::placement_of(self.doc.arena(), root, node))
+            .unwrap_or(Transform::IDENTITY);
+
+        self.abandon_gestures();
+        self.sketch = Some(points);
+        self.reopened = Some(Reopened { node, frame });
+        self.tool = TOOL_SKETCH;
+        self.status = "Drag a corner to move it, click to add one, Enter to apply".to_string();
+    }
+
+    /// Whether the selection has an outline that could be reopened.
+    ///
+    /// Gates the action, so a row that cannot do anything says so before it is
+    /// pressed rather than after.
+    #[must_use]
+    pub(crate) fn selection_has_outline(&self) -> bool {
+        self.selected
+            .and_then(|id| self.sketched_node(id))
+            .is_some_and(|node| self.outline_of(node).is_some())
+    }
+
+    /// The swept node under a selection, looking through single-child wrappers.
+    fn sketched_node(&self, id: NodeId) -> Option<NodeId> {
+        let mut at = id;
+        // Terminates because the arena refuses a cycle, so the walk is bounded
+        // by the depth of the tree.
+        loop {
+            let node = self.doc.arena().get(at)?;
+            if matches!(
+                node,
+                Node::Extrude { .. } | Node::Prism { .. } | Node::Revolve { .. }
+            ) {
+                return Some(at);
+            }
+            let mut children = node.children();
+            let only = children.next()?;
+            if children.next().is_some() {
+                return None;
+            }
+            at = only;
+        }
+    }
+
+    /// The points of a swept node's profile, if it is drawn from points at all.
+    fn outline_of(&self, node: NodeId) -> Option<Vec<Vec2>> {
+        let (Node::Extrude { profile, .. }
+        | Node::Prism { profile }
+        | Node::Revolve { profile, .. }) = self.doc.arena().get(node)?
+        else {
+            return None;
+        };
+        match profile {
+            sc_geom::Profile::Path { points } => Some(points.clone()),
+            _ => None,
+        }
+    }
+
+    /// Moves one point of the outline being edited.
+    pub(crate) fn move_sketch_point(&mut self, index: usize, to: Vec2) {
+        let Some(points) = self.sketch.as_mut() else {
+            return;
+        };
+        let Some(point) = points.get_mut(index) else {
+            return;
+        };
+        *point = to;
+        self.status = format!("{:.1}, {:.1} mm", to.x, to.y);
+    }
+
+    /// The outline point nearest `at`, if one is within `reach`.
+    ///
+    /// Measured in sketch coordinates rather than on screen, because that is
+    /// where the caller already has the pointer, and the reach it passes is the
+    /// screen distance converted once.
+    #[must_use]
+    pub(crate) fn point_near(&self, at: Vec2, reach: f32) -> Option<usize> {
+        let points = self.sketch.as_ref()?;
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.distance(at)))
+            .filter(|(_, d)| *d <= reach)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i)
     }
 
     /// Rounds a plate position to the sketch grid.
@@ -2069,6 +2214,58 @@ impl AppState {
     }
 
     /// Turns the profile in progress into an extruded solid.
+    /// Writes an edited outline back into the feature it came from.
+    ///
+    /// Replaced in place rather than rebuilt, so the node keeps its id and
+    /// everything hanging off it, every placement derived from its face and
+    /// every hole cut into it, stays where it was. Rebuilding would make a new
+    /// id, and a feature attached to the old one would be left pointing at
+    /// something that no longer exists.
+    fn reapply_outline(&mut self, edit: Reopened, points: Vec<Vec2>) {
+        let profile = sc_geom::Profile::Path {
+            points: points.clone(),
+        };
+        // The kind is kept: reopening a pad edits a pad. Turning it into
+        // something else because a key was pressed would be a surprise.
+        let replacement = match self.doc.arena().get(edit.node) {
+            Some(Node::Extrude { depth, .. }) => Node::Extrude {
+                profile,
+                depth: *depth,
+            },
+            Some(Node::Prism { .. }) => Node::Prism { profile },
+            Some(Node::Revolve { major, .. }) => Node::Revolve {
+                profile,
+                major: *major,
+            },
+            _ => {
+                self.end_outline_edit();
+                self.status = "That feature is gone".to_string();
+                return;
+            }
+        };
+        // Handed back rather than thrown away. Somebody who has dragged a corner
+        // through its neighbour wants to drag it back, not to start again.
+        if !replacement.is_valid() {
+            self.sketch = Some(points);
+            self.status = "That outline encloses no area".to_string();
+            return;
+        }
+
+        self.end_outline_edit();
+        self.apply(Command::Replace {
+            id: edit.node,
+            node: replacement,
+        });
+        self.tool = TOOL_SELECT;
+        self.status = "Outline updated".to_string();
+    }
+
+    /// Drops the editing state, leaving the document alone.
+    fn end_outline_edit(&mut self) {
+        self.reopened = None;
+        self.grabbed_point = None;
+    }
+
     /// Turns the profile in progress on the lathe instead of padding it.
     ///
     /// The sketch plane's own vertical is the axis and its horizontal is the
@@ -2082,6 +2279,14 @@ impl AppState {
         };
         if points.len() < 3 {
             self.status = "A profile needs at least 3 points".to_string();
+            self.sketch = Some(points);
+            return;
+        }
+        // Reopening a pad edits a pad. Quietly turning it into a turning
+        // because R was pressed would be a surprise, and the shape it made
+        // would have nothing to do with the one on screen.
+        if self.reopened.is_some() {
+            self.status = "Press Enter to apply your changes to this feature".to_string();
             self.sketch = Some(points);
             return;
         }
@@ -2138,6 +2343,10 @@ impl AppState {
         if points.len() < 3 {
             self.status = "A profile needs at least 3 points".to_string();
             self.sketch = Some(points);
+            return;
+        }
+        if let Some(edit) = self.reopened {
+            self.reapply_outline(edit, points);
             return;
         }
 
@@ -4083,6 +4292,210 @@ mod tests {
 
         state.add_body(Node::Sphere { radius: 6.0 }, "Second");
         state.begin_move(Vec3::ZERO, 940.0).expect("movable")
+    }
+
+    /// Draws a square pad on the plate and leaves it selected.
+    fn square_pad(state: &mut AppState) {
+        state.new_document();
+        state.start_sketch();
+        for (x, y) in [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)] {
+            state.add_sketch_point(Vec2::new(x, y));
+        }
+        state.finish_sketch();
+    }
+
+    /// The whole point. Before this, a shape drawn slightly wrong could only be
+    /// deleted and drawn again.
+    #[test]
+    fn a_pad_gives_its_outline_back() {
+        let mut state = AppState::new();
+        square_pad(&mut state);
+        assert!(state.selection_has_outline(), "nothing offered to edit");
+
+        state.reopen_sketch();
+        let points = state.sketch.clone().expect("the outline came back");
+        assert_eq!(points.len(), 4, "got {points:?}");
+        assert!(
+            points.contains(&Vec2::new(20.0, 20.0)),
+            "the corners are not the ones drawn: {points:?}"
+        );
+    }
+
+    /// Rewritten in place, not rebuilt. A new id would leave every hole cut into
+    /// this pad, and every feature attached to its face, pointing at a node that
+    /// no longer exists.
+    #[test]
+    fn applying_an_edit_keeps_the_feature_the_same_node() {
+        let mut state = AppState::new();
+        square_pad(&mut state);
+        state.reopen_sketch();
+        let node = state.reopened.expect("reopened").node;
+
+        // Outside the square as drawn, so a pass here cannot come from the pad
+        // that was already there.
+        let grew_into = Vec3::new(30.0, 5.0, 1.0);
+        assert!(!solid_at_point(&state, grew_into), "already solid there");
+
+        state.move_sketch_point(1, Vec2::new(40.0, 0.0));
+        state.finish_sketch();
+
+        assert!(state.reopened.is_none(), "still in the editor");
+        assert!(state.sketch.is_none(), "the sketch was left in flight");
+        assert!(
+            state.doc.arena().is_alive(node),
+            "the feature was rebuilt under a new id"
+        );
+        assert!(
+            solid_at_point(&state, grew_into),
+            "the pad did not grow to where the corner was dragged"
+        );
+    }
+
+    /// The payoff for rewriting in place. A boss standing on the pad's face has
+    /// to still be standing on it after the outline is changed, and to follow
+    /// the face when it moves. Rebuilding the pad under a new id would leave the
+    /// boss derived from a node that no longer exists.
+    #[test]
+    fn a_feature_built_on_a_pad_survives_editing_its_outline() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.start_sketch();
+        for (x, y) in [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)] {
+            state.add_sketch_point(Vec2::new(x, y));
+        }
+        state.finish_sketch();
+        let pad = state.selected.expect("the pad is selected");
+
+        state.attach_to_selection();
+        state.extrude_height = 5.0;
+        state.add_pad(
+            sc_geom::Profile::Rect {
+                width: 6.0,
+                height: 6.0,
+            },
+            "Boss",
+        );
+        let boss = state.selected.expect("the boss is selected");
+        assert!(
+            solid_at_point(&state, Vec3::new(0.0, 0.0, 12.0)),
+            "the boss is not on the pad's face to begin with"
+        );
+
+        state.select(Some(pad));
+        state.reopen_sketch();
+        state.move_sketch_point(1, Vec2::new(30.0, 0.0));
+        state.finish_sketch();
+
+        assert!(
+            state.doc.arena().is_alive(boss),
+            "the boss was lost with the pad it stood on"
+        );
+        assert!(
+            solid_at_point(&state, Vec3::new(0.0, 0.0, 12.0)),
+            "the boss came off the face when the outline changed"
+        );
+
+        // And still follows it. The derivation is what carries that, so this is
+        // what says the edit did not quietly break it.
+        let sweep = state
+            .sketched_node(pad)
+            .expect("the pad still has its outline");
+        state.apply(Command::SetParam {
+            id: sweep,
+            name: "depth".into(),
+            value: 16.0,
+        });
+        assert!(
+            solid_at_point(&state, Vec3::new(0.0, 0.0, 18.0)),
+            "the boss stopped following the face it was built on"
+        );
+    }
+
+    /// Cancelling means cancelling: the feature has to be exactly as it was.
+    #[test]
+    fn abandoning_an_edit_leaves_the_feature_alone() {
+        let mut state = AppState::new();
+        square_pad(&mut state);
+        let before = state.doc.hash();
+
+        state.reopen_sketch();
+        state.move_sketch_point(1, Vec2::new(40.0, 0.0));
+        state.cancel_sketch();
+
+        assert!(state.reopened.is_none(), "still in the editor");
+        assert_eq!(state.doc.hash(), before, "the model changed anyway");
+    }
+
+    /// A rectangle is a width and a height, not four corners, and those are
+    /// already editable in the panel. Saying so beats refusing with no reason.
+    #[test]
+    fn a_parametric_shape_says_where_it_is_edited() {
+        let mut state = AppState::new();
+        state.new_document();
+        state.add_body(
+            Node::Extrude {
+                profile: sc_geom::Profile::Rect {
+                    width: 10.0,
+                    height: 4.0,
+                },
+                depth: 3.0,
+            },
+            "Pad",
+        );
+        assert!(!state.selection_has_outline(), "offered corners it has not");
+
+        state.reopen_sketch();
+        assert!(state.sketch.is_none(), "it opened an editor anyway");
+        assert!(
+            state.status.contains("dimensions"),
+            "no hint where to edit it: {}",
+            state.status
+        );
+    }
+
+    /// An outline dragged into a shape with no area is handed back rather than
+    /// thrown away. Somebody who has pulled a corner through its neighbour
+    /// wants to pull it back, not to start the whole outline again.
+    #[test]
+    fn an_outline_with_no_area_is_handed_back() {
+        let mut state = AppState::new();
+        square_pad(&mut state);
+        state.reopen_sketch();
+
+        // Every corner onto one line, which encloses nothing.
+        for i in 0..4 {
+            state.move_sketch_point(i, Vec2::new(i as f32 * 5.0, 0.0));
+        }
+        state.finish_sketch();
+
+        assert!(state.sketch.is_some(), "the work was thrown away");
+        assert!(state.reopened.is_some(), "it left the editor");
+        assert!(
+            state.status.contains("no area"),
+            "no reason given: {}",
+            state.status
+        );
+    }
+
+    /// The outline is drawn over the feature it came from, wherever the plane
+    /// picker happens to be pointing. Using the picker's plane instead would
+    /// draw the outline somewhere the part is not.
+    #[test]
+    fn a_reopened_outline_uses_the_features_own_frame() {
+        let mut state = AppState::new();
+        state.set_plane(crate::plane::SketchPlane::Xz);
+        square_pad(&mut state);
+        state.reopen_sketch();
+        let frame = state.reopened.expect("reopened").frame;
+
+        // Moved after reopening, so a frame read from the picker rather than
+        // from the feature would now be the wrong one.
+        state.set_plane(crate::plane::SketchPlane::Yz);
+        assert_eq!(
+            state.sketch_frame(),
+            frame,
+            "the outline followed the plane picker instead of the feature"
+        );
     }
 
     /// A turned profile has to spin about the sketch plane's vertical, not about
